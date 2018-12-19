@@ -1,0 +1,58 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+module(...,package.seeall);
+
+var ffi = require("ffi");
+
+var app  = require("core.app");
+var link = require("core.link");
+var packet = require("core.packet");
+var pcap = require("lib.pcap.pcap");
+
+PcapReader = {};
+
+function PcapReader::new (filename) {
+   var records = pcap.records(filename);
+   return setmetatable({iterator = records, done = false},
+                       {__index = PcapReader});
+}
+
+function PcapReader::pull () {
+   assert(this.output.output);
+   var limit = engine.pull_npackets;
+   while( limit > 0 && ! this.done ) {
+      --limit    ;
+      var data, record, extra = this.iterator();
+      if( data ) {
+         var p = packet.from_string(data);
+         link.transmit(this.output.output, p);
+      } else {
+         this.done = true;
+      }
+   }
+}
+
+PcapWriter = {};
+
+function PcapWriter::new (filename) {
+   var mode = "w";
+   if( type(filename) == "table" ) {
+      mode = filename[2] || mode;
+      filename = filename[1];
+   }
+   var file = assert(io.open(filename, mode));
+   pcap.write_file_header(file);
+   return setmetatable({file = file}, {__index = PcapWriter});
+}
+
+function PcapWriter::push () {
+   while( ! link.empty(this.input.input) ) {
+      var p = link.receive(this.input.input);
+      pcap.write_record_header(this.file, p.length);
+      // XXX expensive to create interned Lua string.
+      this.file->write(ffi.string(p.data, p.length));
+      this.file->flush();
+      packet.free(p);
+   }
+}
+

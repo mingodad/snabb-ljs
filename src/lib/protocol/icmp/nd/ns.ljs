@@ -1,0 +1,45 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+module(..., package.seeall);
+var ffi = require("ffi");
+var C = ffi.C;
+var nd_header = require("lib.protocol.icmp.nd.header");
+var proto_header = require("lib.protocol.header");
+
+var ns = subClass(nd_header);
+
+// Class variables
+ns._name = "neighbor solicitation";
+ns._ulp = { method = null };
+proto_header.init(ns,
+                  {
+                     [1] = ffi.typeof([=[
+                           struct {
+                              uint32_t reserved;
+                              uint8_t  target[16];
+                           }
+                     ]=])
+                  });
+
+// Class methods
+
+function ns::new (target) {
+   var o = ns->superClass().new(this);
+   o->target(target);
+   return o;
+}
+
+// Instance methods
+
+function ns::target (target) {
+   if( target != null ) {
+      ffi.copy(this->header().target, target, 16);
+   }
+   return this->header().target;
+}
+
+function ns::target_eq (target) {
+   return C.memcmp(target, this->header().target, 16) == 0;
+}
+
+return ns;

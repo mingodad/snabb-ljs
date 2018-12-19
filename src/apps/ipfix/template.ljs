@@ -1,0 +1,383 @@
+// This module implements the flow metering app, which records
+// IP flows as part of an IP flow export program.
+
+module(..., package.seeall);
+
+var bit    = require("bit");
+var ffi    = require("ffi");
+var pf     = require("pf");
+var consts = require("apps.lwaftr.constants");
+var lib    = require("core.lib");
+
+var ntohs  = lib.ntohs;
+var htonl, htons = lib.htonl, lib.htons;
+var function htonq(v) { return bit.bswap(v + 0ULL); }
+
+var function ptr_to(ctype) { return ffi.typeof('$*', ctype); }
+
+var debug = lib.getenv("FLOW_EXPORT_DEBUG");
+
+var IP_PROTO_TCP  = 6;
+var IP_PROTO_UDP  = 17;
+var IP_PROTO_SCTP = 132;
+
+// These constants are taken from the lwaftr constants module, which
+// is maybe a bad dependency but sharing code is good
+// TODO: move constants somewhere else? lib?
+var ethertype_ipv4         = consts.ethertype_ipv4;
+var ethertype_ipv6         = consts.ethertype_ipv6;
+var ethernet_header_size   = consts.ethernet_header_size;
+var ipv6_fixed_header_size = consts.ipv6_fixed_header_size;
+var o_ethernet_ethertype   = consts.o_ethernet_ethertype;
+var o_ipv4_total_length    = consts.o_ipv4_total_length;
+var o_ipv4_ver_and_ihl     = consts.o_ipv4_ver_and_ihl;
+var o_ipv4_proto           = consts.o_ipv4_proto;
+var o_ipv4_src_addr        = consts.o_ipv4_src_addr;
+var o_ipv4_dst_addr        = consts.o_ipv4_dst_addr;
+var o_ipv6_payload_len     = consts.o_ipv6_payload_len;
+var o_ipv6_next_header     = consts.o_ipv6_next_header;
+var o_ipv6_src_addr        = consts.o_ipv6_src_addr;
+var o_ipv6_dst_addr        = consts.o_ipv6_dst_addr;
+
+var function string_parser(str) {
+   var idx = 1;
+   var quote = ('"')->byte();
+   var ret = {};
+   function ret.consume_upto(char) {
+      var start_idx = idx;
+      var byte = char->byte();
+      while( str->byte(idx) != byte ) {
+         if( str->byte(idx) == quote ) {
+            ++idx    ;
+            while( str->byte(idx) != quote ) { ++idx    ; }
+         }
+         ++idx    ;
+      }
+      ++idx    ;
+      return string.sub(str, start_idx, idx - 2);
+   }
+   function ret.is_done() { return idx > str->len(); }
+   return ret;
+}
+
+// Parse out available IPFIX fields.
+var function make_ipfix_element_map() {
+   var elems = require("apps.ipfix.ipfix_information_elements_inc");
+   var parser = string_parser(elems);
+   var map = {};
+   while( ! parser.is_done() ) {
+      var id = parser.consume_upto(",");
+      var name = parser.consume_upto(",");
+      var data_type = parser.consume_upto(",");
+      for( i=1,8 ) { parser.consume_upto(","); }
+      parser.consume_upto("\n");
+      map[name] = { id = id, data_type = data_type };
+   }
+   return map;
+}
+
+var ipfix_elements = make_ipfix_element_map();
+
+var swap_fn_env = { htons = htons, htonl = htonl, htonq = htonq };
+
+// Create a table describing the information needed to create
+// flow templates and data records.
+var function make_template_info(spec) {
+   // Representations of IPFIX IEs.
+   var ctypes =
+      { unsigned8 = 'uint8_t', unsigned16 = 'uint16_t',
+        unsigned32 = 'uint32_t', unsigned64 = 'uint64_t',
+        ipv4Address = 'uint8_t[4]', ipv6Address = 'uint8_t[16]',
+        dateTimeMilliseconds = 'uint64_t' };
+   var bswap = { uint16_t='htons', uint32_t='htonl', uint64_t='htonq' };
+   // the contents of the template records we will send
+   // there is an ID & length for each field
+   var length = 2 * (#spec.keys + #spec.values);
+   var buffer = ffi.new("uint16_t[?]", length);
+
+   // octets in a data record
+   var data_len = 0;
+   var swap_fn = {};
+
+   var function process_fields(buffer, fields, struct_def, types, swap_tmpl) {
+      for( idx, name in ipairs(fields) ) {
+         var entry = ipfix_elements[name];
+         var ctype = assert(ctypes[entry.data_type],
+                              'unimplemented: '..entry.data_type);
+         data_len = data_len + ffi.sizeof(ctype);
+         buffer[2 * (idx - 1)]     = htons(entry.id);
+         buffer[2 * (idx - 1) + 1] = htons(ffi.sizeof(ctype));
+         table.insert(struct_def, '$ '..name..';');
+         table.insert(types, ffi.typeof(ctype));
+         if( bswap[ctype] ) {
+            table.insert(swap_fn, swap_tmpl->format(name, bswap[ctype], name));
+         }
+      }
+   }
+
+   table.insert(swap_fn, 'return function(o)');
+   var key_struct_def = { 'struct {' };
+   var key_types = {};
+   process_fields(buffer, spec.keys, key_struct_def, key_types,
+                  'o.key.%s = %s(o.key.%s)');
+   table.insert(key_struct_def, '} __attribute__((packed))');
+   var value_struct_def = { 'struct {' };
+   var value_types = {};
+   process_fields(buffer + #spec.keys * 2, spec.values, value_struct_def,
+                  value_types, 'o.value.%s = %s(o.value.%s)');
+   table.insert(value_struct_def, '} __attribute__((packed))');
+   table.insert(swap_fn, 'end');
+   var key_t = ffi.typeof(table.concat(key_struct_def, ' '),
+                            unpack(key_types));
+   var value_t = ffi.typeof(table.concat(value_struct_def, ' '),
+                              unpack(value_types));
+   var record_t = ffi.typeof(
+      'struct { $ key; $ value; } __attribute__((packed))', key_t, value_t);
+   gen_swap_fn = loadstring(table.concat(swap_fn, '\n'));
+   setfenv(gen_swap_fn, swap_fn_env);
+
+   assert(ffi.sizeof(record_t) == data_len);
+
+   return { id = spec.id,
+            field_count = #spec.keys + #spec.values,
+            buffer = buffer,
+            buffer_len = length * 2,
+            data_len = data_len,
+            key_t = key_t,
+            value_t = value_t,
+            record_t = record_t,
+            record_ptr_t = ptr_to(record_t),
+            swap_fn = gen_swap_fn(),
+            match = pf.compile_filter(spec.filter)
+          };
+}
+
+var uint16_ptr_t = ffi.typeof('uint16_t *');
+
+var function get_ipv4_ihl(l3) {
+   return bit.band((l3 + o_ipv4_ver_and_ihl)[0], 0x0f);
+}
+
+var function get_ipv4_protocol(l3) {    return l3[o_ipv4_proto]; }
+var function get_ipv6_next_header(l3) { return l3[o_ipv6_next_header]; }
+
+var function get_ipv4_src_addr_ptr(l3) { return l3 + o_ipv4_src_addr; }
+var function get_ipv4_dst_addr_ptr(l3) { return l3 + o_ipv4_dst_addr; }
+
+var function get_ipv6_src_addr_ptr(l3) { return l3 + o_ipv6_src_addr; }
+var function get_ipv6_dst_addr_ptr(l3) { return l3 + o_ipv6_dst_addr; }
+
+var function read_ipv4_src_address(l3, dst) {
+   ffi.copy(dst, get_ipv4_src_addr_ptr(l3), 4);
+}
+var function read_ipv4_dst_address(l3, dst) {
+   ffi.copy(dst, get_ipv4_dst_addr_ptr(l3), 4);
+}
+var function read_ipv6_src_address(l3, dst) {
+   ffi.copy(dst, get_ipv6_src_addr_ptr(l3), 16);
+}
+var function read_ipv6_dst_address(l3, dst) {
+   ffi.copy(dst, get_ipv6_dst_addr_ptr(l3), 16);
+}
+
+var function get_tcp_src_port(l4) {
+   return ntohs(ffi.cast(uint16_ptr_t, l4)[0]);
+}
+var function get_tcp_dst_port(l4) {
+   return ntohs(ffi.cast(uint16_ptr_t, l4)[1]);
+}
+
+v4 = make_template_info ({
+   id     = 256,
+   filter = "ip",
+   keys   = { "sourceIPv4Address",
+              "destinationIPv4Address",
+              "protocolIdentifier",
+              "sourceTransportPort",
+              "destinationTransportPort" },
+   values = { "flowStartMilliseconds",
+              "flowEndMilliseconds",
+              "packetDeltaCount",
+              "octetDeltaCount"}
+});
+
+function v4.extract(pkt, timestamp, entry) {
+   var l2 = pkt.data;
+   var l3 = l2 + ethernet_header_size;
+   var ihl = get_ipv4_ihl(l3);
+   var l4 = l3 + ihl * 4;
+
+   // Fill key.
+   // FIXME: Try using normal Lua assignment.
+   read_ipv4_src_address(l3, entry.key.sourceIPv4Address);
+   read_ipv4_dst_address(l3, entry.key.destinationIPv4Address);
+   var prot = get_ipv4_protocol(l3);
+   entry.key.protocolIdentifier = prot;
+   if( prot == IP_PROTO_TCP || prot == IP_PROTO_UDP || prot == IP_PROTO_SCTP ) {
+      entry.key.sourceTransportPort = get_tcp_src_port(l4);
+      entry.key.destinationTransportPort = get_tcp_dst_port(l4);
+   } else {
+      entry.key.sourceTransportPort = 0;
+      entry.key.destinationTransportPort = 0;
+   }
+
+   // Fill value.
+   entry.value.flowStartMilliseconds = timestamp;
+   entry.value.flowEndMilliseconds = timestamp;
+   entry.value.packetDeltaCount = 1;
+   // Measure bytes starting with the IP header.
+   entry.value.octetDeltaCount = pkt.length - ethernet_header_size;
+}
+
+function v4.accumulate(dst, new) {
+   dst.value.flowEndMilliseconds = new.value.flowEndMilliseconds;
+   dst.value.packetDeltaCount = dst.value.packetDeltaCount + 1;
+   dst.value.octetDeltaCount =
+      dst.value.octetDeltaCount + new.value.octetDeltaCount;
+}
+
+function v4.tostring(entry) {
+   var ipv4   = require("lib.protocol.ipv4");
+   var key = entry.key;
+   var protos =
+      { [IP_PROTO_TCP]='TCP', [IP_PROTO_UDP]='UDP', [IP_PROTO_SCTP]='SCTP' };
+   return string.format(
+      "%s (%d) -> %s (%d) [%s]",
+      ipv4->ntop(key.sourceIPv4Address), key.sourceTransportPort,
+      ipv4->ntop(key.destinationIPv4Address), key.destinationTransportPort,
+      protos[key.protocolIdentifier] || tostring(key.protocolIdentifier));
+}
+
+v6 = make_template_info ({
+   id     = 257,
+   filter = "ip6",
+   keys   = { "sourceIPv6Address",
+              "destinationIPv6Address",
+              "protocolIdentifier",
+              "sourceTransportPort",
+              "destinationTransportPort" },
+   values = { "flowStartMilliseconds",
+              "flowEndMilliseconds",
+              "packetDeltaCount",
+              "octetDeltaCount" }
+});
+
+function v6.extract(pkt, timestamp, entry) {
+   var l2 = pkt.data;
+   var l3 = l2 + ethernet_header_size;
+   // TODO: handle chained headers
+   var l4 = l3 + ipv6_fixed_header_size;
+
+   // Fill key.
+   // FIXME: Try using normal Lua assignment.
+   read_ipv6_src_address(l3, entry.key.sourceIPv6Address);
+   read_ipv6_dst_address(l3, entry.key.destinationIPv6Address);
+   var prot = get_ipv6_next_header(l3);
+   entry.key.protocolIdentifier = prot;
+   if( prot == IP_PROTO_TCP || prot == IP_PROTO_UDP || prot == IP_PROTO_SCTP ) {
+      entry.key.sourceTransportPort = get_tcp_src_port(l4);
+      entry.key.destinationTransportPort = get_tcp_dst_port(l4);
+   } else {
+      entry.key.sourceTransportPort = 0;
+      entry.key.destinationTransportPort = 0;
+   }
+
+   // Fill value.
+   entry.value.flowStartMilliseconds = timestamp;
+   entry.value.flowEndMilliseconds = timestamp;
+   entry.value.packetDeltaCount = 1;
+   // Measure bytes starting with the IP header.
+   entry.value.octetDeltaCount = pkt.length - ethernet_header_size;
+}
+
+function v6.accumulate(dst, new) {
+   dst.value.flowEndMilliseconds = new.value.flowEndMilliseconds;
+   dst.value.packetDeltaCount = dst.value.packetDeltaCount + 1;
+   dst.value.octetDeltaCount =
+      dst.value.octetDeltaCount + new.value.octetDeltaCount;
+}
+
+function v6.tostring(entry) {
+   var ipv6 = require("lib.protocol.ipv6");
+   var key = entry.key;
+   var protos =
+      { [IP_PROTO_TCP]='TCP', [IP_PROTO_UDP]='UDP', [IP_PROTO_SCTP]='SCTP' };
+   return string.format(
+      "%s (%d) -> %s (%d) [%s]",
+      ipv6->ntop(key.sourceIPv6Address), key.sourceTransportPort,
+      ipv6->ntop(key.destinationIPv6Address), key.destinationTransportPort,
+      protos[key.protocolIdentifier] || tostring(key.protocolIdentifier));
+}
+
+function selftest() {
+   print('selftest: apps.ipfix.template');
+   var datagram = require("lib.protocol.datagram");
+   var ether  = require("lib.protocol.ethernet");
+   var ipv4   = require("lib.protocol.ipv4");
+   var ipv6   = require("lib.protocol.ipv6");
+   var udp    = require("lib.protocol.udp");
+   var packet = require("core.packet");
+
+   var function test(src_ip, dst_ip, src_port, dst_port) {
+      var is_ipv6 = ! ! src_ip->match(':');
+      var proto = is_ipv6 && ethertype_ipv6 || ethertype_ipv4;
+      var eth = ether->new({ src = ether->pton("00:11:22:33:44:55"),
+                              dst = ether->pton("55:44:33:22:11:00"),
+                              type = proto });
+      var ip;
+
+      if( is_ipv6 ) {
+         ip = ipv6->new({ src = ipv6->pton(src_ip), dst = ipv6->pton(dst_ip),
+                         next_header = IP_PROTO_UDP, ttl = 64 });
+      } else {
+         ip = ipv4->new({ src = ipv4->pton(src_ip), dst = ipv4->pton(dst_ip),
+                         protocol = IP_PROTO_UDP, ttl = 64 });
+      }
+      var udp = udp->new({ src_port = src_port, dst_port = dst_port });
+      var dg = datagram->new();
+
+      dg->push(udp);
+      dg->push(ip);
+      dg->push(eth);
+
+      var pkt = dg->packet();
+      
+      assert(v4.match(pkt.data, pkt.length) == ! is_ipv6);
+      assert(v6.match(pkt.data, pkt.length) == is_ipv6);
+      var templ = is_ipv6 && v6 || v4;
+      var entry = templ.record_t();
+      var timestamp = 13;
+      templ.extract(pkt, 13, entry);
+      if( is_ipv6 ) {
+         assert(ip->src_eq(entry.key.sourceIPv6Address));
+         assert(ip->dst_eq(entry.key.destinationIPv6Address));
+      } else {
+         assert(ip->src_eq(entry.key.sourceIPv4Address));
+         assert(ip->dst_eq(entry.key.destinationIPv4Address));
+      }
+      assert(entry.key.protocolIdentifier == IP_PROTO_UDP);
+      assert(entry.key.sourceTransportPort == src_port);
+      assert(entry.key.destinationTransportPort == dst_port);
+      assert(entry.value.flowStartMilliseconds == timestamp);
+      assert(entry.value.flowEndMilliseconds == timestamp);
+      assert(entry.value.packetDeltaCount == 1);
+      assert(entry.value.octetDeltaCount == pkt.length - ethernet_header_size);
+
+      packet.free(pkt);
+   }
+
+   for( i=1, 100 ) {
+      var src_ip, dst_ip;
+      if( math.random(1,2) == 1 ) {
+         src_ip = string.format("192.168.1.%d", math.random(1, 254));
+         dst_ip = string.format("10.0.0.%d", math.random(1, 254));
+      } else {
+         src_ip = string.format("2001:4860:4860::%d", math.random(1000, 9999));
+         dst_ip = string.format("2001:db8::ff00:42:%d", math.random(1000, 9999));
+      }
+      var src_port, dst_port = math.random(1, 65535), math.random(1, 65535);
+      test(src_ip, dst_ip, src_port, dst_port);
+   }
+
+   print("selftest ok");
+}

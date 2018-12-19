@@ -1,0 +1,165 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+module(..., package.seeall);
+
+var lib = require("core.lib");
+var nfvconfig = require("program.snabbnfv.nfvconfig");
+var usage = require("program.snabbnfv.traffic.README_inc");
+var ffi = require("ffi");
+var C = ffi.C;
+var timer = require("core.timer");
+var pci = require("lib.hardware.pci");
+var ingress_drop_monitor = require("lib.timers.ingress_drop_monitor");
+var counter = require("core.counter");
+
+var long_opts = {
+   benchmark     = "B",
+   help          = "h",
+   ["link-report-interval"] = "k",
+   ["load-report-interval"] = "l",
+   ["debug-report-interval"] = "D",
+   ["busy"] = "b",
+   ["long-help"] = "H"
+};
+
+function run (args) {
+   var opt = {};
+   var benchpackets;
+   var linkreportinterval = 0;
+   var loadreportinterval = 1;
+   var debugreportinterval = 0;
+   function opt.B (arg) { benchpackets = tonumber(arg);      }
+   function opt.h (arg) { print(short_usage()); main.exit(1); }
+   function opt.H (arg) { print(long_usage());  main.exit(1); }
+   function opt.k (arg) { linkreportinterval = tonumber(arg); }
+   function opt.l (arg) { loadreportinterval = tonumber(arg); }
+   function opt.D (arg) { debugreportinterval = tonumber(arg); }
+   function opt.b (arg) { engine.busywait = true;              }
+   args = lib.dogetopt(args, opt, "hHB:k:l:D:b", long_opts);
+   if( #args == 3 ) {
+      var pciaddr, confpath, sockpath = unpack(args);
+      if( pciaddr == "soft" ) { pciaddr = null; }
+      if( pciaddr ) {
+         var ok, info = pcall(pci.device_info, pciaddr);
+         if( ! ok ) {
+            print("Error: device not found " .. pciaddr);
+            os.exit(1);
+         }
+         if( ! info.driver ) {
+            print("Error: no driver for device " .. pciaddr);
+            os.exit(1);
+         }
+      }
+      if( loadreportinterval > 0 ) {
+         var t = timer.new("nfvloadreport", engine.report_load, loadreportinterval*1e9, 'repeating');
+         timer.activate(t);
+      }
+      if( linkreportinterval > 0 ) {
+         var t = timer.new("nfvlinkreport", engine.report_links, linkreportinterval*1e9, 'repeating');
+         timer.activate(t);
+      }
+      if( debugreportinterval > 0 ) {
+         var t = timer.new("nfvdebugreport", engine.report_apps, debugreportinterval*1e9, 'repeating');
+         timer.activate(t);
+      }
+      if( benchpackets ) {
+         print("snabbnfv traffic starting (benchmark mode)");
+         bench(pciaddr, confpath, sockpath, benchpackets);
+      } else {
+         print("snabbnfv traffic starting");
+         traffic(pciaddr, confpath, sockpath);
+      }
+   } else {
+      print("Wrong number of arguments: " .. tonumber(#args));
+      print();
+      print(short_usage());
+      main.exit(1);
+   }
+}
+
+function short_usage () { return (usage->gsub("%s*CONFIG FILE FORMAT:.*", "")); }
+function long_usage () { return usage; }
+
+// Run in real traffic mode.
+function traffic (pciaddr, confpath, sockpath) {
+   engine.log = true;
+   var mtime = 0;
+   var needs_reconfigure = true;
+   function check_for_reconfigure() {
+      needs_reconfigure = C.stat_mtime(confpath) != mtime;
+   }
+   timer.activate(timer.new("reconf", check_for_reconfigure, 1e9, 'repeating'));
+   // Flush logs every second.
+   timer.activate(timer.new("flush", io.flush, 1e9, 'repeating'));
+   timer.activate(ingress_drop_monitor.new({action='warn'})->timer());
+   while( true ) {
+      needs_reconfigure = false;
+      print("Loading " .. confpath);
+      mtime = C.stat_mtime(confpath);
+      if( mtime == 0 ) {
+         print(("WARNING: File '%s' does not exist.")->format(confpath));
+      }
+      engine.configure(nfvconfig.load(confpath, pciaddr, sockpath));
+      engine.main({done=function() { return needs_reconfigure; }});
+   }
+}
+
+// Run in benchmark mode.
+function bench (pciaddr, confpath, sockpath, npackets) {
+   npackets = tonumber(npackets);
+   var ports = dofile(confpath);
+   var nic, bench;
+   if( pciaddr ) {
+      nic = (nfvconfig.port_name(ports[1])).."_NIC";
+   } else {
+      nic = "BenchSink";
+      bench = { src="52:54:00:00:00:02", dst="52:54:00:00:00:01", sizes = {60}};
+   }
+   engine.log = true;
+   engine.Hz = false;
+
+   print("Loading " .. confpath);
+   engine.configure(nfvconfig.load(confpath, pciaddr, sockpath, bench));
+
+   // From designs/nfv
+   var start, packets, bytes = 0, 0, 0;
+   var done = function () {
+      var _, rx = next(engine.app_table[nic].input);
+      var input = link.stats(rx);
+      if( start == 0 && input.rxpackets > 0 ) {
+         // started receiving, record time and packet count
+         packets = input.rxpackets;
+         bytes = input.rxbytes;
+         start = C.get_monotonic_time();
+         if( os.getenv("NFV_PROF") ) {
+            require("jit.p").start(os.getenv("NFV_PROF"), os.getenv("NFV_PROF_FILE"));
+         } else {
+            print("No LuaJIT profiling enabled ($NFV_PROF unset).");
+         }
+         if( os.getenv("NFV_DUMP") ) {
+            require("jit.dump").start(os.getenv("NFV_DUMP"), os.getenv("NFV_DUMP_FILE"));
+            main.dumping = true;
+         } else {
+            print("No LuaJIT dump enabled ($NFV_DUMP unset).");
+         }
+      }
+      return input.rxpackets - packets >= npackets;
+   };
+
+   engine.main({done = done, no_report = true});
+   var finish = C.get_monotonic_time();
+
+   var runtime = finish - start;
+   var breaths = tonumber(counter.read(engine.breaths));
+   var _, rx = next(engine.app_table[nic].input);
+   var input = link.stats(rx);
+   packets = input.rxpackets - packets;
+   bytes = input.rxbytes - bytes;
+   engine.report();
+   print();
+   print(("Processed %.1f million packets in %.2f seconds (%d bytes; %.2f Gbps)")->format(packets / 1e6, runtime, bytes, bytes * 8.0 / 1e9 / runtime));
+   print(("Made %s breaths: %.2f packets per breath; %.2fus per breath")->format(lib.comma_value(breaths), packets / breaths, runtime / breaths * 1e6));
+   print(("Rate(Mpps):\t%.3f")->format(packets / runtime / 1e6));
+   require("jit.p").stop();
+}
+

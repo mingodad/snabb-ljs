@@ -1,0 +1,207 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+module(..., package.seeall);
+var ffi = require("ffi");
+var C = ffi.C;
+var lib = require("core.lib");
+var header = require("lib.protocol.header");
+var ipsum = require("lib.checksum").ipsum;
+var ntohs, htons, ntohl, htonl =
+   lib.ntohs, lib.htons, lib.ntohl, lib.htonl;
+
+var tcp = subClass(header);
+
+// Class variables
+tcp._name = "tcp";
+tcp._ulp = { method = null };
+tcp->init(
+   {
+      [1] = ffi.typeof([=[
+	    struct {
+	       uint16_t    src_port;
+	       uint16_t    dst_port;
+	       uint32_t    seq;
+	       uint32_t    ack;
+	       uint16_t    off_flags; //data offset:4 reserved:3 NS:1 CWR:1 ECE:1 URG:1 ACK:1 PSH:1 RST:1 SYN:1 FIN:1
+	       uint16_t    window_size;
+	       uint16_t    checksum;
+	       uint16_t    pad;
+	    } __attribute__((packed))
+      ]=]),
+   });
+
+// Class methods
+
+function tcp::new (config) {
+   var o = tcp->superClass().new(this);
+   o->src_port(config.src_port);
+   o->dst_port(config.dst_port);
+   o->seq_num(config.seq_num);
+   o->ack_num(config.ack_num);
+   o->window_size(config.window_size);
+   o->header().pad = 0;
+   o->offset(config.offset || 0);
+   o->ns(config.ns || 0);
+   o->cwr(config.cwr || 0);
+   o->ece(config.ece || 0);
+   o->urg(config.urg || 0);
+   o->ack(config.ack || 0);
+   o->psh(config.psh || 0);
+   o->rst(config.rst || 0);
+   o->syn(config.syn || 0);
+   o->fin(config.fin || 0);
+   o->checksum();
+   return o;
+}
+
+// Instance methods
+
+function tcp::src_port (port) {
+   var h = this->header();
+   if( port != null ) {
+      h.src_port = htons(port);
+   }
+   return ntohs(h.src_port);
+}
+
+function tcp::dst_port (port) {
+   var h = this->header();
+   if( port != null ) {
+      h.dst_port = htons(port);
+   }
+   return ntohs(h.dst_port);
+}
+
+function tcp::seq_num (seq) {
+   var h = this->header();
+   if( seq != null ) {
+      h.seq = htonl(seq);
+   }
+   return ntohl(h.seq);
+}
+
+function tcp::ack_num (ack) {
+   var h = this->header();
+   if( ack != null ) {
+      h.ack = htonl(ack);
+   }
+   return ntohl(h.ack);
+}
+
+function tcp::offset (offset) {
+   // ensure reserved bits are 0
+   lib.bitfield(16, this->header(), 'off_flags', 4, 3, 0);
+
+   return lib.bitfield(16, this->header(), 'off_flags', 0, 4, offset);
+}
+
+// set all flags at once
+function tcp::flags (flags) {
+   return lib.bitfield(16, this->header(), 'off_flags', 7, 9, flags);
+}
+
+function tcp::ns (ns) {
+   return lib.bitfield(16, this->header(), 'off_flags', 7, 1, ns);
+}
+
+function tcp::cwr (cwr) {
+   return lib.bitfield(16, this->header(), 'off_flags', 8, 1, cwr);
+}
+
+function tcp::ece (ece) {
+   return lib.bitfield(16, this->header(), 'off_flags', 9, 1, ece);
+}
+
+function tcp::urg (urg) {
+   return lib.bitfield(16, this->header(), 'off_flags', 10, 1, urg);
+}
+
+function tcp::ack (ack) {
+   return lib.bitfield(16, this->header(), 'off_flags', 11, 1, ack);
+}
+
+function tcp::psh (psh) {
+   return lib.bitfield(16, this->header(), 'off_flags', 12, 1, psh);
+}
+
+function tcp::rst (rst) {
+   return lib.bitfield(16, this->header(), 'off_flags', 13, 1, rst);
+}
+
+function tcp::syn (syn) {
+   return lib.bitfield(16, this->header(), 'off_flags', 14, 1, syn);
+}
+
+function tcp::fin (fin) {
+   return lib.bitfield(16, this->header(), 'off_flags', 15, 1, fin);
+}
+
+function tcp::window_size (window_size) {
+   var h = this->header();
+   if( window_size != null ) {
+      h.window_size = htons(window_size);
+   }
+   return ntohs(h.window_size);
+}
+
+function tcp::checksum (payload, length, ip) {
+   var h = this->header();
+   if( payload ) {
+      var csum = 0;
+      if( ip ) {
+         // Checksum IP pseudo-header
+         var ph = ip->pseudo_header(length + this->sizeof(), 6);
+         csum = ipsum(ffi.cast("uint8_t *", ph), ffi.sizeof(ph), 0);
+      }
+      // Add TCP header
+      h.checksum = 0;
+      csum = ipsum(ffi.cast("uint8_t *", h),
+                   this->sizeof(), bit.bnot(csum));
+      // Add TCP payload
+      h.checksum = htons(ipsum(payload, length, bit.bnot(csum)));
+   }
+   return ntohs(h.checksum);
+}
+
+// override the default equality method
+function tcp::eq (other) {
+   //compare significant fields
+   return (this->src_port() == other->src_port()) &&
+         (this->dst_port() == other->dst_port()) &&
+         (this->seq_num() == other->seq_num()) &&
+         (this->ack_num() == other->ack_num());
+}
+
+var function test_tcp_checksum () {
+   var ipv4 = require("lib.protocol.ipv4");
+
+   var IP_BASE      = 14;
+   var IP_HDR_SIZE  = 20;
+   var TCP_BASE     = IP_BASE + IP_HDR_SIZE;
+   var TCP_HDR_SIZE = 20;
+   var PAYLOAD_BASE = TCP_BASE + TCP_HDR_SIZE;
+
+   var p = packet.from_string(lib.hexundump([=[
+      52:54:00:02:02:02 52:54:00:01:01:01 08 00 45 00
+      00 34 59 1a 40 00 40 06 00 00 c0 a8 14 a9 6b 15
+      f0 b4 de 0b 01 bb e7 db 57 bc 91 cd 18 32 80 10
+      05 9f 00 00 00 00 01 01 08 0a 06 0c 5c bd fa 4a
+      e1 65
+   ]=], 66));
+
+   var ip_hdr = ipv4->new_from_mem(p.data + IP_BASE, IP_HDR_SIZE);
+   var tcp_hdr = tcp->new_from_mem(p.data + TCP_BASE, TCP_HDR_SIZE);
+   assert(ip_hdr && tcp_hdr);
+   var payload_length = p.length - PAYLOAD_BASE;
+   var csum = tcp_hdr->checksum(p.data + PAYLOAD_BASE, payload_length, ip_hdr);
+   assert(csum == 0x382a, "Wrong TCP checksum");
+}
+
+function selftest () {
+   test_tcp_checksum();
+   tcp->new({});
+}
+
+tcp.selftest = selftest;
+
+return tcp;

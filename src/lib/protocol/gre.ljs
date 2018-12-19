@@ -1,0 +1,195 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+module(..., package.seeall);
+var ffi = require("ffi");
+var C = ffi.C;
+var header = require("lib.protocol.header");
+var lib = require("core.lib");
+var bitfield = lib.bitfield;
+var ipsum = require("lib.checksum").ipsum;
+var ntohs, htons, ntohl, htonl =
+   lib.ntohs, lib.htons, lib.ntohl, lib.htonl;
+
+// GRE uses a variable-length header as specified by RFCs 2784 and
+// 2890.  The actual size is determined by flag bits in the base
+// header.  This implementation only supports the checksum and key
+// extensions.  Note that most of the flags specified in the original
+// specification of RFC1701 have been deprecated.
+
+var gre = subClass(header);
+
+ffi.cdef([=[
+      typedef struct {
+         uint16_t bits; // Flags, version
+         uint16_t protocol;
+      } gre_h_t;
+]=]);
+
+// Class variables
+gre._name = "gre";
+gre._ulp = {
+   class_map = {
+                  [0x6558] = "lib.protocol.ethernet",
+                  [0x0800] = "lib.protocol.ipv4",
+                  [0x86dd] = "lib.protocol.ipv6",
+                },
+   method    = 'protocol' };
+gre->init(
+   {
+      [1] = ffi.typeof([=[
+            struct { gre_h_t h; }
+      ]=]),
+      [2] = ffi.typeof([=[
+            struct { gre_h_t h;
+                     uint32_t key; }
+      ]=]),
+      [3] = ffi.typeof([=[
+            struct { gre_h_t h;
+                     uint16_t csum;
+                     uint16_t reserved1; }
+      ]=]),
+      [4] = ffi.typeof([=[
+            struct { gre_h_t h;
+                     uint16_t csum;
+                     uint16_t reserved1;
+                     uint32_t key; }
+      ]=])
+   });
+
+var types = { base = 1, key = 2, csum = 3, csum_key = 4 };
+
+// Class methods
+
+var default = { protocol = 0 };
+function gre::new (config) {
+   var o = gre->superClass().new(this);
+   config = config || default;
+   var type = null;
+   o._checksum, o._key = false, false;
+   if( config ) {
+      if( config.checksum ) {
+         type = 'csum';
+         o._checksum = true;
+      }
+      if( config.key != null ) {
+         o._key = true;
+         if( type ) {
+            type = 'csum_key';
+         } else {
+            type = 'key';
+         }
+      }
+   }
+   if( type ) {
+      var header = o._headers[types[type]];
+      o._header = header;
+      var data = header.data;
+      header.box[0] = ffi.cast(header.ptr_t, data);
+      ffi.fill(data, ffi.sizeof(data));
+      if( o._key ) {
+         lib.bitfield(16, data.h, 'bits', 2, 1, 1);
+         o->key(config.key);
+      }
+      if( o._checksum ) {
+         lib.bitfield(16, data.h, 'bits', 0, 1, 1);
+      }
+   }
+   o->protocol(config.protocol);
+   return o;
+}
+
+function gre::new_from_mem (mem, size) {
+   var o = gre->superClass().new_from_mem(this, mem, size);
+   if( o == null ) {
+      return null;
+   }
+   var header = o._header;
+   var data = header.box[0];
+   // Reserved bits and version MUST be zero.  We don't support
+   // the sequence number option, i.e. the 'S' flag (bit 3) must
+   // be cleared as well
+   if( bitfield(16, data.h, 'bits', 3, 13) != 0 ) {
+      o->free();
+      return null;
+   }
+   var type = null;
+   if( bitfield(16, data.h, 'bits', 0, 1) == 1 ) {
+      type = 'csum';
+      o._checksum = true;
+   } else {
+      o._checksum = false;
+   }
+   if( bitfield(16, data.h, 'bits', 2, 1) == 1 ) {
+      if( type == 'csum' ) {
+         type = 'csum_key';
+      } else {
+         type = 'key';
+      }
+      o._key = true;
+   } else {
+      o._key = false;
+   }
+   if( type ) {
+      header = o._headers[types[type]];
+      header.box[0] = ffi.cast(header.ptr_t, mem);
+      o._header = header;
+   }
+   return o;
+}
+
+// Instance methods
+
+var function checksum(header, payload, length) {
+   var csum_in = header.csum;
+   header.csum = 0;
+   header.reserved1 = 0;
+   var csum = ipsum(payload, length,
+                      bit.bnot(ipsum(ffi.cast("uint8_t *", header),
+                                     ffi.sizeof(header), 0)));
+   header.csum = csum_in;
+   return csum;
+}
+
+// Returns nil if checksumming is disabled.  If payload and length is
+// supplied, the checksum is written to the header and returned to the
+// caller.  With nil arguments, the current checksum is returned.
+function gre::checksum (payload, length) {
+   if( ! this._checksum ) {
+      return null;
+   }
+   if( payload != null ) {
+      // Calculate and set the checksum
+      this->header().csum = htons(checksum(this->header(), payload, length));
+   }
+   return ntohs(this->header().csum);
+}
+
+function gre::checksum_check (payload, length) {
+   if( ! this._checksum ) {
+      return true;
+   }
+   return checksum(this->header(), payload, length) == lib.ntohs(this->header().csum);
+}
+
+// Returns nil if keying is disabled. Otherwise, the key is set to the
+// given value or the current key is returned if called with a nil
+// argument.
+function gre::key (key) {
+   if( ! this._key ) {
+      return null;
+   }
+   if( key != null ) {
+      this->header().key = htonl(key);
+   } else {
+      return ntohl(this->header().key);
+   }
+}
+
+function gre::protocol (protocol) {
+   if( protocol != null ) {
+      this->header().h.protocol = htons(protocol);
+   }
+   return(ntohs(this->header().h.protocol));
+}
+
+return gre;

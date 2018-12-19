@@ -1,0 +1,310 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+module(..., package.seeall);
+
+var ffi    = require("ffi");
+var lib    = require("core.lib");
+var consts = require("apps.lwaftr.constants");
+
+var ntohs = lib.ntohs;
+var htons = lib.htons;
+
+var ethertype_ipv4         = consts.ethertype_ipv4;
+var ethertype_ipv6         = consts.ethertype_ipv6;
+var ethernet_header_size   = consts.ethernet_header_size;
+var o_ipv4_total_length    = consts.o_ipv4_total_length;
+var o_ipv4_ver_and_ihl     = consts.o_ipv4_ver_and_ihl;
+var o_ipv4_flags           = consts.o_ipv4_flags;
+var o_ipv4_proto           = consts.o_ipv4_proto;
+var ipv6_fixed_header_size = consts.ipv6_fixed_header_size;
+var o_ipv6_payload_len     = consts.o_ipv6_payload_len;
+var o_ipv6_next_header     = consts.o_ipv6_next_header;
+
+var uint16_ptr_t = ffi.typeof('uint16_t *');
+
+var function get_ipv4_total_length(l3) {
+   return ntohs(ffi.cast(uint16_ptr_t, l3 + o_ipv4_total_length)[0]);
+}
+
+var function get_ipv4_ihl(l3) {
+   return (bit.band((l3 + o_ipv4_ver_and_ihl)[0], 0x0f));
+}
+
+var function get_ipv4_offset(l3) {
+   var flags_offset = ntohs(ffi.cast(uint16_ptr_t, l3 + o_ipv4_flags)[0]);
+   return (bit.band(0x1fff, flags_offset));
+}
+
+var function get_ipv4_protocol(l3) {
+   return l3[o_ipv4_proto];
+}
+
+var function get_ipv6_payload_length(l3) {
+   return ntohs(ffi.cast(uint16_ptr_t, l3 + o_ipv6_payload_len)[0]);
+}
+
+var function set_ipv6_payload_length(l3, length) {
+   (ffi.cast(uint16_ptr_t, l3 + o_ipv6_payload_len))[0] = htons(length);
+}
+
+var function get_ipv6_next_header(l3) {
+   return l3[o_ipv6_next_header];
+}
+
+var function set_ipv6_next_header(l3, type) {
+   l3[o_ipv6_next_header] = type;
+}
+
+var function ptr_to(ctype) {
+   return ffi.typeof('$*', ctype);
+}
+
+var ipv6_ext_hdr_t = ffi.typeof([=[
+   struct {
+      uint8_t next_header;
+      uint8_t length;
+      uint8_t data[0];
+   }  __attribute__((packed))
+]=]);
+var ipv6_ext_hdr_ptr_t = ptr_to(ipv6_ext_hdr_t);
+
+var ipv6_frag_hdr_t = ffi.typeof([=[
+   struct {
+      uint8_t next_header;
+      uint8_t reserved;
+      uint16_t offset_flags;
+      uint32_t identificaton;
+   }  __attribute__((packed))
+]=]);
+var ipv6_frag_hdr_ptr_t = ptr_to(ipv6_frag_hdr_t);
+
+var function ipv6_generic_ext_hdr(ptr) {
+   var ext_hdr = ffi.cast(ipv6_ext_hdr_ptr_t, ptr);
+   var next_header = ext_hdr.next_header;
+   var length = ext_hdr.length;
+   // Length in units of 8 bytes, not including the first 8 bytes
+   return length * 8 + 8, next_header;
+}
+
+// The fragmentation header inspector sets this upvalue as a side
+// effect.  Only at most one fragmentation header is expected in a
+// header chain.
+var ipv6_frag_offset;
+
+var ipv6_ext_hdr_fns = {
+   [0] =
+      // Hop-by-hop
+      ipv6_generic_ext_hdr,
+   [43] =
+      // Routing
+      ipv6_generic_ext_hdr,
+   [44] =
+      // Fragmentation, fixed size (8 bytes)
+      function(ptr) {
+         var frag_hdr = ffi.cast(ipv6_frag_hdr_ptr_t, ptr);
+         var next_header = frag_hdr.next_header;
+         ipv6_frag_offset = bit.rshift(ntohs(frag_hdr.offset_flags), 3);
+         return 8, next_header;
+      },
+   [51] =
+      // IPSec authentication header RFC4302.  Next header and length
+      // fields are the same as for a generic header, but the units of
+      // the length differs.
+      function(ptr) {
+         var ext_hdr = ffi.cast(ipv6_ext_hdr_ptr_t, ptr);
+         var next_header = ext_hdr.next_header;
+         // Length in units of 4 bytes minus 2
+         var payload_len = ext_hdr.length;
+         return payload_len * 4 - 2, next_header;
+      },
+   [59] =
+      // No next header
+      function(ptr) {
+         return 0, 255;
+      },
+   [60] =
+      // Destination
+      ipv6_generic_ext_hdr,
+   [135] =
+      // Mobility RFC6275
+      ipv6_generic_ext_hdr,
+   [139] =
+      // HIP RFC7401
+      ipv6_generic_ext_hdr,
+   [140] =
+      // Shim6 RFC5533
+      ipv6_generic_ext_hdr,
+};
+
+var function traverse_extension_headers(pkt, l3, squash) {
+   var payload = l3 + ipv6_fixed_header_size;
+   var payload_length = get_ipv6_payload_length(l3);
+   // This differs from payload_length if the packet is truncated
+   var eff_payload_length = pkt.data + pkt.length - payload;
+   var ulp = get_ipv6_next_header(l3);
+
+   var next_header = ulp;
+   var ext_hdrs_size = 0;
+   ipv6_frag_offset = 0;
+   var ipv6_ext_hdr_fn = ipv6_ext_hdr_fns[next_header];
+   while( ipv6_ext_hdr_fn ) {
+      hdr_size, next_header = ipv6_ext_hdr_fn(payload + ext_hdrs_size);
+      ext_hdrs_size +=   hdr_size;
+      if( ext_hdrs_size < 0 || ext_hdrs_size > eff_payload_length ) {
+         // The extension header has lead us out of the packet, bail
+         // out and leave the packet unmodified. The ulp returned to
+         // the caller is the next header field of the basic header.
+         goto exit;
+      }
+      ipv6_ext_hdr_fn = ipv6_ext_hdr_fns[next_header];
+   }
+   // All extension headers known to us have been skipped. next_header
+   // contains what we consider as the "upper layer protocol".
+   ulp = next_header;
+   if( ext_hdrs_size > 0 && squash ) {
+      pkt.length = pkt.length - ext_hdrs_size;
+      payload_length -=   ext_hdrs_size;
+      set_ipv6_next_header(l3, ulp);
+      set_ipv6_payload_length(l3, payload_length);
+      ffi.C.memmove(payload, payload + ext_hdrs_size,
+                    eff_payload_length - ext_hdrs_size
+                       + ffi.sizeof(pkt_meta_data_t));
+   }
+   exit:
+   return payload_length, ulp;
+}
+
+ether_header_t = ffi.typeof([=[
+   struct {
+      uint8_t dhost[6];
+      uint8_t shost[6];
+      union {
+         struct {
+            uint16_t type;
+         } ether;
+         struct {
+            uint16_t tpid;
+            uint16_t tci;
+            uint16_t type;
+         } dot1q;
+      };
+   } __attribute__((packed))
+]=]);
+ether_header_ptr_t = ptr_to(ether_header_t);
+
+var magic_number = 0x5ABB;
+
+pkt_meta_data_t = ffi.typeof([=[
+   struct {
+      uint16_t magic;
+      /* Actual ethertype for single-tagged frames */
+      uint16_t ethertype;
+      /* vlan == 0 if untagged frame */
+      uint16_t vlan;
+      /* Total size, excluding the L2 header */
+      uint16_t total_length;
+      /* Pointer and length that can be passed directly to a pflua filter */
+      uint8_t *filter_start;
+      uint16_t filter_length;
+      /* Pointers to the L3 and L4 headers */
+      uint8_t *l3;
+      uint8_t *l4;
+      /* Offsets of the respective pointers relative to the
+         start of the packet.  Used to re-calculate the
+         pointers by copy() */
+      uint16_t filter_offset;
+      uint16_t l3_offset;
+      uint16_t l4_offset;
+      uint8_t proto;
+      /* Fragment offset in units of 8 bytes.  Equals 0 if not fragmented
+         or initial fragment */
+      uint8_t frag_offset;
+      /* Difference between packet length and length
+         according to the l3 header, negative if the
+         packet is truncated, == 0 if not. A positive value
+         would indicate that the packet contains some kind
+         of padding.  This should not occur under normal
+         circumstances. */
+      int16_t length_delta;
+      /* Used by the rss app */
+      uint16_t ref;
+      uint16_t hash;
+   } __attribute__((packed))
+]=]);
+pkt_meta_data_ptr_t = ptr_to(pkt_meta_data_t);
+
+var function md_ptr (pkt) {
+   assert(ffi.C.PACKET_PAYLOAD_SIZE - pkt.length >= ffi.sizeof(pkt_meta_data_t));
+   return ffi.cast(pkt_meta_data_ptr_t, pkt.data + pkt.length);
+}
+
+var function set_pointers (md, pkt) {
+   var data = pkt.data;
+   md.filter_start = data + md.filter_offset;
+   md.l3 = data + md.l3_offset;
+   md.l4 = data + md.l4_offset;
+}
+
+function get (pkt) {
+   var md = md_ptr(pkt);
+   assert(md.magic == magic_number);
+   return md;
+}
+
+function copy (pkt) {
+   var smd = get(pkt);
+   var cpkt = packet.clone(pkt);
+   var dmd = md_ptr(cpkt);
+   ffi.copy(dmd, smd, ffi.sizeof(pkt_meta_data_t));
+   set_pointers(dmd, cpkt);
+   return cpkt;
+}
+
+function add (pkt, rm_ext_headers, vlan_override) {
+   var vlan = 0;
+   var filter_offset = 0;
+   var l3_offset = ethernet_header_size;
+   var hdr = ffi.cast(ether_header_ptr_t, pkt.data);
+   var ethertype = lib.ntohs(hdr.ether.type);
+   if( ethertype == 0x8100 ) {
+      ethertype = lib.ntohs(hdr.dot1q.type);
+      vlan = bit.band(lib.ntohs(hdr.dot1q.tci), 0xFFF);
+      filter_offset = 4;
+      l3_offset +=   filter_offset;
+   }
+
+   var md = md_ptr(pkt);
+   md.magic = magic_number;
+   md.ref = 0;
+   md.ethertype = ethertype;
+   md.vlan = vlan_override || vlan;
+   md.l3_offset = l3_offset;
+   var l3 = pkt.data + l3_offset;
+
+   if( ethertype == ethertype_ipv4 ) {
+      md.total_length = get_ipv4_total_length(l3);
+      md.l4_offset = l3_offset + 4 * get_ipv4_ihl(l3);
+      md.frag_offset = get_ipv4_offset(l3);
+      md.proto = get_ipv4_protocol(l3);
+   } else if( ethertype == ethertype_ipv6 ) {
+      // Optionally remove all extension headers from the packet and
+      // track the position of the metadata block
+      var payload_length, next_header =
+         traverse_extension_headers(pkt, l3, rm_ext_headers);
+      md = get(pkt);
+      md.total_length = payload_length + ipv6_fixed_header_size;
+      md.l4_offset = l3_offset + ipv6_fixed_header_size;
+      md.frag_offset = ipv6_frag_offset;
+      md.proto = next_header;
+   } else {
+      md.total_length = pkt.length - l3_offset;
+      md.l4_offset = l3_offset;
+   }
+
+   md.filter_offset = filter_offset;
+   md.filter_length = pkt.length - filter_offset;
+   md.length_delta = pkt.length - l3_offset - md.total_length;
+   set_pointers(md, pkt);
+
+   return md;
+}

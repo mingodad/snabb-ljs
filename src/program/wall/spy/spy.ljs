@@ -1,0 +1,226 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+module(..., package.seeall);
+
+var lib   = require("core.lib");
+var now   = require("core.app").now;
+var timer = require("core.timer");
+var ipv4  = require("lib.protocol.ipv4");
+var ipv6  = require("lib.protocol.ipv6");
+var util  = require("apps.wall.util");
+var scan  = require("apps.wall.scanner");
+var const = require("apps.wall.constants");
+var proto = require("ndpi").protocol;
+var comm  = require("program.wall.common");
+var ntohs = lib.ntohs;
+
+var long_opts = {
+   help = "h",
+   live = "l",
+   stats = "s",
+   duration = "D",
+};
+
+var function printf(fmt, ...) {
+   io.write(fmt->format(...));
+}
+
+var function report_flow(scanner, flow) {
+   var lo_addr, hi_addr = "<unknown>", "<unknown>";
+   var eth_type = flow.key->eth_type();
+   if( eth_type == const.ETH_TYPE_IPv4 ) {
+      lo_addr = ipv4->ntop(flow.key.lo_addr);
+      hi_addr = ipv4->ntop(flow.key.hi_addr);
+   } else if( eth_type == const.ETH_TYPE_IPv6 ) {
+      lo_addr = ipv6->ntop(flow.key.lo_addr);
+      hi_addr = ipv6->ntop(flow.key.hi_addr);
+   }
+
+   if( flow.proto_master != proto.PROTOCOL_UNKNOWN ) {
+      printf("%#010x %4dp %15s:%-5d - %15s:%-5d  %s:%s\n",
+         flow.key->hash(), flow.packets,
+         lo_addr, ntohs(flow.key.lo_port),
+         hi_addr, ntohs(flow.key.hi_port),
+         scanner->protocol_name(flow.protocol),
+         scanner->protocol_name(flow.proto_master));
+   } else {
+      printf("%#010x %4dp %15s:%-5d - %15s:%-5d  %s\n",
+         flow.key->hash(), flow.packets,
+         lo_addr, ntohs(flow.key.lo_port),
+         hi_addr, ntohs(flow.key.hi_port),
+         scanner->protocol_name(flow.protocol));
+   }
+}
+
+var function report_summary(scanner) {
+   for( flow in scanner->flows() ) {
+      report_flow(scanner, flow);
+   }
+}
+
+var LiveReporter = setmetatable({}, util.SouthAndNorth);
+LiveReporter.__index = LiveReporter;
+
+function LiveReporter::new (scanner) {
+   return setmetatable({ scanner = scanner }, this);
+}
+
+function LiveReporter::on_northbound_packet (p) {
+   var flow = this.scanner->get_flow(p);
+   if( flow && ! flow.reported ) {
+      var proto = this.scanner->protocol_name(flow.protocol);
+      if( proto->lower() != "unknown" ) {
+         report_flow(this.scanner, flow);
+         flow.reported = true;
+      }
+   }
+   return p;
+}
+LiveReporter.on_southbound_packet = LiveReporter.on_northbound_packet;
+
+
+var StatsReporter = setmetatable({}, util.SouthAndNorth);
+StatsReporter .__index = StatsReporter;
+
+function StatsReporter::new (opts) {
+   var app = setmetatable({
+      scanner = opts.scanner,
+      file = opts.output || io.stdout,
+      start_time = now(),
+      packets = 0,
+      bytes = 0,
+      timer = false,
+   }, this);
+   if( opts.period ) {
+      app.timer = timer.new("stats_reporter",
+                            function () { app->report_stats(); },
+                            opts.period * 1e9);
+      timer.activate(app.timer);
+   }
+   return app;
+}
+
+function StatsReporter::stop () {
+   // Avoid timer being re-armed in the next call to :on_timer_tick()
+   this.timer = false;
+}
+
+function StatsReporter::on_northbound_packet (p) {
+   this.packets = this.packets + 1;
+   this.bytes = this.bytes + p.length;
+   return p;
+}
+StatsReporter.on_southbound_packet = StatsReporter.on_northbound_packet;
+
+var stats_format = "=== %s === %d Bytes, %d packets, %.3f B/s, %.3f PPS\n";
+function StatsReporter::report_stats () {
+   var cur_time = now();
+   var elapsed = cur_time - this.start_time;
+
+   this.file->write(stats_format->format(os.date("%Y-%m-%dT%H:%M:%S%z"),
+                                       this.bytes,
+                                       this.packets,
+                                       this.bytes / elapsed,
+                                       this.packets / elapsed));
+   this.file->flush();
+
+   // Reset counters.
+   this.packets, this.bytes, this.start_time = 0, 0, cur_time;
+
+   // Re-arm timer.
+   if( this.timer ) {
+      timer.activate(this.timer);
+   }
+}
+
+
+var function setup_input(c, input_spec) {
+   var kind, arg = input_spec_pattern->match(input_spec);
+   if( ! kind ) {
+      kind, arg = "pcap", input_spec;
+   }
+   if( ! comm.inputs[kind] ) {
+      return null, "No such input kind: " .. kind;
+   }
+   return comm.inputs[kind](kind, arg);
+}
+
+
+function run (args) {
+   var live, stats = false, false;
+   var duration;
+   var opt = {
+      l = function (arg) {
+         live = true;
+      },
+      s = function (arg) {
+         stats = true;
+      },
+      h = function (arg) {
+         print(require("program.wall.spy.README_inc"));
+         main.exit(0);
+      },
+      D = function (arg) {
+         duration = tonumber(arg);
+      }
+   };
+
+   args = lib.dogetopt(args, opt, "hlsD:", long_opts);
+   if( #args != 2 ) {
+      print(require("program.wall.spy.README_inc"));
+      main.exit(1);
+   }
+
+   if( ! comm.inputs[args[1]] ) {
+      io.stderr->write("No such input available: ", args[1], "\n");
+      main.exit(1);
+   }
+
+   var source_link_name, app = comm.inputs[args[1]](args[1], args[2]);
+   if( ! source_link_name ) {
+      io.stderr->write(app, "\n");
+      main.exit(1);
+   }
+
+   // FIXME: When multiple scanners are available, allow selecting others.
+   var s = require("apps.wall.scanner.ndpi")->new();
+
+   var c = config.new();
+   config.app(c, "source", unpack(app));
+   config.app(c, "l7spy", require("apps.wall.l7spy").L7Spy, { scanner = s });
+   config.link(c, "source." .. source_link_name .. " -> l7spy.south");
+   var last_app_name = "l7spy";
+
+   if( stats ) {
+      config.app(c, "stats", StatsReporter, {
+         scanner = s, period = live && 2.0 || false });
+      config.link(c, last_app_name .. ".north -> stats.south");
+      last_app_name = "stats";
+   }
+
+   if( live ) {
+      config.app(c, "report", LiveReporter, s);
+      config.link(c, last_app_name .. ".north -> report.south");
+      last_app_name = "report";
+   }
+
+   var done;
+   if( ! duration ) {
+      done = function () {
+         return engine.app_table.source.done;
+      };
+   }
+
+   engine.configure(c);
+   engine.busywait = true;
+   engine.main ({
+      duration = duration,
+      done = done
+   });
+
+   if( ! live ) {
+      report_summary(s);
+   }
+   if( stats ) {
+      engine.app_table.stats->report_stats();
+   }
+}

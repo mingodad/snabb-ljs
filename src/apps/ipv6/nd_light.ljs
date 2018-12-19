@@ -1,0 +1,414 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+// This app implements a small subset of IPv6 neighbor discovery
+// (RFC4861).  It has two ports, north and south.  The south port
+// attaches to a port on which ND must be performed.  The north port
+// attaches to an app that processes IPv6 packets.  Packets
+// transmitted to and received from the north port contain full
+// Ethernet frames.
+//
+// The app replies to neighbor solicitations for which it is
+// configured as taarget and performs rudimentary address resolution
+// for its configured "next-hop" address.  This is done by
+// transmitting a neighbor solicitation for the hext-hop with a
+// configurable number of retransmits (default 10) with a configurable
+// interval (default 1000ms) and processing the (solicited) neighbor
+// advertisements.
+//
+// If address resolution succeeds, the app constructs an Ethernet
+// header with the discovered destination address, configured source
+// address and ethertype 0x86dd and overwrites the headers of all
+// packets received from the north port with it.  The resulting
+// packets are transmitted to the south port.  All packets from the
+// north port are discarded as long as ND has not yet succeeded.
+//
+// Address resolution is not repeated for the lifetime of the app.
+// The app terminates if address resolution has not succeeded after
+// all retransmits have been performed.
+//
+// Packets received from the south port are transmitted to the north
+// port unaltered, i.e. including the Ethernet header.
+
+module(..., package.seeall);
+var ffi = require("ffi");
+var C = ffi.C;
+var app = require("core.app");
+var link = require("core.link");
+var config = require("core.config");
+var packet = require("core.packet");
+var counter = require("core.counter");
+var datagram = require("lib.protocol.datagram");
+var ethernet = require("lib.protocol.ethernet");
+var ipv6 = require("lib.protocol.ipv6");
+var icmp = require("lib.protocol.icmp.header");
+var ns = require("lib.protocol.icmp.nd.ns");
+var na = require("lib.protocol.icmp.nd.na");
+var tlv = require("lib.protocol.icmp.nd.options.tlv");
+var filter = require("lib.pcap.filter");
+var timer = require("core.timer");
+var lib = require("core.lib");
+
+nd_light = subClass(null);
+nd_light._name = "Partial IPv6 neighbor discovery";
+nd_light.config = {
+   local_mac = {required=true},
+   remote_mac = {},
+   local_ip = {required=true},
+   next_hop =  {required=true},
+   delay = {default=1000},
+   retrans = {},
+   quiet = {default=false}
+};
+nd_light.shm = {
+   status                   = {counter, 2}, // Link down
+   rxerrors                 = {counter},
+   txerrors                 = {counter},
+   txdrop                   = {counter},
+   ns_checksum_errors       = {counter},
+   ns_target_address_errors = {counter},
+   na_duplicate_errors      = {counter},
+   na_target_address_errors = {counter},
+   nd_protocol_errors       = {counter}
+};
+
+// config:
+//   local_mac  MAC address of the interface attached to "south".
+//              Accepted formats:
+//                6-byte on-the-wire representaion, either as a cdata
+//                object (e.g. as returned by lib.protocol.ethernet:pton())
+//                or a Lua string of lengh 6.
+//
+//                String with regular colon-notation.
+//   local_ip   IPv6 address of the interface. Accepted formats:
+//                16-byte on-the-wire representation, either as a cdata
+//                object (e.g as returned by lib.protocol.ipv6:pton()) or
+//                a Lus string of length 16.
+//   next_hop   IPv6 address of next-hop for all packets to south.  Accepted
+//              formats as for local_ip.
+//   remote_mac Optional MAC address of next_hop in case dynamic ND is not
+//              available on the link
+//   delay      NS retransmit delay in ms (default 1000ms)
+//   retrans    Number of NS retransmits (default 10)
+var function check_ip_address (ip, desc) {
+   if( type(ip) == "string" && string.len(ip) != 16 ) {
+      ip = ipv6->pton(ip);
+   } else {
+      assert(type(ip) == "cdata",
+             "nd_light: invalid type of "..desc.." IP address, expected cdata, got "
+                ..type(ip));
+   }
+   return ip;
+}
+
+var function check_mac_address (mac, desc) {
+   if( type(mac) == "string" && string.len(mac) != 6 ) {
+      mac = ethernet->pton(mac);
+   } else {
+      assert(type(mac) == "cdata",
+             "nd_light: invalid type of "..desc.." MAC address, expected cdata, got "
+                ..type(mac));
+   }
+   return mac;
+}
+
+function _new (this, conf) {
+   conf.local_ip = check_ip_address(conf.local_ip, "local");
+   conf.next_hop = check_ip_address(conf.next_hop, "next-hop");
+   conf.local_mac = check_mac_address(conf.local_mac, "local");
+   if( conf.remote_mac ) {
+      conf.remote_mac = check_mac_address(conf.remote_mac, "remote");
+      this._eth_header = ethernet->new({ src = conf.local_mac,
+                                        dst = conf.remote_mac,
+                                        type = 0x86dd });
+   }
+
+   this._config = conf;
+   this._match_ns = function(ns) {
+                    return(ns->target_eq(conf.local_ip));
+                 };
+   this._match_na = function(na) {
+                    return(na->target_eq(conf.next_hop) && na->solicited() == 1);
+                 };
+
+   // Prepare packet for solicitation of next hop
+   var nh = this._next_hop;
+   var dgram = datagram->new();
+   var sol_node_mcast = ipv6->solicited_node_mcast(conf.next_hop);
+   var ipv6 = ipv6->new({ next_header = 58, // ICMP6
+         hop_limit = 255,
+         src = conf.local_ip,
+         dst = sol_node_mcast });
+   var icmp = icmp->new(135, 0);
+
+   // Construct a neighbor solicitation with a source link-layer
+   // option.
+   var ns = ns->new(conf.next_hop);
+   var src_lladdr_tlv = tlv->new(1, conf.local_mac)->tlv();
+   var src_lladdr_tlv_len = ffi.sizeof(src_lladdr_tlv);
+   // We add both chunks to the payload rather than using push() for
+   // the ns header to have everything in a contiguous block for
+   // checksum calculation.
+   dgram->payload(ns->header(), ns->sizeof());
+   var mem, length = dgram->payload(src_lladdr_tlv, src_lladdr_tlv_len);
+   icmp->checksum(mem, length, ipv6);
+   dgram->push(icmp);
+   ipv6->payload_length(icmp->sizeof() + ns->sizeof() + src_lladdr_tlv_len);
+   dgram->push(ipv6);
+   dgram->push(ethernet->new({ src = conf.local_mac,
+                             dst = ethernet->ipv6_mcast(sol_node_mcast),
+                             type = 0x86dd }));
+   nh.packet = dgram->packet();
+   dgram->free();
+
+   // Prepare packet for solicited neighbor advertisement
+   var sna = this._sna;
+   dgram = datagram->new();
+   // Leave dst address unspecified.  It will be set to the source of
+   // the incoming solicitation
+   ipv6 = ipv6->new({ next_header = 58, // ICMP6
+                     hop_limit = 255,
+                     src = conf.local_ip });
+   icmp = icmp->new(136, 0);
+   // Construct a neighbor solicitation with a target link-layer
+   // option.
+   var na = na->new(conf.local_ip, null, 1, null);
+   var tgt_lladdr_tlv = tlv->new(2, conf.local_mac)->tlv();
+   var tgt_lladdr_tlv_len = ffi.sizeof(tgt_lladdr_tlv);
+   dgram->payload(na->header(), na->sizeof());
+   mem, length = dgram->payload(tgt_lladdr_tlv, tgt_lladdr_tlv_len);
+   icmp->checksum(mem, length, ipv6);
+   dgram->push(icmp);
+   ipv6->payload_length(icmp->sizeof() + na->sizeof() + tgt_lladdr_tlv_len);
+   dgram->push(ipv6);
+   // Leave dst address unspecified.
+   dgram->push(ethernet->new({ src = conf.local_mac,
+                             type = 0x86dd }));
+   sna.packet = dgram->packet();
+
+   // Parse the headers we want to modify later on from our template
+   // packet.
+   dgram = dgram->new(sna.packet, ethernet);
+   dgram->parse_n(3);
+   sna.eth, sna.ipv6, sna.icmp = unpack(dgram->stack());
+   sna.dgram = dgram;
+   return this;
+}
+
+function nd_light::new (arg) {
+   var o = nd_light->superClass().new(this);
+   var nh = { nsent = 0 };
+   o._next_hop = nh;
+   o._sna = {};
+   var errmsg;
+   o._filter, errmsg = filter->new("icmp6 and ( ip6[40] = 135 or ip6[40] = 136 )");
+   assert(o._filter, errmsg && ffi.string(errmsg));
+
+   _new(o, arg);
+
+   // Timer for retransmits of neighbor solicitations
+   nh.timer_cb = function (t) {
+      var nh = o._next_hop;
+      // If nh.packet is nil the app was stopped and we
+      // bail out.
+      if( ! nh.packet ) { return null; }
+      if( ! o._config.quiet ) {
+         o._logger->log(string.format("Sending neighbor solicitation for next-hop %s",
+                                     ipv6->ntop(o._config.next_hop)));
+      }
+      link.transmit(o.output.south, packet.clone(nh.packet));
+      nh.nsent = nh.nsent + 1;
+      if( (! o._config.retrans || nh.nsent <= o._config.retrans)
+         && ! o._eth_header
+      ) {
+         timer.activate(nh.timer);
+      }
+      if( o._config.retrans && nh.nsent > o._config.retrans ) {
+         error(string.format("ND for next hop %s has failed",
+                             ipv6->ntop(o._config.next_hop)));
+      }
+   };
+   nh.timer = timer.new("ns retransmit",
+                        nh.timer_cb, 1e6 * o._config.delay);
+
+   // Caches for for various cdata pointer objects to avoid boxing in
+   // the push() loop
+   o._cache = {
+      p = ffi.new("struct packet *[1]"),
+      mem = ffi.new("uint8_t *[1]")
+   };
+   o._logger = lib.logger_new({ module = 'nd_light' });
+
+   return o;
+}
+
+function nd_light::reconfig (arg) {
+   // Free static packets
+   this->stop();
+   return _new(this, arg);
+}
+
+// Process neighbor solicitation
+var function xns(this, dgram, eth, ipv6, icmp) { //DADBUG redefinition
+   var mem, length = this._cache.mem;
+   mem[0], length = dgram->payload();
+   if( ! icmp->checksum_check(mem[0], length, ipv6) ) {
+      counter.add(this.shm.ns_checksum_errors);
+      counter.add(this.shm.rxerrors);
+      return null;
+   }
+   // Parse the neighbor solicitation and check if it contains our own
+   // address as target
+   var ns = dgram->parse_match(null, this._match_ns);
+   if( ! ns ) {
+      counter.add(this.shm.ns_target_address_errors);
+      counter.add(this.shm.rxerrors);
+      return null;
+   }
+   // Ignore options as long as we don't implement a proper neighbor
+   // cache.
+
+   // Set Ethernet and IPv6 destination addresses and re-compute the
+   // ICMP checksum
+   var sna = this._sna;
+   sna.eth->dst(eth->src());
+   sna.ipv6->dst(ipv6->src());
+   // The payload of the pre-fabricated packet consists of the NA and
+   // target ll-option
+   mem[0], length = sna.dgram->payload();
+   sna.icmp->checksum(mem[0], length, sna.ipv6);
+   return true;
+}
+
+// Process neighbor advertisement
+var function xna(this, dgram, eth, ipv6, icmp) {  //DADBUG redefinition
+   if( this._eth_header ) {
+      counter.add(this.shm.na_duplicate_errors);
+      counter.add(this.shm.rxerrors);
+      return null;
+   }
+   var na = dgram->parse_match(null, this._match_na);
+   if( ! na ) {
+      counter.add(this.shm.na_target_address_errors);
+      counter.add(this.shm.rxerrors);
+      return null;
+   }
+   var option = na->options(dgram->payload());
+   if( ! (#option == 1 && option[1]->type() == 2) ) {
+      // Invalid NS, ignore
+      counter.add(this.shm.nd_protocol_errors);
+      counter.add(this.shm.rxerrors);
+      return null;
+   }
+   this._eth_header = ethernet->new({ src = this._config.local_mac,
+                                     dst = option[1]->option()->addr(),
+                                     type = 0x86dd });
+   this._logger->log(string.format("Resolved next-hop %s to %s",
+                                  ipv6->ntop(this._config.next_hop),
+                                  ethernet->ntop(option[1]->option()->addr())));
+   counter.set(this.shm.status, 1); // Link up
+   return null;
+}
+
+var function from_south (this, p) {
+   if( ! this._filter->match(p[0].data, p[0].length) ) {
+      return false;
+   }
+   var dgram = datagram->new(p[0], ethernet);
+   // Parse the ethernet, ipv6 amd icmp headers
+   dgram->parse_n(3);
+   var eth, ipv6, icmp = unpack(dgram->stack());
+   if( ipv6->hop_limit() != 255 ) {
+      // Avoid off-link spoofing as per RFC
+      counter.add(this.shm.nd_protocol_errors);
+      counter.add(this.shm.rxerrors);
+      return null;
+   }
+   var result;
+   if( icmp->type() == 135 ) {
+      result = xns(this, dgram, eth, ipv6, icmp);
+   } else {
+      result = xna(this, dgram, eth, ipv6, icmp);
+   }
+   dgram->free();
+   return result;
+}
+
+function nd_light::push () {
+   if( this._next_hop.nsent == 0 && this._eth_header == null ) {
+      // Kick off address resolution
+      this._next_hop.timer_cb();
+   }
+
+   var cache = this._cache;
+   var l_in = this.input.south;
+   var l_out = this.output.north;
+   var l_reply = this.output.south;
+   while( ! link.empty(l_in) ) {
+      var p = cache.p;
+      p[0] = link.receive(l_in);
+      var status = from_south(this, p);
+      if( status == null ) {
+         // Discard
+         packet.free(p[0]);
+      } else if( status == true ) {
+         // Send NA back south
+         packet.free(p[0]);
+         link.transmit(l_reply, packet.clone(this._sna.packet));
+      } else {
+         // Send transit traffic up north
+         link.transmit(l_out, p[0]);
+      }
+   }
+
+   l_in = this.input.north;
+   l_out = this.output.south;
+   while( ! link.empty(l_in) ) {
+      if( ! this._eth_header ) {
+         // Drop packets until ND for the next-hop
+         // has completed.
+         packet.free(link.receive(l_in));
+         counter.add(this.shm.txdrop);
+      } else {
+         var p = cache.p;
+         p[0] = link.receive(l_in);
+         if( p[0].length >= this._eth_header->sizeof() ) {
+            this._eth_header->copy(p[0].data);
+            link.transmit(l_out, p[0]);
+         } else {
+            packet.free(p[0]);
+            counter.add(this.shm.txerrors);
+         }
+      }
+   }
+}
+
+// Free static packets on `stop'.
+function nd_light::stop () {
+   packet.free(this._next_hop.packet);
+   this._next_hop.packet = null;
+   packet.free(this._sna.packet);
+   this._sna.packet = null;
+}
+
+function selftest () {
+   var sink = require("apps.basic.basic_apps").Sink;
+   var c = config.new();
+   config.app(c, "nd1", nd_light, { local_mac = "00:00:00:00:00:01",
+                                    local_ip  = "2001:DB8::1",
+                                    next_hop  = "2001:DB8::2" });
+   config.app(c, "nd2", nd_light, { local_mac = "00:00:00:00:00:02",
+                                    local_ip  = "2001:DB8::2",
+                                    next_hop  = "2001:DB8::1" });
+   config.app(c, "sink1", sink);
+   config.app(c, "sink2", sink);
+   config.link(c, "nd1.south -> nd2.south");
+   config.link(c, "nd2.south -> nd1.south");
+   config.link(c, "sink1.tx -> nd1.north");
+   config.link(c, "nd1.north -> sink1.rx");
+   config.link(c, "sink2.tx -> nd2.north");
+   config.link(c, "nd2.north -> sink2.rx");
+   engine.configure(c);
+   engine.main({ duration = 2 });
+   assert(engine.app_table.nd1._eth_header);
+   assert(engine.app_table.nd2._eth_header);
+}

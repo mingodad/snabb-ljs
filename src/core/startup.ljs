@@ -1,0 +1,8 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+var ok, err = pcall(require, "core.main");
+if( ! ok ) {
+   print("startup: unhandled exception");
+   //print(debug.traceback());
+   print(err);
+   os.exit(1);
+}

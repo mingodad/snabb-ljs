@@ -1,0 +1,570 @@
+test_processes
+  [test_processes->test_execve] 	Ok
+  [test_processes->test_fork_wait] test_processes
+  [test_processes->test_execve] 	Ok
+  [test_processes->test_fork_wait] 	Ok
+  [test_processes->test_fork_wait3] test_processes
+  [test_processes->test_execve] 	Ok
+  [test_processes->test_fork_wait] 	Ok
+  [test_processes->test_fork_wait3] 	Ok
+  [test_processes->test_fork_wait4] test_processes
+  [test_processes->test_execve] 	Ok
+  [test_processes->test_fork_wait] 	Ok
+  [test_processes->test_fork_wait3] 	Ok
+  [test_processes->test_fork_wait4] 	Ok
+  [test_processes->test_fork_waitid] test_processes
+  [test_processes->test_execve] 	Ok
+  [test_processes->test_fork_wait] 	Ok
+  [test_processes->test_fork_wait3] 	Ok
+  [test_processes->test_fork_wait4] 	Ok
+  [test_processes->test_fork_waitid] 	Ok
+  [test_processes->test_fork_waitpid] test_processes
+  [test_processes->test_execve] 	Ok
+  [test_processes->test_fork_wait] 	Ok
+  [test_processes->test_fork_wait3] 	Ok
+  [test_processes->test_fork_wait4] 	Ok
+  [test_processes->test_fork_waitid] 	Ok
+  [test_processes->test_fork_waitpid] 	Ok
+  [test_processes->test_nice] 	Ok
+  [test_processes->test_setpgid] 	Ok
+  [test_processes->test_setsid] test_processes
+  [test_processes->test_execve] 	Ok
+  [test_processes->test_fork_wait] 	Ok
+  [test_processes->test_fork_wait3] 	Ok
+  [test_processes->test_fork_wait4] 	Ok
+  [test_processes->test_fork_waitid] 	Ok
+  [test_processes->test_fork_waitpid] 	Ok
+  [test_processes->test_nice] 	Ok
+  [test_processes->test_setpgid] 	Ok
+  [test_processes->test_setsid] test_processes
+  [test_processes->test_execve] 	Ok
+  [test_processes->test_fork_wait] 	Ok
+  [test_processes->test_fork_wait3] 	Ok
+  [test_processes->test_fork_wait4] 	Ok
+  [test_processes->test_fork_waitid] 	Ok
+  [test_processes->test_fork_waitpid] 	Ok
+  [test_processes->test_nice] 	Ok
+  [test_processes->test_setpgid] 	Ok
+  [test_processes->test_setsid] 	Ok
+test_signals_linux
+  [test_signals_linux->test_itimer] 	Ok
+  [test_signals_linux->test_sigprocmask] 	Ok
+test_util
+  [test_util->test_basename_dirname] 	Ok
+  [test_util->test_cp] 	Ok
+  [test_util->test_readfile_writefile] 	Ok
+  [test_util->test_rm_broken_symlink] 	Ok
+  [test_util->test_rm_recursive] 	Ok
+  [test_util->test_touch] 	Ok
+test_seccomp
+  [test_seccomp->test_no_new_privs] 	Ok
+  [test_seccomp->test_seccomp] 	Ok
+  [test_seccomp->test_seccomp_allow] 	Ok
+  [test_seccomp->test_seccomp_fail] 	Ok
+  [test_seccomp->test_seccomp_fail_errno] 	Ok
+test_mmap
+  [test_mmap->test_getpagesize] 	Ok
+  [test_mmap->test_madvise] 	Ok
+  [test_mmap->test_mlock] 	Ok
+  [test_mmap->test_mlockall] 	Skipped
+  [test_mmap->test_mmap_anon] 	Ok
+  [test_mmap->test_mmap_fail] 	Ok
+  [test_mmap->test_mmap_file] 	Ok
+  [test_mmap->test_mmap_page_offset] 	Ok
+  [test_mmap->test_msync] 	Ok
+test_libc
+  [test_libc->test_environ] 	Ok
+test_mounts
+test_inotify
+  [test_inotify->test_inotify] 	Ok
+test_sockets_pipes
+  [test_sockets_pipes->test_accept4] 	Ok
+  [test_sockets_pipes->test_accept_noaddr] 	Ok
+  [test_sockets_pipes->test_getsockopt_acceptconn] 	Ok
+  [test_sockets_pipes->test_inet6_inet_conn_socket] 	Ok
+  [test_sockets_pipes->test_inet6_only_inet_conn_socket] 	Ok
+  [test_sockets_pipes->test_inet6_only_inet_conn_socket2] 	Ok
+  [test_sockets_pipes->test_inet6_socket] 	Ok
+  [test_sockets_pipes->test_inet6_udp_socket] 	Ok
+  [test_sockets_pipes->test_inet_socket] 	Ok
+  [test_sockets_pipes->test_inet_socket_readv] 	Ok
+  [test_sockets_pipes->test_named_unix] 	Ok
+  [test_sockets_pipes->test_notsock_error] 	Ok
+  [test_sockets_pipes->test_pipe] 	Ok
+  [test_sockets_pipes->test_pipe2] 	Ok
+  [test_sockets_pipes->test_recvfrom] 	Ok
+  [test_sockets_pipes->test_recvfrom_alloc] 	Ok
+  [test_sockets_pipes->test_send] 	Ok
+  [test_sockets_pipes->test_sendmmsg] 	Ok
+  [test_sockets_pipes->test_sendmsg] 	Ok
+  [test_sockets_pipes->test_sendto] 	Ok
+  [test_sockets_pipes->test_sendto_src] 	Ok
+  [test_sockets_pipes->test_setsockopt_keepalive] 	Ok
+  [test_sockets_pipes->test_setsockopt_keepalive_inet6] 	Ok
+  [test_sockets_pipes->test_sockaddr_storage] 	Ok
+  [test_sockets_pipes->test_socketpair] 	Ok
+  [test_sockets_pipes->test_sockopt_sndbuf] 	Ok
+  [test_sockets_pipes->test_sockopt_sndbuf_inet6] 	Ok
+  [test_sockets_pipes->test_sockopt_tcp_nodelay] 	Ok
+  [test_sockets_pipes->test_sockopt_tcp_nodelay_inet6] 	Ok
+  [test_sockets_pipes->test_udp_socket] 	Ok
+test_directory_operations
+  [test_directory_operations->test_dents_stat_conversion] 	Ok
+  [test_directory_operations->test_dirtable] 	Ok
+  [test_directory_operations->test_getdents] 	Ok
+  [test_directory_operations->test_getdents_dev] 	Ok
+  [test_directory_operations->test_getdents_error] 	Ok
+  [test_directory_operations->test_ls] 	Ok
+  [test_directory_operations->test_ls_long] 	Ok
+test_sendfd
+  [test_sendfd->test_sendfd] 	Ok
+test_misc_linux
+  [test_misc_linux->test_adjtimex] 	Ok
+  [test_misc_linux->test_getdomainname] 	Ok
+  [test_misc_linux->test_gethostname] 	Ok
+  [test_misc_linux->test_getrandom] 	Ok
+  [test_misc_linux->test_memfd] 	Ok
+  [test_misc_linux->test_prctl] 	Ok
+  [test_misc_linux->test_prlimit] 	Ok
+  [test_misc_linux->test_rlimit] 	Ok
+  [test_misc_linux->test_sendcred] 	Ok
+  [test_misc_linux->test_sysinfo] 	Ok
+  [test_misc_linux->test_syslog] 	Ok
+  [test_misc_linux->test_uname] 	Ok
+test_sendfile
+  [test_sendfile->test_sendfile] 	Ok
+  [test_sendfile->test_sendfile_largefile] 	Ok
+  [test_sendfile->test_sendfile_offset] 	Ok
+test_read_write
+  [test_read_write->test_pread_pwrite] 	Ok
+  [test_read_write->test_preadv_pwritev] 	Ok
+  [test_read_write->test_read] 	Ok
+  [test_read_write->test_read_to_string] 	Ok
+  [test_read_write->test_readv_writev] 	Ok
+  [test_read_write->test_write] 	Ok
+  [test_read_write->test_write_ro] 	Ok
+  [test_read_write->test_write_string] 	Ok
+test_timers_linux
+  [test_timers_linux->test_time] 	Ok
+  [test_timers_linux->test_timerfd] 	Ok
+test_misc
+  [test_misc->test_fpathconf] 	Ok
+  [test_misc->test_pathconf] 	Ok
+  [test_misc->test_sysctl] 	Ok
+test_shm
+  [test_shm->test_shm] 	Ok
+test_locking
+  [test_locking->test_fcntl_setlk] 	Ok
+  [test_locking->test_flock] 	Ok
+  [test_locking->test_lockf_lock] 	Ok
+  [test_locking->test_lockf_test] 	Ok
+  [test_locking->test_lockf_tlock] 	Ok
+  [test_locking->test_lockf_ulock] 	Ok
+test_filesystem_linux
+  [test_filesystem_linux->test_fstatfs] 	Ok
+  [test_filesystem_linux->test_statfs] 	Ok
+  [test_filesystem_linux->test_utimensat] 	Ok
+test_aio
+  [test_aio->test_aio] 	Ok
+  [test_aio->test_aio_cancel] 	Ok
+  [test_aio->test_aio_error] 	Ok
+  [test_aio->test_aio_eventfd] 	Ok
+  [test_aio->test_aio_setup] 	Ok
+test_ids
+  [test_ids->test_getgroups] 	Ok
+  [test_ids->test_setegid] 	Ok
+  [test_ids->test_seteuid] 	Ok
+  [test_ids->test_setgid] 	Ok
+  [test_ids->test_setuid] 	Ok
+test_basic
+  [test_basic->test_at_flags] 	Ok
+  [test_basic->test_b64] 	Ok
+  [test_basic->test_band64] 	Ok
+  [test_basic->test_booltoc] 	Ok
+  [test_basic->test_bor64] 	Ok
+  [test_basic->test_constants] 	Ok
+  [test_basic->test_error_string] 	Ok
+  [test_basic->test_fd_nums] 	Ok
+  [test_basic->test_lshift64] 	Ok
+  [test_basic->test_major_minor] 	Ok
+  [test_basic->test_missing_error_string] 	Ok
+  [test_basic->test_multiflags] 	Ok
+  [test_basic->test_multiflags_negation] 	Ok
+  [test_basic->test_no_missing_error_strings] 	Ok
+  [test_basic->test_rshift64] 	Ok
+test_mremap
+  [test_mremap->test_mremap] 	Ok
+test_file_operations
+  [test_file_operations->test_chdir] 	Ok
+  [test_file_operations->test_chmod] 	Ok
+  [test_file_operations->test_chown] 	Ok
+  [test_file_operations->test_dup] 	Ok
+  [test_file_operations->test_dup2] 	Ok
+  [test_file_operations->test_dup3] 	Ok
+  [test_file_operations->test_fchmod] 	Ok
+  [test_file_operations->test_fdatasync] 	Ok
+  [test_file_operations->test_fsync] 	Ok
+  [test_file_operations->test_futimens] 	Ok
+  [test_file_operations->test_futimes] 	Ok
+  [test_file_operations->test_getcwd_long] 	Ok
+  [test_file_operations->test_link] 	Ok
+  [test_file_operations->test_lstat_symlink] 	Ok
+  [test_file_operations->test_lutimes] 	Ok
+  [test_file_operations->test_mkdir_rmdir] 	Ok
+  [test_file_operations->test_mkfifo] 	Ok
+  [test_file_operations->test_rename] 	Ok
+  [test_file_operations->test_seek] 	Ok
+  [test_file_operations->test_seek_error] 	Ok
+  [test_file_operations->test_stat_aliases] 	Ok
+  [test_file_operations->test_stat_device] 	Ok
+  [test_file_operations->test_stat_directory] 	Ok
+  [test_file_operations->test_stat_file] 	Ok
+  [test_file_operations->test_stat_symlink] 	Ok
+  [test_file_operations->test_symlink] 	Ok
+  [test_file_operations->test_sync] 	Ok
+  [test_file_operations->test_syncfs] 	Ok
+  [test_file_operations->test_truncate] 	Ok
+  [test_file_operations->test_utime] 	Ok
+  [test_file_operations->test_utimes] 	Ok
+test_raw_socket
+  [test_raw_socket->test_ip_checksum] 	Ok
+test_timespec_timeval
+  [test_timespec_timeval->test_timespec] 	Ok
+  [test_timespec_timeval->test_timeval] 	Ok
+test_ids_linux
+  [test_ids_linux->test_getresgid] 	Ok
+  [test_ids_linux->test_getresuid] 	Ok
+  [test_ids_linux->test_setregid] 	Ok
+  [test_ids_linux->test_setresgid] 	Ok
+  [test_ids_linux->test_setresuid] 	Ok
+  [test_ids_linux->test_setreuid] 	Ok
+test_termios
+  [test_termios->test_ioctl_winsize] 	Skipped
+  [test_termios->test_isatty_fail] 	Ok
+  [test_termios->test_pts_termios] 	Ok
+test_address_names
+  [test_address_names->test_inet_name] 	Ok
+  [test_address_names->test_inet_name6] 	Ok
+  [test_address_names->test_ipv4_names] 	Ok
+  [test_address_names->test_ipv6_names] 	Ok
+  [test_address_names->test_util_netmask_broadcast] 	Ok
+test_remap_file_pages
+  [test_remap_file_pages->test_remap_file_pages] 	Ok
+test_ppoll
+  [test_ppoll->test_ppoll] 	Ok
+test_file_operations_at
+  [test_file_operations_at->test_faccessat] 	Ok
+  [test_file_operations_at->test_fchmodat] 	Ok
+  [test_file_operations_at->test_fstatat] 	Ok
+  [test_file_operations_at->test_fstatat_fdcwd] 	Ok
+  [test_file_operations_at->test_linkat] 	Ok
+  [test_file_operations_at->test_mkdirat_unlinkat] 	Ok
+  [test_file_operations_at->test_mkfifoat] 	Ok
+  [test_file_operations_at->test_openat] 	Ok
+  [test_file_operations_at->test_renameat] 	Ok
+  [test_file_operations_at->test_symlinkat] 	Ok
+test_scheduler
+  [test_scheduler->test_cpu_set] 	Ok
+  [test_scheduler->test_get_sched_priority_minmax] 	Ok
+  [test_scheduler->test_getcpu] 	Ok
+  [test_scheduler->test_sched_getaffinity] 	Ok
+  [test_scheduler->test_sched_getparam] 	Ok
+  [test_scheduler->test_sched_rr_get_interval] 	Ok
+  [test_scheduler->test_sched_set_getscheduler] 	Ok
+  [test_scheduler->test_sched_setaffinity] 	Ok
+  [test_scheduler->test_sched_yield] 	Ok
+test_file_operations_linux
+  [test_file_operations_linux->test_fadvise_etc] 	Ok
+  [test_file_operations_linux->test_mknodat_fifo] 	Ok
+  [test_file_operations_linux->test_readahead] 	Ok
+  [test_file_operations_linux->test_sync_file_range] 	Ok
+test_capabilities
+  [test_capabilities->test_cap_tostring] 	Ok
+  [test_capabilities->test_cap_types] 	Ok
+  [test_capabilities->test_capget] 	Ok
+  [test_capabilities->test_filesystem_caps_get] 	Ok
+  [test_capabilities->test_get_cap_version] 	Ok
+test_proc
+  [test_proc->test_proc_init] 	Ok
+  [test_proc->test_proc_self] 	Ok
+  [test_proc->test_ps] 	Ok
+test_util_misc
+  [test_util_misc->test_mapfile] 	Ok
+test_timers
+  [test_timers->test_timers] 	Ok
+  [test_timers->test_timers_nosig] 	Ok
+test_timeofday
+  [test_timeofday->test_gettimeofday] 	Ok
+  [test_timeofday->test_settimeofday_fail] 	Ok
+test_clock
+  [test_clock->test_clock_gettime] 	Ok
+  [test_clock->test_clock_nanosleep] 	Ok
+  [test_clock->test_clock_nanosleep_abs] 	Ok
+test_signals
+  [test_signals->test_alarm] 	Ok
+  [test_signals->test_pause] 	Ok
+  [test_signals->test_signal_return] 	Ok
+test_swap
+  [test_swap->test_swap_constants] 	Ok
+  [test_swap->test_swap_fail] 	Ok
+test_bridge_linux
+  [test_bridge_linux->test_bridge] 	Ok
+  [test_bridge_linux->test_bridge_delete_fail] 	Ok
+test_mq
+  [test_mq->test_mq_getsetattr] 	Ok
+  [test_mq->test_mq_open_close_unlink] 	Ok
+  [test_mq->test_mq_send_receive] 	Ok
+test_poll_select
+  [test_poll_select->test_poll] 	Ok
+  [test_poll_select->test_pselect] 	Ok
+  [test_poll_select->test_select] 	Ok
+test_rusage
+  [test_rusage->test_rusage] 	Ok
+test_largefile
+  [test_largefile->test_ftruncate] 	Ok
+  [test_largefile->test_open] 	Ok
+  [test_largefile->test_openat] 	Ok
+  [test_largefile->test_preadv_pwritev] 	Ok
+  [test_largefile->test_seek] 	Ok
+  [test_largefile->test_seek_error] 	Ok
+  [test_largefile->test_truncate] 	Ok
+test_events_epoll
+  [test_events_epoll->test_epoll_events_iter] 	Ok
+  [test_events_epoll->test_epoll_pwait] 	Ok
+  [test_events_epoll->test_epoll_wait] 	Ok
+  [test_events_epoll->test_eventfd] 	Ok
+test_netlink
+  [test_netlink->test_get_addresses_in] 	Ok
+  [test_netlink->test_get_addresses_in6] 	Ok
+  [test_netlink->test_getlink] 	Ok
+  [test_netlink->test_getroute_inet] 	Ok
+  [test_netlink->test_getroute_inet6] 	Failed
+  [test_netlink->test_interface_set_macaddr_fail] 	Ok
+  [test_netlink->test_interfaces] 	Ok
+  [test_netlink->test_netlink_socket] 	Ok
+test_processes_linux
+  [test_processes_linux->test_clone] t_fstatat] 	Ok
+  [test_file_operations_at->test_fstatat_fdcwd] 	Ok
+  [test_file_operations_at->test_linkat] 	Ok
+  [test_file_operations_at->test_mkdirat_unlinkat] 	Ok
+  [test_file_operations_at->test_mkfifoat] 	Ok
+  [test_file_operations_at->test_openat] 	Ok
+  [test_file_operations_at->test_renameat] 	Ok
+  [test_file_operations_at->test_symlinkat] 	Ok
+test_scheduler
+  [test_scheduler->test_cpu_set] 	Ok
+  [test_scheduler->test_get_sched_priority_minmax] 	Ok
+  [test_scheduler->test_getcpu] 	Ok
+  [test_scheduler->test_sched_getaffinity] 	Ok
+  [test_scheduler->test_sched_getparam] 	Ok
+  [test_scheduler->test_sched_rr_get_interval] 	Ok
+  [test_scheduler->test_sched_set_getscheduler] 	Ok
+  [test_scheduler->test_sched_setaffinity] 	Ok
+  [test_scheduler->test_sched_yield] 	Ok
+test_file_operations_linux
+  [test_file_operations_linux->test_fadvise_etc] 	Ok
+  [test_file_operations_linux->test_mknodat_fifo] 	Ok
+  [test_file_operations_linux->test_readahead] 	Ok
+  [test_file_operations_linux->test_sync_file_range] 	Ok
+test_capabilities
+  [test_capabilities->test_cap_tostring] 	Ok
+  [test_capabilities->test_cap_types] 	Ok
+  [test_capabilities->test_capget] 	Ok
+  [test_capabilities->test_filesystem_caps_get] 	Ok
+  [test_capabilities->test_get_cap_version] 	Ok
+test_proc
+  [test_proc->test_proc_init] 	Ok
+  [test_proc->test_proc_self] 	Ok
+  [test_proc->test_ps] 	Ok
+test_util_misc
+  [test_util_misc->test_mapfile] 	Ok
+test_timers
+  [test_timers->test_timers] 	Ok
+  [test_timers->test_timers_nosig] 	Ok
+test_timeofday
+  [test_timeofday->test_gettimeofday] 	Ok
+  [test_timeofday->test_settimeofday_fail] 	Ok
+test_clock
+  [test_clock->test_clock_gettime] 	Ok
+  [test_clock->test_clock_nanosleep] 	Ok
+  [test_clock->test_clock_nanosleep_abs] 	Ok
+test_signals
+  [test_signals->test_alarm] 	Ok
+  [test_signals->test_pause] 	Ok
+  [test_signals->test_signal_return] 	Ok
+test_swap
+  [test_swap->test_swap_constants] 	Ok
+  [test_swap->test_swap_fail] 	Ok
+test_bridge_linux
+  [test_bridge_linux->test_bridge] 	Ok
+  [test_bridge_linux->test_bridge_delete_fail] 	Ok
+test_mq
+  [test_mq->test_mq_getsetattr] 	Ok
+  [test_mq->test_mq_open_close_unlink] 	Ok
+  [test_mq->test_mq_send_receive] 	Ok
+test_poll_select
+  [test_poll_select->test_poll] 	Ok
+  [test_poll_select->test_pselect] 	Ok
+  [test_poll_select->test_select] 	Ok
+test_rusage
+  [test_rusage->test_rusage] 	Ok
+test_largefile
+  [test_largefile->test_ftruncate] 	Ok
+  [test_largefile->test_open] 	Ok
+  [test_largefile->test_openat] 	Ok
+  [test_largefile->test_preadv_pwritev] 	Ok
+  [test_largefile->test_seek] 	Ok
+  [test_largefile->test_seek_error] 	Ok
+  [test_largefile->test_truncate] 	Ok
+test_events_epoll
+  [test_events_epoll->test_epoll_events_iter] 	Ok
+  [test_events_epoll->test_epoll_pwait] 	Ok
+  [test_events_epoll->test_epoll_wait] 	Ok
+  [test_events_epoll->test_eventfd] 	Ok
+test_netlink
+  [test_netlink->test_get_addresses_in] 	Ok
+  [test_netlink->test_get_addresses_in6] 	Ok
+  [test_netlink->test_getlink] 	Ok
+  [test_netlink->test_getroute_inet] 	Ok
+  [test_netlink->test_getroute_inet6] 	Failed
+  [test_netlink->test_interface_set_macaddr_fail] 	Ok
+  [test_netlink->test_interfaces] 	Ok
+  [test_netlink->test_netlink_socket] 	Ok
+test_processes_linux
+  [test_processes_linux->test_clone] 	Ok
+  [test_processes_linux->test_fork_waitid_linux] t_fstatat] 	Ok
+  [test_file_operations_at->test_fstatat_fdcwd] 	Ok
+  [test_file_operations_at->test_linkat] 	Ok
+  [test_file_operations_at->test_mkdirat_unlinkat] 	Ok
+  [test_file_operations_at->test_mkfifoat] 	Ok
+  [test_file_operations_at->test_openat] 	Ok
+  [test_file_operations_at->test_renameat] 	Ok
+  [test_file_operations_at->test_symlinkat] 	Ok
+test_scheduler
+  [test_scheduler->test_cpu_set] 	Ok
+  [test_scheduler->test_get_sched_priority_minmax] 	Ok
+  [test_scheduler->test_getcpu] 	Ok
+  [test_scheduler->test_sched_getaffinity] 	Ok
+  [test_scheduler->test_sched_getparam] 	Ok
+  [test_scheduler->test_sched_rr_get_interval] 	Ok
+  [test_scheduler->test_sched_set_getscheduler] 	Ok
+  [test_scheduler->test_sched_setaffinity] 	Ok
+  [test_scheduler->test_sched_yield] 	Ok
+test_file_operations_linux
+  [test_file_operations_linux->test_fadvise_etc] 	Ok
+  [test_file_operations_linux->test_mknodat_fifo] 	Ok
+  [test_file_operations_linux->test_readahead] 	Ok
+  [test_file_operations_linux->test_sync_file_range] 	Ok
+test_capabilities
+  [test_capabilities->test_cap_tostring] 	Ok
+  [test_capabilities->test_cap_types] 	Ok
+  [test_capabilities->test_capget] 	Ok
+  [test_capabilities->test_filesystem_caps_get] 	Ok
+  [test_capabilities->test_get_cap_version] 	Ok
+test_proc
+  [test_proc->test_proc_init] 	Ok
+  [test_proc->test_proc_self] 	Ok
+  [test_proc->test_ps] 	Ok
+test_util_misc
+  [test_util_misc->test_mapfile] 	Ok
+test_timers
+  [test_timers->test_timers] 	Ok
+  [test_timers->test_timers_nosig] 	Ok
+test_timeofday
+  [test_timeofday->test_gettimeofday] 	Ok
+  [test_timeofday->test_settimeofday_fail] 	Ok
+test_clock
+  [test_clock->test_clock_gettime] 	Ok
+  [test_clock->test_clock_nanosleep] 	Ok
+  [test_clock->test_clock_nanosleep_abs] 	Ok
+test_signals
+  [test_signals->test_alarm] 	Ok
+  [test_signals->test_pause] 	Ok
+  [test_signals->test_signal_return] 	Ok
+test_swap
+  [test_swap->test_swap_constants] 	Ok
+  [test_swap->test_swap_fail] 	Ok
+test_bridge_linux
+  [test_bridge_linux->test_bridge] 	Ok
+  [test_bridge_linux->test_bridge_delete_fail] 	Ok
+test_mq
+  [test_mq->test_mq_getsetattr] 	Ok
+  [test_mq->test_mq_open_close_unlink] 	Ok
+  [test_mq->test_mq_send_receive] 	Ok
+test_poll_select
+  [test_poll_select->test_poll] 	Ok
+  [test_poll_select->test_pselect] 	Ok
+  [test_poll_select->test_select] 	Ok
+test_rusage
+  [test_rusage->test_rusage] 	Ok
+test_largefile
+  [test_largefile->test_ftruncate] 	Ok
+  [test_largefile->test_open] 	Ok
+  [test_largefile->test_openat] 	Ok
+  [test_largefile->test_preadv_pwritev] 	Ok
+  [test_largefile->test_seek] 	Ok
+  [test_largefile->test_seek_error] 	Ok
+  [test_largefile->test_truncate] 	Ok
+test_events_epoll
+  [test_events_epoll->test_epoll_events_iter] 	Ok
+  [test_events_epoll->test_epoll_pwait] 	Ok
+  [test_events_epoll->test_epoll_wait] 	Ok
+  [test_events_epoll->test_eventfd] 	Ok
+test_netlink
+  [test_netlink->test_get_addresses_in] 	Ok
+  [test_netlink->test_get_addresses_in6] 	Ok
+  [test_netlink->test_getlink] 	Ok
+  [test_netlink->test_getroute_inet] 	Ok
+  [test_netlink->test_getroute_inet6] 	Failed
+  [test_netlink->test_interface_set_macaddr_fail] 	Ok
+  [test_netlink->test_interfaces] 	Ok
+  [test_netlink->test_netlink_socket] 	Ok
+test_processes_linux
+  [test_processes_linux->test_clone] 	Ok
+  [test_processes_linux->test_fork_waitid_linux] 	Ok
+test_sleep
+  [test_sleep->test_nanosleep] 	Ok
+  [test_sleep->test_sleep] 	Ok
+test_bpf
+  [test_bpf->test_bpf_struct_jump] 	Ok
+  [test_bpf->test_bpf_struct_stmt] 	Ok
+test_tee_splice
+  [test_tee_splice->test_tee_splice] 	Ok
+test_xattr_linux
+  [test_xattr_linux->test_xattr] 	Ok
+  [test_xattr_linux->test_xattr_empty_fd] 	Ok
+  [test_xattr_linux->test_xattr_long] 	Ok
+test_open_close
+  [test_open_close->test_access] 	Ok
+  [test_open_close->test_close_invalid_fd] 	Ok
+  [test_open_close->test_double_close] 	Ok
+  [test_open_close->test_fd_cleared_on_close] 	Ok
+  [test_open_close->test_fd_gc] 	Ok
+  [test_open_close->test_fd_nogc] 	Ok
+  [test_open_close->test_open_nofile] 	Ok
+  [test_open_close->test_open_valid] 	Ok
+  [test_open_close->test_umask] 	Ok
+=========================================================
+Failed tests:
+-------------
+>>> test_netlink->test_getroute_inet6 failed
+./syscall/linux/nl.ljs:491: NYI: 20
+stack traceback:
+	./include/luaunit/luaunit.ljs:479: in function <./include/luaunit/luaunit.ljs:478>
+	[C]: in function 'error'
+	./syscall/linux/nl.ljs:491: in function 'decode_route'
+	./syscall/linux/nl.ljs:569: in function <./syscall/linux/nl.ljs:568>
+	./syscall/linux/nl.ljs:627: in function 'read'
+	./syscall/linux/nl.ljs:946: in function 'nlmsg'
+	./syscall/linux/nl.ljs:982: in function 'getroute'
+	./syscall/linux/nl.ljs:991: in function 'routes'
+	./test/linux.ljs:673: in function 'test_getroute_inet6'
+	[string "test_netlink->test_getroute_inet6()"]:1: in main chunk
+	[C]: in function 'xpcall'
+	./include/luaunit/luaunit.ljs:482: in function 'runTestMethod'
+	./include/luaunit/luaunit.ljs:507: in function 'runTestMethodName'
+	./include/luaunit/luaunit.ljs:536: in function 'runTestClassByName'
+	./include/luaunit/luaunit.ljs:570: in function <./include/luaunit/luaunit.ljs:542>
+	test/test.ljs:2517: in main chunk
+	[C]: at 0x00404a80
+Success : 99% - 273 / 274 (total of 276 tests, 2 skipped)

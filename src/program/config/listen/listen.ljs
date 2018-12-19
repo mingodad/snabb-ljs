@@ -1,0 +1,164 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+module(..., package.seeall);
+
+var S = require("syscall");
+var ffi = require("ffi");
+var rpc = require("lib.yang.rpc");
+var data = require("lib.yang.data");
+var path_lib = require("lib.yang.path");
+var json_lib = require("lib.ptree.json");
+var common = require("program.config.common");
+
+var function open_socket(file) {
+   S.signal('pipe', 'ign');
+   var socket = assert(S.socket("unix", "stream"));
+   S.unlink(file);
+   var sa = S.t.sockaddr_un(file);
+   assert(socket->bind(sa));
+   assert(socket->listen());
+   return socket;
+}
+
+var function validate_config(schema_name, revision_date, path, value_str) {
+   var parser = common.config_parser(schema_name, path);
+   var value = parser(value_str);
+   return common.serialize_config(value, schema_name, path);
+}
+
+var request_handlers = {};
+function request_handlers.get(schema_name, revision_date, path) {
+   return {method='get-config',
+           args={schema=schema_name, revision=revision_date, path=path}};
+}
+function request_handlers.get_state(schema_name, revision_date, path) {
+   return {method='get-state',
+           args={schema=schema_name, revision=revision_date, path=path}};
+}
+function request_handlers.set(schema_name, revision_date, path, value) {
+   assert(value != null);
+   var config = validate_config(schema_name, revision_date, path, value);
+   return {method='set-config',
+           args={schema=schema_name, revision=revision_date, path=path,
+                 config=config}};
+}
+function request_handlers.add(schema_name, revision_date, path, value) {
+   assert(value != null);
+   var config = validate_config(schema_name, revision_date, path, value);
+   return {method='add-config',
+           args={schema=schema_name, revision=revision_date, path=path,
+                 config=config}};
+}
+function request_handlers.remove(schema_name, revision_date, path) {
+   return {method='remove-config',
+           args={schema=schema_name, revision=revision_date, path=path}};
+}
+
+var function read_request(client, schema_name, revision_date) {
+   var json = json_lib.read_json_object(client);
+   var id, verb, path = assert(json.id), assert(json.verb), json.path || '/';
+   path = path_lib.normalize_path(path);
+   if( json.schema ) { schema_name = json.schema; }
+   if( json.revision ) { revision_date = json.revision; }
+   var handler = assert(request_handlers[data.normalize_id(verb)]);
+   var req = handler(schema_name, revision_date, path, json.value);
+   var function print_reply(reply, fd) {
+      var output = json_lib.buffered_output();
+      var value;
+      if( verb == 'get' ) { value = reply.config;
+      } else if( verb == 'get-state' ) { value = reply.state;
+      }
+      json_lib.write_json_object(output, {id=id, status='ok', value=value});
+      output->flush(fd || S.stdout);
+   }
+   return req, print_reply;
+}
+
+var function attach_listener(leader, caller, schema_name, revision_date) {
+   var msg, parse_reply = rpc.prepare_call(
+      caller, 'attach-listener', {schema=schema_name, revision=revision_date});
+   common.send_message(leader, msg);
+   return parse_reply(common.recv_message(leader));
+}
+
+function run(args) {
+   args = common.parse_command_line(args, { command='listen' });
+   var caller = rpc.prepare_caller('snabb-config-leader-v1');
+   var leader = common.open_socket_or_die(args.instance_id);
+   attach_listener(leader, caller, args.schema_name, args.revision_date);
+   
+   // Check if there is a socket path specified, if so use that as method
+   // to communicate, otherwise use stdin and stdout.
+   var fd = null;
+   if( args.socket ) {
+      var sockfd = open_socket(args.socket);
+      var addr = S.t.sockaddr_un();
+      // Wait for a connection
+      var err;
+      print("Listening for clients on socket: "..args.socket);
+      fd, err = sockfd->accept(addr);
+      if( fd == null ) {
+         sockfd->close();
+         error(err);
+      }
+   } else {
+      fd = S.stdin;
+   }
+      
+   var client = json_lib.buffered_input(fd);
+   var pollfds = S.types.t.pollfds({
+         {fd=leader, events="in"},
+         {fd=client, events="in"}});
+   var pending_replies = {};
+   while( true ) {
+      if( client->avail() == 0 ) {
+         assert(S.poll(pollfds, -1));
+      }
+      for( _,pfd in ipairs(pollfds) ) {
+         if( pfd.fd == leader->getfd() ) {
+            if( pfd.ERR || pfd.HUP ) {
+               while( #pending_replies > 0 ) {
+                  var have_reply = table.remove(pending_replies);
+                  have_reply(common.recv_message(leader));
+               }
+               io.stderr->write('Leader hung up\n');
+               main.exit(1);
+            } else if( pfd.IN ) {
+               assert(#pending_replies > 0);
+               var have_reply = table.remove(pending_replies);
+               have_reply(common.recv_message(leader));
+            }
+            pfd.revents = 0;
+         } else if( pfd.fd == client->getfd() ) {
+            if( pfd.ERR || pfd.HUP || pfd.NVAL ) {
+               io.stderr->write('Client hung up\n');
+               main.exit(0);
+            }
+            if( pfd.IN ) {
+               // The JSON objects sent to us by the client can have
+               // whitespace between them.  Make sure we don't block
+               // expecting a new datum when really it was just the
+               // remote side sending whitespace.  (Calling peek()
+               // causes the buffer to fill, which itself shouldn't
+               // block given the IN flag in the revents.)
+               client->peek();
+               json_lib.drop_buffered_whitespace(client);
+            }
+            while( client->avail() > 0 ) {
+               var request, print_reply =
+                  read_request(client, args.schema_name, args.revision_date);
+               json_lib.drop_buffered_whitespace(client);
+               var msg, parse_reply = rpc.prepare_call(
+                  caller, request.method, request.args);
+               var function have_reply(msg) {
+                  return print_reply(parse_reply(msg), fd);
+               }
+               common.send_message(leader, msg);
+               table.insert(pending_replies, 1, have_reply);
+            }
+            pfd.revents = 0;
+         } else {
+            error('unreachable');
+         }
+      }
+   }
+}

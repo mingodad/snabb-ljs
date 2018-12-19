@@ -1,0 +1,91 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+module(..., package.seeall);
+
+var lib = require("core.lib");
+var pcap = require("lib.pcap.pcap");
+
+var function usage(status) {
+   print(require("program.unhexdump.README_inc"));
+   main.exit(status);
+}
+
+var function write_to_file(filename, content) {
+   if( ! lib.writefile(filename, content) ) {
+      print(("Writing to %s failed, quitting")->format(filename));
+      main.exit(1);
+   }
+}
+
+var function write_packets(input, output) {
+   var bytes = {};
+   var count = 0;
+   var function flush() {
+      if( #bytes != 0 ) {
+         pcap.write_record_header(output, #bytes);
+         var s = string.char(unpack(bytes));
+         output->write(string.char(unpack(bytes)));
+         output->flush();
+         bytes = {};
+      }
+      return count;
+   }
+   var function add(byte) {
+      // Adding the first byte of a packet means that we have one more
+      // packet than we did before.
+      if( #bytes == 0 ) { ++count    ; }
+      bytes[#bytes+1] = byte;
+   }
+   while( true ) {
+      var line = input->read();
+      if( ! line ) {
+         // EOF.
+         return flush();
+      } else if( line->match('^%s*$') ) {
+         // Blank lines delimit packets.
+         flush();
+      } else {
+         for( hexpairs in line->split('[%p%sxX]+') ) {
+            if( ! hexpairs->match('^%x*$') ) {
+               error('Unexpected hexdump', hexpairs);
+            } else if( #hexpairs % 2 != 0 ) {
+               error('Odd sequence of hex characters', hexpairs);
+            } else {
+               for( pair in hexpairs->gmatch('%x%x') ) {
+                  add(tonumber(pair, 16));
+               }
+            }
+         }
+      }
+   }
+}
+
+function run(args) {
+   var truncate, append;
+   var handlers = {};
+   function handlers.h() { usage(0); }
+   function handlers.t() { truncate = true; }
+   function handlers.a() { append = true; }
+   args = lib.dogetopt(args, handlers, "hta",
+                       {help='h', truncate='t', append='a'});
+   if( #args != 1 ) { usage(1); }
+   if( truncate && append ) { usage(1); }
+
+   var filename = args[1];
+   var mode = "w";
+   if( truncate ) { mode = "w+"; }
+   if( append ) { mode = "a+"; }
+   var file = assert(io.open(filename, mode..'b'));
+   if( file->seek('end') == 0 ) {
+      pcap.write_file_header(file);
+   } else {
+      file->seek('set', 0);
+      // Assert that it's a pcap file.
+      var header = pcap.read_file_header(file);
+      file->seek('end', 0);
+   }
+
+   var count = write_packets(io.stdin, file);
+   file->close();
+   print("Wrote "..count.." packets to '"..filename.."'.");
+}

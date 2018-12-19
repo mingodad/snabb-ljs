@@ -1,0 +1,23 @@
+module(..., package.seeall);
+var ffi = require("ffi");
+
+// Sequence number type with accessors for lower/upper order 32 bits
+
+var seq_no_t = ffi.typeof("union { uint64_t no; uint32_t no32[2]; }");
+var seq_no = {};
+
+var low, high;
+if(     ffi.abi("le") ) { low  = 0; high = 1;
+} else if( ffi.abi("be") ) { low  = 1; high = 0; }
+
+function seq_no::low (n) {
+   if( n ) { this.no32[low] = n;
+   } else { return this.no32[low]; }
+}
+
+function seq_no::high (n) {
+   if( n ) { this.no32[high] = n;
+   } else { return this.no32[high]; }
+}
+
+return ffi.metatype(seq_no_t, {__index=seq_no});

@@ -1,0 +1,321 @@
+module(..., package.seeall);
+
+var ffi = require("ffi");
+var lib = require("core.lib");
+var ipv4 = require("lib.protocol.ipv4");
+var ipv6 = require("lib.protocol.ipv6");
+var ethernet = require("lib.protocol.ethernet");
+
+Parser = {};
+
+function Parser.new(file) {
+   var name = file.name;
+   var err;
+   if( type(file) == 'string' ) {
+      name = file;
+      file, err = io.open(file);
+      if( ! file ) { error(err); }
+   }
+   var ret = { column=0, line=1, name=name };
+   function ret.read_char() { return file->read(1); }
+   function ret.cleanup() {
+      function ret.cleanup() { }
+      return file->close();
+   }
+   ret.peek_char = ret.read_char();
+   return setmetatable(ret, {__index=Parser});
+}
+
+function Parser::error(msg, ...) {
+   this.cleanup();
+   error(('%s:%d:%d: error: '..msg)->format(
+         this.name || '<unknown>', this.line, this.column, ...));
+}
+
+function Parser::next() {
+   var chr = this.peek_char;
+   if( chr == '\n' ) {
+      this.column = 0;
+      this.line = this.line + 1;
+   } else if( chr ) {
+      this.column = this.column + 1;
+   } else {
+      this.cleanup();
+   }
+   this.peek_char = this.read_char();
+   return chr;
+}
+
+function Parser::peek() { return this.peek_char; }
+function Parser::is_eof() { return ! this->peek(); }
+
+function Parser::check(expected) {
+   if( this->peek() == expected ) {
+      if( expected ) { this->next(); }
+      return true;
+   }
+   return false;
+}
+
+function Parser::consume(expected) {
+   if( ! this->check(expected) ) {
+      var ch = this->peek();
+      if( ch == null ) {
+         this->error("while looking for '%s', got EOF", expected);
+      } else if( expected ) {
+         this->error("expected '%s', got '%s'", expected, ch);
+      } else {
+         this->error("expected EOF, got '%s'", ch);
+      }
+   }
+}
+
+function Parser::take_while(pattern) {
+   var res = {};
+   while( ! this->is_eof() && this->peek()->match(pattern) ) {
+      table.insert(res, this->next());
+   }
+   return table.concat(res);
+}
+
+function Parser::consume_token(pattern, expected) {
+   var tok = this->take_while(pattern);
+   if( tok->lower() != expected ) {
+      this->error("expected '%s', got '%s'", expected, tok);
+   }
+}
+
+function Parser::skip_whitespace() {
+   this->take_while('%s');
+   // Skip comments, which start with # and continue to the end of line.
+   while( this->check('#') ) {
+      this->take_while('[^\n]');
+      this->take_while('%s');
+   }
+}
+
+function Parser::parse_uint(min, max) {
+   var tok = this->take_while('%d');
+   if( tok == '' ) { this->error('expected a number'); }
+   if( #tok > #(tostring(max)) ) {
+      this->error('numeric constant too long: %s', tok);
+   }
+   var uint = tonumber(tok);
+   if( uint < min || uint > max ) {
+      this->error('numeric constant out of range: %d', uint);
+   }
+   return uint;
+}
+
+function Parser::parse_psid_param() { return this->parse_uint(0, 16); }
+function Parser::parse_ipv4_quad() { return this->parse_uint(0, 255); }
+
+function Parser::parse_property_list(spec, bra, ket) {
+   var res = {};
+   this->skip_whitespace();
+   if( bra ) {
+      this->consume(bra);
+      this->skip_whitespace();
+   }
+   while( ! this->check(ket) ) {
+      var key = this->take_while('[%w_]');
+      if( key == '' ) {
+         this->error("expected a key=value property or a closing '%s'", ket);
+      }
+      if( res[key] ) { this->error('duplicate key: %s', key); }
+      if( ! spec.parse[key] ) { this->error('unexpected key: "%s"', key); }
+      this->skip_whitespace();
+      this->consume('=');
+      this->skip_whitespace();
+      var val = spec.parse[key](this);
+      res[key] = val;
+
+      // Key-value pairs are separated by newlines or commas, and
+      // terminated by the ket.  A trailing comma is optional.
+      var line = this.line;
+      this->skip_whitespace();
+      var has_comma = this->check(',');
+      if( has_comma ) { this->skip_whitespace(); }
+      if( this->check(ket) ) { break; }
+      if( ! has_comma && this.line == line ) {
+         this->error('properties should be separated by commas or newlines');
+      }
+   }
+   for( k, default in pairs(spec.defaults) ) {
+      if( res[k] == null ) { res[k] = default(res); }
+   }
+   spec.validate(this, res);
+   return res;
+}
+
+// Returns a uint8_t[4].
+function Parser::parse_ipv4() {
+   var addr_string = this->take_while('[%d.]');
+   if( ! addr_string || #addr_string == 0 ) {
+      this->error("IPv4 address expected");
+   }
+   var addr, err = ipv4->pton(addr_string);
+   if( ! addr ) { this->error('%s', err); }
+   return addr;
+}
+
+function Parser::parse_ipv4_as_uint32() {
+   var addr = this->parse_ipv4();
+   return ffi.C.htonl(ffi.cast('uint32_t*', addr)[0]);
+}
+
+// Returns a uint8_t[16].
+function Parser::parse_ipv6() {
+   var addr_string = this->take_while('[%x:]');
+   if( ! addr_string || #addr_string == 0 ) {
+      this->error("IPv6 address expected");
+   }
+   var addr, err = ipv6->pton(addr_string);
+   if( ! addr ) { this->error('%s', err); }
+   return addr;
+}
+
+// Returns a uint8_t[6].
+function Parser::parse_mac() {
+   var addr_string = this->take_while('[%x:]');
+   if( ! addr_string || #addr_string == 0 ) {
+      this->error("Ethernet MAC address expected");
+   }
+   // FIXME: Unlike ipv6:pton, ethernet:pton raises an error if the
+   // address is invalid.
+   var success, addr_or_err = pcall(ethernet.pton, ethernet, addr_string);
+   if( ! success ) { this->error('%s', addr_or_err); }
+   return addr_or_err;
+}
+
+function Parser::parse_ipv4_range() {
+   var range_begin, range_end;
+   range_begin = this->parse_ipv4_as_uint32();
+   this->skip_whitespace();
+   if( this->check('-') ) {
+      this->skip_whitespace();
+      range_end = this->parse_ipv4_as_uint32();
+   } else {
+      range_end = range_begin;
+   }
+   if( range_end < range_begin ) {
+      this->error('invalid IPv4 address range (end before begin)');
+   }
+   return { min=range_begin, max=range_end };
+}
+
+function Parser::parse_ipv4_range_list() {
+   var ranges = {};
+   do {
+      this->skip_whitespace();
+      table.insert(ranges, this->parse_ipv4_range());
+      this->skip_whitespace();
+   } while(!( ! this->check(',')) );
+   return ranges;
+}
+
+function Parser::parse_quoted_string(quote, escape) {
+   var res = {};
+   escape = escape || '\\';
+   while( ! this->check(quote) ) {
+      var ch = this->next();
+      if( ch == escape ) { ch = this->next(); }
+      if( ! ch ) { this->error('EOF while reading quoted string'); }
+      table.insert(res, ch);
+   }
+   return table.concat(res);
+}
+
+function Parser::parse_string() {
+   var str;
+   if( this->check("'") ) { str = this->parse_quoted_string("'");
+   } else if( this->check('"') ) { str = this->parse_quoted_string('"');
+   } else { str = this->take_while('[^%s,]'); }
+   return str;
+}
+
+function Parser::make_path(orig_path) {
+   if( orig_path == '' ) { this->error('file name is empty'); }
+   if( ! orig_path->match('^/') && this.name ) {
+      // Relative paths in conf files are relative to the location of the
+      // conf file, not the current working directory.
+      return lib.dirname(this.name)..'/'..orig_path;
+   }
+   return orig_path;
+}
+
+function Parser::parse_file_name() {
+   return this->make_path(this->parse_string());
+}
+
+function Parser::parse_string_or_file() {
+   var str = this->parse_string();
+   if( ! str->match('^<') ) {
+      return str;
+   }
+   // Remove the angle bracket.
+   var path = this->make_path(str->sub(2));
+   var filter, err = lib.readfile(path, "*a");
+   if( filter == null ) {
+      this->error('cannot read filter conf file "%s": %s', path, err);
+   }
+   return filter;
+}
+
+function Parser::parse_boolean() {
+   var tok = this->take_while('[%a]');
+   if( tok->lower() == 'true' ) { return true; }
+   if( tok->lower() == 'false' ) { return false; }
+   this->error('expected "true" or "false", instead got "%s"', tok);
+}
+
+function Parser::parse_number() {
+   var tok = this->take_while('[%d.eExX]');
+   var num = tonumber(tok);
+   if( ! num ) { this->error('expected a number, instead got "%s"', tok); }
+   return num;
+}
+
+function Parser::parse_positive_number() {
+   var num = this->parse_number();
+   if( num <= 0 ) {
+      this->error('expected a positive number, instead got %s',
+                 tostring(num));
+   }
+   return num;
+}
+
+function Parser::parse_non_negative_number() {
+   var num = this->parse_number();
+   if( num < 0 ) {
+      this->error('expected a non-negative number, instead got %s',
+                 tostring(num));
+   }
+   return num;
+}
+
+function Parser::parse_mtu() {
+   return this->parse_uint(0,2**16-1);
+}
+
+function Parser::parse_psid() {
+   return this->parse_uint(0,2**16-1);
+}
+
+function Parser.enum_parser(enums) {
+   return function(this) {
+      var tok = this->parse_string();
+      for( k,v in pairs(enums) ) {
+         if( k->lower() == tok->lower() ) { return v; }
+      }
+      // Not found; make a nice error.
+      var keys = {};
+      for( k,_ in pairs(enums) ) { table.insert(keys, k); }
+      keys = table.concat(keys, ', ');
+      this->error('bad value: "%s".  expected one of %s', tok, keys);
+   };
+}
+
+function Parser::parse_vlan_tag() {
+   return this->parse_uint(0,2**12-1);
+}

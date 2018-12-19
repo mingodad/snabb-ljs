@@ -1,0 +1,58 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+module(...,package.seeall);
+
+var shm = require("core.shm");
+var interlink = require("lib.interlink");
+
+var Receiver = {name="apps.interlink.Receiver"};
+
+function Receiver::new (queue) {
+   packet.enable_group_freelist();
+   return setmetatable({attached=false, queue=queue}, {__index=Receiver});
+}
+
+function Receiver::link () {
+   var queue = this.queue || this.appname;
+   if( ! this.attached ) {
+      this.shm_name = "group/interlink/"..queue..".interlink";
+      this.backlink = "interlink/receiver/"..queue..".interlink";
+      this.interlink = interlink.attach_receiver(this.shm_name);
+      shm.alias(this.backlink, this.shm_name);
+      this.attached = true;
+   }
+}
+
+function Receiver::pull () {
+   var o, r, n = this.output.output, this.interlink, 0;
+   if( ! o ) { return; } // don’t forward packets until connected
+   while( ! interlink.empty(r) && n < engine.pull_npackets ) {
+      link.transmit(o, interlink.extract(r));
+      ++n    ;
+   }
+   interlink.pull(r);
+}
+
+function Receiver::stop () {
+   if( this.attached ) {
+      interlink.detach_receiver(this.interlink, this.shm_name);
+      shm.unlink(this.backlink);
+   }
+}
+
+// Detach receivers to prevent leaking interlinks opened by pid.
+//
+// This is an internal API function provided for cleanup during
+// process termination.
+function Receiver.shutdown (pid) {
+   for( _, queue in ipairs(shm.children("/"..pid.."/interlink/receiver")) ) {
+      var backlink = "/"..pid.."/interlink/receiver/"..queue..".interlink";
+      var shm_name = "/"..pid.."/group/interlink/"..queue..".interlink";
+      // Call protected in case /<pid>/group is already unlinked.
+      var ok, r = pcall(interlink.open, shm_name);
+      if( ok ) { interlink.detach_receiver(r, shm_name); }
+      shm.unlink(backlink);
+   }
+}
+
+return Receiver;

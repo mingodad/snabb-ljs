@@ -1,0 +1,24 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+module(..., package.seeall);
+
+var pcap = require("apps.pcap.pcap");
+var raw = require("apps.socket.raw");
+
+function run (parameters) {
+   if( ! (#parameters == 2) ) {
+      print("Usage: example_replay <pcap-file> <interface>");
+      main.exit(1);
+   }
+   var pcap_file = parameters[1];
+   var interface = parameters[2];
+
+   var c = config.new();
+   config.app(c, "capture", pcap.PcapReader, pcap_file);
+   config.app(c, "playback", raw.RawSocket, interface);
+
+   config.link(c, "capture.output -> playback.rx");
+
+   engine.configure(c);
+   engine.main({duration=1, report = {showlinks=true}});
+}

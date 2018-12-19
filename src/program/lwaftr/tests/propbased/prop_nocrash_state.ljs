@@ -1,0 +1,25 @@
+module(..., package.seeall);
+
+// test to make sure repeated get-state commands are ok
+
+var genyang = require("program.lwaftr.tests.propbased.genyang");
+var common  = require("program.lwaftr.tests.propbased.common");
+var run_pid = {};
+var current_cmd;
+
+function property() {
+   current_cmd = genyang.generate_get_state(run_pid[1]);
+   var results = (genyang.run_yang(current_cmd));
+   if( common.check_crashed(results) ) {
+      return false;
+   }
+}
+
+function print_extra_information() {
+   print("The command was:", current_cmd);
+}
+
+handle_prop_args =
+   common.make_handle_prop_args("prop_nocrash_state", 20, run_pid);
+
+cleanup = common.make_cleanup(run_pid);

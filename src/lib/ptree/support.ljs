@@ -1,0 +1,232 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+module(...,package.seeall);
+
+var app = require("core.app");
+var app_graph_mod = require("core.config");
+var path_mod = require("lib.yang.path");
+var path_data = require("lib.yang.path_data");
+var yang = require("lib.yang.yang");
+var data = require("lib.yang.data");
+var cltable = require("lib.cltable");
+
+function compute_parent_paths(path) {
+   var function sorted_keys(t) {
+      var ret = {};
+      for( k, v in pairs(t) ) { table.insert(ret, k); }
+      table.sort(ret);
+      return ret;
+   }
+   var ret = { '/' };
+   var head = '';
+   for( _,part in ipairs(path_mod.parse_path(path)) ) {
+      head = head..'/'..part.name;
+      table.insert(ret, head);
+      var keys = sorted_keys(part.query);
+      if( #keys > 0 ) {
+         for( _,k in ipairs(keys) ) {
+            head = head..'['..k..'='..part.query[k]..']';
+         }
+         table.insert(ret, head);
+      }
+   }
+   return ret;
+}
+
+var function add_child_objects(accum, grammar, config) {
+   var visitor = {};
+   var function visit(grammar, config) {
+      assert(visitor[grammar.type])(grammar, config);
+   }
+   var function visit_child(grammar, config) {
+      if( grammar.type == 'scalar' ) { return; }
+      table.insert(accum, config);
+      return visit(grammar, config);
+   }
+   function visitor.table(grammar, config) {
+      // Ctables are raw data, and raw data doesn't contain children
+      // with distinct identity.
+      if( grammar.key_ctype && grammar.value_ctype ) { return; }
+      var child_grammar = {type="struct", members=grammar.values,
+                             ctype=grammar.value_ctype};
+      if( grammar.key_ctype ) {
+         for( k, v in cltable.pairs(config) ) { visit_child(child_grammar, v); }
+      } else {
+         for( k, v in pairs(config) ) { visit_child(child_grammar, v); }
+      }
+   }
+   function visitor.array(grammar, config) {
+      // Children are leaves; nothing to do.
+   }
+   function visitor.struct(grammar, config) {
+      // Raw data doesn't contain children with distinct identity.
+      if( grammar.ctype ) { return; }
+      for( k,xgrammar in pairs(grammar.members) ) {
+         var id = data.normalize_id(k);
+         var child = config[id];
+         if( child != null ) { visit_child(xgrammar, child); }
+      }
+   }
+   return visit(grammar, config);
+}
+
+var function compute_objects_maybe_updated_in_place (schema_name, config,
+                                                       changed_path) {
+   var schema = yang.load_schema_by_name(schema_name);
+   var grammar = data.config_grammar_from_schema(schema);
+   var objs = {};
+   var getter, subgrammar;
+   for( _,path in ipairs(compute_parent_paths(changed_path)) ) {
+      // Calling the getter is avg O(N) in depth, so that makes the
+      // loop O(N^2), though it is generally bounded at a shallow
+      // level so perhaps it's OK.  path_data.resolver is O(N) too but
+      // memoization makes it O(1).
+      getter, subgrammar = path_data.resolver(grammar, path);
+      // Scalars can't be updated in place.
+      if( subgrammar.type == 'scalar' ) { return objs; }
+      table.insert(objs, getter(config));
+      // Members of raw data can't be updated in place either.
+      if( subgrammar.type == 'table' ) {
+         if( subgrammar.key_ctype && subgrammar.value_ctype ) { return objs; }
+      } else if( subgrammar.type == 'struct' ) {
+         if( subgrammar.ctype ) { return objs; }
+      }
+   }
+   // If the loop above finished normally, then it means that the
+   // object at changed_path might contain in-place-updatable objects
+   // inside of it, so visit its children.
+   add_child_objects(objs, subgrammar, objs[#objs]);
+   return objs;
+}
+
+var function record_mutable_objects_embedded_in_app_initarg (worker_id, app_name, obj, accum) {
+   var function record(obj) {
+      var tab = accum[obj];
+      if( ! tab ) {
+         tab = {};
+         accum[obj] = tab;
+      }
+      if( tab[worker_id] == null ) {
+         tab[worker_id] = {app_name};
+      } else {
+         table.insert(tab[worker_id], app_name);
+      }
+   }
+   var function visit(obj) {
+      if( type(obj) == 'table' ) {
+         record(obj);
+         for( _,v in pairs(obj) ) { visit(v); }
+      } else if( type(obj) == 'cdata' ) {
+         record(obj);
+         // Cdata contains sub-objects but they don't have identity;
+         // it's only the cdata object itself that has identity.
+      } else {
+         // Other object kinds can't be updated in place.
+      }
+   }
+   visit(obj);
+}
+
+// Takes a table of worker ids (app_graph_map) and returns a tabl≈e which has
+// the worker id as the key and a table listing all app names
+//   i.e. {worker_id => {app name, ...}, ...}
+var function compute_mutable_objects_embedded_in_app_initargs (app_graph_map) {
+   var deps = {};
+   for( id, app_graph in pairs(app_graph_map) ) {
+      for( name, info in pairs(app_graph.apps) ) {
+         record_mutable_objects_embedded_in_app_initarg(id, name, info.arg, deps);
+      }
+   }
+   return deps;
+}
+
+var function compute_apps_to_restart_after_configuration_update (
+      schema_name, configuration, verb, changed_path, in_place_dependencies, arg) {
+   var maybe_updated = compute_objects_maybe_updated_in_place(
+      schema_name, configuration, changed_path);
+   var needs_restart = {};
+   for( _,place in ipairs(maybe_updated) ) {
+      for( _, id in ipairs(in_place_dependencies[place] || {}) ) {
+         if( needs_restart[id] == null ) { needs_restart[id] = {}; }
+         for( _, appname in ipairs(in_place_dependencies[place][id] || {}) ) {
+            needs_restart[id][appname] = true;
+         }
+      }
+   }
+   return needs_restart;
+}
+
+var function add_restarts(actions, app_graph, to_restart) {
+   for( _,action in ipairs(actions) ) {
+      var name, args = unpack(action);
+      if( name == 'stop_app' || name == 'reconfig_app' ) {
+         var appname = args[1];
+         to_restart[appname] = null;
+      }
+   }
+   var to_relink = {};
+   for( id, apps in pairs(to_restart) ) {
+      for( appname, _ in pairs(apps) ) {
+         var info = assert(app_graph.apps[appname]);
+         var class, arg = info.class, info.arg;
+         if( class.reconfig ) {
+            table.insert(actions, {'reconfig_app', {appname, class, arg}});
+         } else {
+            table.insert(actions, {'stop_app', {appname}});
+            table.insert(actions, {'start_app', {appname, class, arg}});
+            to_relink[appname] = true;
+         }
+      }
+   }
+   for( linkspec,_ in pairs(app_graph.links) ) {
+      var fa, fl, ta, tl = app_graph_mod.parse_link(linkspec);
+      if( to_relink[fa] ) {
+         table.insert(actions, {'link_output', {fa, fl, linkspec}});
+      }
+      if( to_relink[ta] ) {
+         table.insert(actions, {'link_input', {ta, tl, linkspec}});
+      }
+   }
+   table.insert(actions, {'commit', {}});
+   return actions;
+}
+
+var function configuration_for_worker(worker, configuration) {
+   return configuration;
+}
+
+var function compute_state_reader(schema_name) {
+   return function(pid) {
+      var reader = state.state_reader_from_schema_by_name(schema_name);
+      return reader(state.counters_for_pid(pid));
+   };
+}
+
+var function process_states(states) {
+   return states[1];
+}
+
+generic_schema_config_support = {
+   compute_config_actions = function(
+         old_graph, new_graph, to_restart, verb, path, ...) {
+      return add_restarts(app.compute_config_actions(old_graph, new_graph),
+                          new_graph, to_restart);
+   },
+   update_mutable_objects_embedded_in_app_initargs = function(
+         in_place_dependencies, app_graph, schema_name, verb, path, arg) {
+      return compute_mutable_objects_embedded_in_app_initargs(app_graph);
+   },
+   compute_state_reader = compute_state_reader,
+   configuration_for_worker = configuration_for_worker,
+   process_states = process_states,
+   compute_apps_to_restart_after_configuration_update =
+      compute_apps_to_restart_after_configuration_update,
+   translators = {}
+};
+
+function load_schema_config_support(schema_name) {
+   var mod_name = 'lib.ptree.support.'..schema_name->gsub('-', '_');
+   var success, support_mod = pcall(require, mod_name);
+   if( success ) { return support_mod.get_config_support(); }
+   return generic_schema_config_support;
+}

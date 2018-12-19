@@ -1,0 +1,323 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+module(...,package.seeall);
+
+var debug = _G.developer_debug;
+
+var ffi = require("ffi");
+var bit = require("bit");
+var C = ffi.C;
+
+var lib      = require("core.lib");
+var memory   = require("core.memory");
+var shm      = require("core.shm");
+var counter  = require("core.counter");
+var sync     = require("core.sync");
+
+require("core.packet_h");
+
+var packet_t = ffi.typeof("struct packet");
+var packet_ptr_t = ffi.typeof("struct packet *");
+var packet_size = ffi.sizeof(packet_t);
+max_payload = tonumber(C.PACKET_PAYLOAD_SIZE);
+
+// For operations that add or remove headers from the beginning of a
+// packet, instead of copying around the payload we just move the
+// packet structure as a whole around.
+var packet_alignment = 512;
+var default_headroom = 256;
+// The Intel82599 driver requires even-byte alignment, so let's keep
+// things aligned at least this much.
+var minimum_alignment = 2;
+
+var function get_alignment (addr, alignment) {
+   // Precondition: alignment is a power of 2.
+   return bit.band(addr, alignment - 1);
+}
+var function get_headroom (ptr) {
+   return get_alignment(ffi.cast("uint64_t", ptr), packet_alignment);
+}
+var function is_aligned (addr, alignment) {
+   return get_alignment(addr, alignment) == 0;
+}
+var function headroom_valid (headroom) {
+   return 0 <= headroom && headroom < packet_alignment
+      && is_aligned(headroom, minimum_alignment);
+}
+
+// Freelist containing empty packets ready for use.
+
+var max_packets = 1e6;
+
+ffi.cdef([=[
+struct freelist {
+    int32_t lock[1];
+    uint64_t nfree;
+    uint64_t max;
+    struct packet *list[]=]..max_packets..[=[];
+};
+]=]);
+
+var function freelist_full(freelist) {
+   return freelist.nfree == freelist.max;
+}
+
+var function freelist_add(freelist, element) {
+   // Safety check
+   if( _G.developer_debug ) {
+      assert(! freelist_full(freelist), "freelist overflow");
+   }
+   freelist.list[freelist.nfree] = element;
+   freelist.nfree = freelist.nfree + 1;
+}
+
+var function freelist_remove(freelist) {
+   if( freelist.nfree == 0 ) {
+      error("no free packets");
+   } else {
+      freelist.nfree = freelist.nfree - 1;
+      return freelist.list[freelist.nfree];
+   }
+}
+
+var function freelist_nfree(freelist) {
+   return freelist.nfree;
+}
+
+var function freelist_lock(freelist) {
+   sync.lock(freelist.lock);
+}
+
+var function freelist_unlock(freelist) {
+   sync.unlock(freelist.lock);
+}
+
+var packet_allocation_step = 1000;
+var packets_allocated = 0;
+var packets_fl = ffi.new("struct freelist", {max=max_packets});
+var group_fl; // Initialized on demand.
+
+// Call to ensure group freelist is enabled.
+function enable_group_freelist () {
+   if( ! group_fl ) {
+      group_fl = shm.create("group/packets.freelist", "struct freelist");
+      group_fl.max = max_packets;
+   }
+}
+
+// Return borrowed packets to group freelist.
+function rebalance_freelists () {
+   if( group_fl && freelist_nfree(packets_fl) > packets_allocated ) {
+      freelist_lock(group_fl);
+      while( freelist_nfree(packets_fl) > packets_allocated
+      && ! freelist_full(group_fl) ) {
+         freelist_add(group_fl, freelist_remove(packets_fl));
+      }
+      freelist_unlock(group_fl);
+   }
+}
+
+// Return an empty packet.
+function allocate () {
+   if( freelist_nfree(packets_fl) == 0 ) {
+      if( group_fl ) {
+         freelist_lock(group_fl);
+         while( freelist_nfree(group_fl) > 0
+         && freelist_nfree(packets_fl) < packets_allocated ) {
+            freelist_add(packets_fl, freelist_remove(group_fl));
+         }
+         freelist_unlock(group_fl);
+      }
+      if( freelist_nfree(packets_fl) == 0 ) {
+         preallocate_step();
+      }
+   }
+   return freelist_remove(packets_fl);
+}
+
+// Create a new empty packet.
+function new_packet () {
+   var base = memory.dma_alloc(packet_size + packet_alignment,
+                                 packet_alignment);
+   var p = ffi.cast(packet_ptr_t, base + default_headroom);
+   p.length = 0;
+   return p;
+}
+
+// Create an exact copy of a packet.
+function clone (p) {
+   return from_pointer(p.data, p.length);
+}
+
+// Append data to the end of a packet.
+function append (p, ptr, len) {
+   assert(p.length + len <= max_payload, "packet payload overflow");
+   ffi.copy(p.data + p.length, ptr, len);
+   p.length = p.length + len;
+   return p;
+}
+
+// Prepend data to the start of a packet.
+function prepend (p, ptr, len) {
+   p = shiftright(p, len);
+   ffi.copy(p.data, ptr, len);                // Fill the gap
+   return p;
+}
+
+// Move packet data to the left. This shortens the packet by dropping
+// the header bytes at the front.
+function shiftleft (p, bytes) {
+   assert(0 <= bytes && bytes <= p.length);
+   var ptr = ffi.cast("char*", p);
+   var len = p.length;
+   var headroom = get_headroom(ptr);
+   if( headroom_valid(bytes + headroom) ) {
+      // Fast path: just shift the packet pointer.
+      p = ffi.cast(packet_ptr_t, ptr + bytes);
+      p.length = len - bytes;
+      return p;
+   } else {
+      // Slow path: shift packet data, resetting the default headroom.
+      var delta_headroom = default_headroom - headroom;
+      C.memmove(p.data + delta_headroom, p.data + bytes, len - bytes);
+      p = ffi.cast(packet_ptr_t, ptr + delta_headroom);
+      p.length = len - bytes;
+      return p;
+   }
+}
+
+// Move packet data to the right. This leaves length bytes of data
+// at the beginning of the packet.
+function shiftright (p, bytes) {
+   var ptr = ffi.cast("char*", p);
+   var len = p.length;
+   var headroom = get_headroom(ptr);
+   if( headroom_valid(headroom - bytes) ) {
+      // Fast path: just shift the packet pointer.
+      p = ffi.cast(packet_ptr_t, ptr - bytes);
+      p.length = len + bytes;
+      return p;
+   } else {
+      // Slow path: shift packet data, resetting the default headroom.
+      assert(bytes <= max_payload - len);
+      var delta_headroom = default_headroom - headroom;
+      C.memmove(p.data + bytes + delta_headroom, p.data, len);
+      p = ffi.cast(packet_ptr_t, ptr + delta_headroom);
+      p.length = len + bytes;
+      return p;
+   }
+}
+
+// Conveniently create a packet by copying some existing data.
+function from_pointer (ptr, len) { return append(allocate(), ptr, len); }
+function from_string (d) {         return from_pointer(d, #d); }
+
+// Free a packet that is no longer in use.
+var function free_internal (p) {
+   var ptr = ffi.cast("char*", p);
+   p = ffi.cast(packet_ptr_t, ptr - get_headroom(ptr) + default_headroom);
+   p.length = 0;
+   freelist_add(packets_fl, p);
+}   
+
+function account_free (p) {
+   counter.add(engine.frees);
+   counter.add(engine.freebytes, p.length);
+   // Calculate bits of physical capacity required for packet on 10GbE
+   // Account for minimum data size and overhead of CRC and inter-packet gap
+   counter.add(engine.freebits, (math.max(p.length, 46) + 4 + 5) * 8);
+}
+
+function free (p) {
+   account_free(p);
+   free_internal(p);
+}
+
+// Set packet data length.
+function resize (p, len) {
+   assert(len <= max_payload, "packet payload overflow");
+   ffi.fill(p.data + p.length, math.max(0, len - p.length));
+   p.length = len;
+   return p;
+}
+
+function preallocate_step() {
+   assert(packets_allocated + packet_allocation_step <= max_packets,
+          "packet allocation overflow");
+
+   for( i=1, packet_allocation_step ) {
+      free_internal(new_packet(), true);
+   }
+   packets_allocated +=   packet_allocation_step;
+   packet_allocation_step = 2 * packet_allocation_step;
+}
+
+function selftest () {
+   assert(is_aligned(0, 1));
+   assert(is_aligned(1, 1));
+   assert(is_aligned(2, 1));
+   assert(is_aligned(3, 1));
+
+   assert(    is_aligned(0, 2));
+   assert(! is_aligned(1, 2));
+   assert(    is_aligned(2, 2));
+   assert(! is_aligned(3, 2));
+
+   assert(    is_aligned(0, 512));
+   assert(! is_aligned(1, 512));
+   assert(! is_aligned(2, 512));
+   assert(! is_aligned(3, 512));
+   assert(! is_aligned(510, 512));
+   assert(! is_aligned(511, 512));
+   assert(    is_aligned(512, 512));
+   assert(! is_aligned(513, 512));
+
+   var function is_power_of_2 (x) { return bit.band(x, x-1) == 0; }
+   assert(is_power_of_2(minimum_alignment));
+   assert(is_power_of_2(packet_alignment));
+   assert(is_aligned(default_headroom, minimum_alignment));
+
+   var function check_free (p) {
+      free(p);
+      // Check that the last packet added to the free list has the
+      // default headroom.
+      p = allocate();
+      assert(get_headroom(p) == default_headroom);
+      free(p);
+   }
+
+   var function check_shift(init_len, shift, amount, len, headroom) {
+      var p = allocate();
+      p.length = init_len;
+      p = shift(p, amount);
+      assert(p.length == len);
+      assert(get_headroom(p) == headroom);
+      check_free(p);
+   }
+   var function check_fast_shift(init_len, shift, amount, len, headroom) {
+      assert(headroom_valid(amount));
+      check_shift(init_len, shift, amount, len, headroom);
+   }
+   var function check_slow_shift(init_len, shift, amount, len) {
+      check_shift(init_len, shift, amount, len, default_headroom);
+   }
+
+   check_fast_shift(0, function (p, amt) { return p; }, 0, 0, default_headroom);
+   check_fast_shift(0, shiftright, 0, 0, default_headroom);
+   check_fast_shift(0, shiftright, 10, 10, default_headroom - 10);
+   check_slow_shift(0, shiftright, 11, 11);
+
+   check_fast_shift(512, shiftleft, 0, 512, default_headroom);
+   check_fast_shift(512, shiftleft, 10, 502, default_headroom + 10);
+   check_slow_shift(512, shiftleft, 11, 501);
+
+   check_fast_shift(0, shiftright, default_headroom, default_headroom, 0);
+   check_slow_shift(0, shiftright, default_headroom + 2, default_headroom + 2);
+   check_slow_shift(0, shiftright, packet_alignment * 2, packet_alignment * 2);
+
+   check_fast_shift(packet_alignment, shiftleft,
+                    packet_alignment - default_headroom - 2,
+                    default_headroom + 2, packet_alignment - 2);
+   check_slow_shift(packet_alignment, shiftleft,
+                    packet_alignment - default_headroom, default_headroom);
+}

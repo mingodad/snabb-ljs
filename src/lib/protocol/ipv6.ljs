@@ -1,0 +1,212 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+module(..., package.seeall);
+var ffi = require("ffi");
+var C = ffi.C;
+var lib = require("core.lib");
+var header = require("lib.protocol.header");
+var htons, ntohs = lib.htons, lib.ntohs;
+
+var AF_INET6 = 10;
+var INET6_ADDRSTRLEN = 48;
+
+var defaults = {
+   traffic_class = 0,
+   flow_label = 0,
+   next_header = 59, // no next header
+   hop_limit = 64,
+};
+
+var ipv6hdr_pseudo_t = ffi.typeof([=[
+      struct {
+         char src_ip[16];
+         char dst_ip[16];
+         uint16_t ulp_zero;
+         uint16_t ulp_length;
+         uint8_t  zero[3];
+         uint8_t  next_header;
+      } __attribute__((packed))
+]=]);
+
+var ipv6_addr_t = ffi.typeof("uint16_t[8]");
+var ipv6 = subClass(header);
+
+// Class variables
+ipv6._name = "ipv6";
+ipv6._ulp = {
+   class_map = {
+       [6] = "lib.protocol.tcp",
+      [17] = "lib.protocol.udp",
+      [47] = "lib.protocol.gre",
+      [58] = "lib.protocol.icmp.header",
+      [115] = "lib.protocol.keyed_ipv6_tunnel",
+   },
+   method    = 'next_header' };
+header.init(ipv6,
+            {
+               [1] = ffi.typeof([=[
+                     struct {
+                        uint32_t v_tc_fl; // version, tc, flow_label
+                        uint16_t payload_length;
+                        uint8_t  next_header;
+                        uint8_t hop_limit;
+                        uint8_t src_ip[16];
+                        uint8_t dst_ip[16];
+                     } __attribute__((packed))
+               ]=])
+            });
+
+// Class methods
+
+function ipv6::new (config) {
+   var o = ipv6->superClass().new(this);
+   if( ! o._recycled ) {
+      o._ph = ipv6hdr_pseudo_t();
+   }
+   o->version(6);
+   o->traffic_class(config.traffic_class || defaults.traffic_class);
+   o->flow_label(config.flow_label || defaults.flow_label);
+   o->next_header(config.next_header || defaults.next_header);
+   o->hop_limit(config.hop_limit || defaults.hop_limit);
+   o->src(config.src);
+   o->dst(config.dst);
+   return o;
+}
+
+function ipv6::new_from_mem(mem, size) {
+   var o = ipv6->superClass().new_from_mem(this, mem, size);
+   if( o == null ) {
+      return null;
+   }
+   if( ! o._recycled ) {
+      o._ph = ipv6hdr_pseudo_t();
+   }
+   return o;
+}
+
+function ipv6::pton (p) {
+   var in_addr  = ffi.new("uint8_t[16]");
+   var result = C.inet_pton(AF_INET6, p, in_addr);
+   if( result != 1 ) {
+      return false, "malformed IPv6 address: " .. p;
+   }
+   return in_addr;
+}
+
+function ipv6::ntop (n) {
+   var p = ffi.new("char[?]", INET6_ADDRSTRLEN);
+   var c_str = C.inet_ntop(AF_INET6, n, p, INET6_ADDRSTRLEN);
+   return ffi.string(c_str);
+}
+
+function ipv6::get() {
+   return this->ntop(this);
+}
+
+function ipv6::set(addr) {
+   this->pton(addr);
+}
+
+// Construct the solicited-node multicast address from the given
+// unicast address by appending the last 24 bits to ff02::1:ff00:0/104
+function ipv6::solicited_node_mcast (n) {
+   n = ffi.cast("uint8_t *", n);
+   var result = this->pton("ff02:0:0:0:0:1:ff00:0");
+   ffi.copy(ffi.cast("uint8_t *", result)+13, n+13, 3);
+   return result;
+}
+
+// Instance methods
+
+function ipv6::version (v) {
+   return lib.bitfield(32, this->header(), 'v_tc_fl', 0, 4, v);
+}
+
+function ipv6::traffic_class (tc) {
+   return lib.bitfield(32, this->header(), 'v_tc_fl', 4, 8, tc);
+}
+
+function ipv6::dscp (dscp) {
+   return lib.bitfield(32, this->header(), 'v_tc_fl', 4, 6, dscp);
+}
+
+function ipv6::ecn (ecn) {
+   return lib.bitfield(32, this->header(), 'v_tc_fl', 10, 2, ecn);
+}
+
+function ipv6::flow_label (fl) {
+   return lib.bitfield(32, this->header(), 'v_tc_fl', 12, 20, fl);
+}
+
+function ipv6::payload_length (length) {
+   if( length != null ) {
+      this->header().payload_length = htons(length);
+   } else {
+      return(ntohs(this->header().payload_length));
+   }
+}
+
+function ipv6::next_header (nh) {
+   if( nh != null ) {
+      this->header().next_header = nh;
+   } else {
+      return(this->header().next_header);
+   }
+}
+
+function ipv6::hop_limit (limit) {
+   if( limit != null ) {
+      this->header().hop_limit = limit;
+   } else {
+      return(this->header().hop_limit);
+   }
+}
+
+function ipv6::src (ip) {
+   if( ip != null ) {
+      ffi.copy(this->header().src_ip, ip, 16);
+   } else {
+      return this->header().src_ip;
+   }
+}
+
+function ipv6::src_eq (ip) {
+   return C.memcmp(ip, this->header().src_ip, 16) == 0;
+}
+
+function ipv6::dst (ip) {
+   if( ip != null ) {
+      ffi.copy(this->header().dst_ip, ip, 16);
+   } else {
+      return this->header().dst_ip;
+   }
+}
+
+function ipv6::dst_eq (ip) {
+   return C.memcmp(ip, this->header().dst_ip, 16) == 0;
+}
+
+// Return a pseudo header for checksum calculation in a upper-layer
+// protocol (e.g. icmp).  Note that the payload length and next-header
+// values in the pseudo-header refer to the effective upper-layer
+// protocol.  They differ from the respective values of the ipv6
+// header if extension headers are present.
+function ipv6::pseudo_header (plen, nh) {
+   var ph = this._ph;
+   ffi.fill(ph, ffi.sizeof(ph));
+   var h = this->header();
+   ffi.copy(ph, h.src_ip, 32);  // Copy source and destination
+   ph.ulp_length = htons(plen);
+   ph.next_header = nh;
+   return(ph);
+}
+
+function selftest() {
+   var ipv6_address = "2001:620:0:c101::2";
+   assert(ipv6_address == ipv6->ntop(ipv6->pton(ipv6_address)),
+      'ipv6 text to binary conversion failed.');
+}
+
+ipv6.selftest = selftest;
+
+return ipv6;

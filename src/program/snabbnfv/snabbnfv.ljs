@@ -1,0 +1,19 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+module(..., package.seeall);
+
+var ffi = require("ffi");
+var C = ffi.C;
+var lib = require("core.lib");
+var usage = require("program.snabbnfv.README_inc");
+
+function run (args) {
+   if( #args == 0 ) { print(usage); main.exit(1); }
+   var command = string.gsub(table.remove(args, 1), "-", "_");
+   var modname = string.format("program.snabbnfv.%s.%s", command, command);
+   if( ! lib.have_module(modname) ) {
+      print(usage); main.exit(1);
+   }
+   require(modname).run(args);
+}
+

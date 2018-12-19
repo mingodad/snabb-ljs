@@ -1,0 +1,108 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+module(...,package.seeall);
+
+var numa = require('lib.numa');
+
+var CPUSet = {};
+
+function new() {
+   return setmetatable({by_node={}}, {__index=CPUSet});
+}
+
+{
+   var cpuset = false;
+   function global_cpuset() {
+      if( ! cpuset ) { cpuset = new(); }
+      return cpuset;
+   }
+}
+
+function CPUSet::bind_to_numa_node() {
+   var nodes = {};
+   for( node, _ in pairs(this.by_node) ) { table.insert(nodes, node); }
+   if( #nodes == 0 ) {
+      print("No CPUs available; not binding to any NUMA node.");
+   } else if( #nodes == 1 ) {
+      numa.bind_to_numa_node(nodes[1]);
+      print("Bound main process to NUMA node: ", nodes[1]);
+   } else {
+      print("CPUs available from multiple NUMA nodes: "..table.concat(nodes, ","));
+      print("Not binding to any NUMA node.");
+   }
+}
+
+function CPUSet::add_from_string(cpus) {
+   for( range in cpus->split(',') ) {
+      var lo, hi = range->match("^%s*([^%-]*)%s*-%s*([^%-%s]*)%s*$");
+      if( lo == null ) { lo = range->match("^%s*([^%-]*)%s*$"); }
+      assert(lo != null, 'invalid range: '..range);
+      lo = assert(tonumber(lo), 'invalid range begin: '..lo);
+      assert(lo == math.floor(lo), 'invalid range begin: '..lo);
+      if( hi != null ) {
+         hi = assert(tonumber(hi), 'invalid range end: '..hi);
+         assert(hi == math.floor(hi), 'invalid range end: '..hi);
+         assert(lo < hi, 'invalid range: '..range);
+      } else {
+         hi = lo;
+      }
+      for( cpu=lo,hi ) { this->add(cpu); }
+   }
+}
+
+function CPUSet::add(cpu) {
+   var node = numa.cpu_get_numa_node(cpu);
+   assert(node != null, 'Failed to get NUMA node for CPU: '..cpu);
+   if( this.by_node[node] == null ) { this.by_node[node] = {}; }
+   assert(this.by_node[cpu] == null, 'CPU already in set: '..cpu);
+   this.by_node[node][cpu] = true;
+}
+
+function CPUSet::acquire_for_pci_addresses(addrs) {
+   return this->acquire(numa.choose_numa_node_for_pci_addresses(addrs));
+}
+
+function CPUSet::acquire(on_node) {
+   for( node, cpus in pairs(this.by_node) ) {
+      if( on_node == null || on_node == node ) {
+         for( cpu, avail in pairs(cpus) ) {
+            if( avail ) {
+               cpus[cpu] = false;
+               return cpu;
+            }
+         }
+      }
+   }
+   if( on_node != null ) {
+      for( node, cpus in pairs(this.by_node) ) {
+         for( cpu, avail in pairs(cpus) ) {
+            if( avail ) {
+               print("Warning: No CPU available on local NUMA node "..on_node);
+               print("Warning: Assigning CPU "..cpu.." from remote node "..node);
+               cpus[cpu] = false;
+               return cpu;
+            }
+         }
+      }
+   }
+   for( node, cpus in pairs(this.by_node) ) {
+      print("Warning: All assignable CPUs in use; "
+               .."leaving data-plane process without assigned CPU.");
+      return;
+   }
+   print("Warning: No assignable CPUs declared; "
+            .."leaving data-plane process without assigned CPU.");
+}
+
+function CPUSet::release(cpu) {
+   var node = numa.cpu_get_numa_node(cpu);
+   assert(node != null, 'Failed to get NUMA node for CPU: '..cpu);
+   for( x, avail in pairs(this.by_node[node]) ) {
+      if( x == cpu ) {
+         assert(this.by_node[node][cpu] == false);
+         this.by_node[node][cpu] = true;
+         return;
+      }
+   }
+   error('CPU not found on NUMA node: '..cpu..', '..node);
+}

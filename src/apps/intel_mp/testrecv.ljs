@@ -1,0 +1,88 @@
+// Helper module for testing intel_mp driver receive
+
+module(..., package.seeall);
+
+var intel = require("apps.intel_mp.intel_mp");
+var basic = require("apps.basic.basic_apps");
+var ffi = require("ffi");
+var C = ffi.C;
+
+function test(pciaddr, qno, vmdq, poolno, macaddr, vlan) {
+   var c = config.new();
+   if( vmdq ) {
+      config.app(c, "nic", intel.Intel,
+                 { pciaddr=pciaddr,
+                   macaddr=macaddr,
+                   vlan=vlan,
+                   vmdq=true,
+                   poolnum=poolno,
+                   rxq = qno,
+                   wait_for_link=true });
+   } else {
+      config.app(c, "nic", intel.Intel,
+                 { pciaddr=pciaddr,
+                   rxq = qno,
+                   wait_for_link=true });
+   }
+   config.app(c, "sink", basic.Sink);
+   if( os.getenv("SNABB_RECV_EXPENSIVE") ) {
+      var filter = require("apps.packet_filter.pcap_filter");
+   
+      var count = 10;
+      config.link(c, "nic.output -> filter0.input");
+      for( i=0,count ) {
+         var n = tostring(i);
+         var s = "filter"..n;
+         config.app(c, s, filter.PcapFilter, { filter = [=[ not dst host 10.2.29.1 and not dst host 10.2.50.1 ]=]});
+      }
+      for( i=1,count ) {
+         var m = tostring(i-1);
+         var n = tostring(i);
+         var s = "filter"..m..".output -> filter"..n..".input";
+         config.link(c, s);
+      }
+      config.app(c, "sane", filter.PcapFilter, { filter = [=[ src host 172.16.172.3 and dst net 1.2.0.0/16 and ip proto 0 ]=] });
+      config.link(c, "filter"..tostring(count)..".output -> sane.input");
+      config.link(c, "sane.output -> sink.input");
+   } else {
+      config.link(c, "nic.output -> sink.input");
+   }
+   
+   engine.configure(c);
+   var spinup = os.getenv("SNABB_RECV_SPINUP");
+   if( spinup ) {
+      engine.main({duration = spinup});
+   }
+   
+   var counters = {
+      Intel82599 = { "GPRC", "RXDGPC" },
+      Intel1g = { "GPRC", "RPTHC" }
+   };
+   
+   var duration = os.getenv("SNABB_RECV_DURATION") || 2;
+   var before = {};
+   var nic = engine.app_table.nic;
+   var master = nic.master;
+   
+   if( master ) {
+      for( _,v in pairs(counters[nic.driver]) ) {
+         before[v] = nic.r[v]();
+      }
+   }
+   
+   if( os.getenv("SNABB_RECV_DEBUG") ) {
+      for( _=1,duration ) {
+         engine.main({duration = 1});
+         nic->debug();
+      }
+   } else {
+      engine.main({duration = duration});
+   }
+   
+   if( master ) {
+      for( _,v in pairs(counters[nic.driver]) ) {
+         print(string.format("%s %d", v, tonumber(nic.r[v]() - before[v])/duration));
+      }
+   }
+   main.exit(0);
+}

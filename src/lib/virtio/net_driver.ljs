@@ -1,0 +1,176 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+// Application to connect to a virtio-net driver implementation
+//
+// Licensed under the Apache 2.0 license
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Copyright (c) 2015 Virtual Open Systems
+//
+
+module(..., package.seeall);
+
+var debug = _G.developer_debug;
+
+var ffi       = require("ffi");
+var C         = ffi.C;
+var S         = require('syscall');
+var pci       = require("lib.hardware.pci");
+var lib       = require("core.lib");
+var bit       = require('bit');
+var virtq     = require('lib.virtio.virtq_driver');
+var VirtioPci = require('lib.virtio.virtio_pci').VirtioPci;
+var checksum  = require('lib.checksum');
+
+var band, bor, rshift, lshift = bit.band, bit.bor, bit.rshift, bit.lshift;
+var prepare_packet4, prepare_packet6 = checksum.prepare_packet4, checksum.prepare_packet6;
+var new_packet, free = packet.allocate, packet.free;
+
+// constants
+var ETHERTYPE_IPv4 = C.htons(0x0800);
+var ETHERTYPE_IPv6 = C.htons(0x86DD);
+var ETHERTYPE_OFF = 12;
+var ETHERLEN = 14; // DST MAC | SRC MAC | ethertype
+var VIRTIO_NET_HDR_F_NEEDS_CSUM = 1;
+
+var min_features = C.VIRTIO_NET_F_CSUM +
+   C.VIRTIO_F_ANY_LAYOUT +
+   C.VIRTIO_NET_F_CTRL_VQ;
+var want_features =  min_features;
+
+var RXQ = 0;
+var TXQ = 1;
+
+VirtioNetDriver = {};
+VirtioNetDriver.__index = VirtioNetDriver;
+
+function VirtioNetDriver::new(args) {
+
+   var virtio_pci = VirtioPci->new(args.pciaddr);
+
+   this.min_features = min_features;
+   this.want_features = want_features;
+
+   if( args.use_checksum ) {
+      this.transmit = this._transmit_checksum;
+   } else {
+      this.transmit = this._transmit;
+   }
+
+   virtio_pci->reset();
+   virtio_pci->acknowledge();
+
+   virtio_pci->driver();
+
+   var error = virtio_pci->set_guest_features(this.min_features, this.want_features);
+   if( error ) {
+      virtio_pci->free();
+      return null, error;
+   }
+
+   if( debug ) { print("enumerating queues..."); }
+   var vqs = {};
+   for( n = 0, 1 ) {
+      var queue_num = virtio_pci->get_queue_num(n);
+      if( ! queue_num ) {
+         virtio_pci->failed();
+         virtio_pci->free();
+         return null, "missing required virtqueues";
+      }
+      vqs[n] = virtq.allocate_virtq(queue_num);
+      virtio_pci->set_queue_vring(n, vqs[n].vring_physaddr);
+   }
+
+   virtio_pci->driver_ok();
+
+   return setmetatable({
+      virtio_pci = virtio_pci,
+      vqs = vqs,
+   }, this);
+}
+
+function VirtioNetDriver::close() {
+   for( n, _ in ipairs(this.vqs) ) {
+      this.virtio_pci->disable_queue(n);
+   }
+   this.virtio_pci->free();
+}
+
+// Device operation
+function VirtioNetDriver::can_transmit() {
+   var txq = this.vqs[TXQ];
+   return txq->can_add();
+}
+
+function VirtioNetDriver::_transmit_checksum(p) {
+
+   var ethertype = ffi.cast('uint16_t*', p.data + ETHERTYPE_OFF)[0];
+   var l3p, l3len = p.data + ETHERLEN, p.length - ETHERLEN;
+   var csum_start, csum_off;
+
+   if( ethertype == ETHERTYPE_IPv4 ) {
+      csum_start, csum_off = prepare_packet4(l3p, l3len);
+   } else if( ethertype == ETHERTYPE_IPv6 ) {
+      csum_start, csum_off = prepare_packet6(l3p, l3len);
+   }
+
+   if( csum_start != null ) {
+      var flags = VIRTIO_NET_HDR_F_NEEDS_CSUM;
+      csum_start +=   ETHERLEN;
+      this.vqs[TXQ]->add(p, p.length, flags, csum_start, csum_off);
+   } else {
+      this.vqs[TXQ]->add_empty_header(p, p.length);
+   }
+
+}
+
+function VirtioNetDriver::_transmit(p) {
+   this.vqs[TXQ]->add_empty_header(p, p.length);
+}
+
+function VirtioNetDriver::sync_transmit() {
+   var txq = this.vqs[TXQ];
+
+   txq->update_avail_idx();
+}
+
+function VirtioNetDriver::notify_transmit() {
+   var txq = this.vqs[TXQ];
+
+   // Notify the device if needed
+   if( txq->should_notify() ) {
+      this.virtio_pci->notify_queue(TXQ);
+   }
+}
+
+function VirtioNetDriver::recycle_transmit_buffers() {
+   var txq = this.vqs[TXQ];
+   var to_free = txq->can_get();
+
+   for( i=0, to_free - 1 ) {
+      var p = txq->get();
+      free(p);
+   }
+}
+
+function VirtioNetDriver::can_receive() {
+   var rxq = this.vqs[RXQ];
+   return rxq->can_get();
+}
+
+function VirtioNetDriver::receive() {
+   return this.vqs[RXQ]->get();
+}
+
+function VirtioNetDriver::add_receive_buffers() {
+   var rxq = this.vqs[RXQ];
+   var to_add = rxq->can_add();
+   if( to_add  == 0 ) { return; }
+
+   for( i=0, to_add - 1 ) {
+      rxq->add_empty_header(new_packet(), C.PACKET_PAYLOAD_SIZE);
+   }
+
+   rxq->update_avail_idx();
+}
+

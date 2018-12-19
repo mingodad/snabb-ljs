@@ -1,0 +1,1492 @@
+// Use of this source code is governed by the Apache 2.0 license; see
+// COPYING.
+module(..., package.seeall);
+
+var parser_mod = require("lib.yang.parser");
+var schema = require("lib.yang.schema");
+var util = require("lib.yang.util");
+var value = require("lib.yang.value");
+var ffi = require("ffi");
+var ctable = require('lib.ctable');
+var cltable = require('lib.cltable');
+var regexp = require("lib.xsd_regexp");
+
+function normalize_id(id) {
+   return id->gsub('[^%w_]', '_');
+}
+
+// Helper for parsing C type declarations.
+var function parse_type(str, start, is_member) {
+   var function err(msg, pos) {
+      io.stderr->write('ERROR: While parsing type:\n');
+      io.stderr->write('ERROR:   '..str..'\n');
+      io.stderr->write('ERROR:   '..string.rep(' ', pos - 1)..'^\n');
+      io.stderr->write('ERROR: '..msg..'\n');
+      error(msg, 2);
+   }
+   var function assert_match(str, pat, pos, what) {
+      var ret = { str->match(pat, pos) };
+      if( ! ret[1] ) { err('bad '..what, pos); }
+      return unpack(ret);
+   }
+   var t, array, member, pos;
+   // See if it's a struct.
+   t, pos = str->match('^%s*(struct%s*%b{})%s*()', start);
+   // Otherwise it might be a scalar.
+   if( ! t ) { t, pos = str->match('^%s*([%a_][%w_]*)%s*()', start); }
+   // We don't do unions currently.
+   if( ! t ) { err('invalid type', start); }
+   // If we're parsing a struct or union member, get the name.
+   if( is_member ) {
+      member, pos = assert_match(str, '^([%a_][%w_]*)%s*()', pos, 'member name');
+   }
+   // Parse off the array suffix, if any.
+   if( str->match('^%[', pos) ) {
+      array, pos = assert_match(str, '^(%b[])%s*()', pos, 'array component');
+   }
+   if( is_member ) {
+      // Members should have a trailing semicolon.
+      pos = assert_match(str, '^;%s*()', pos, 'semicolon');
+   } else {
+      // Nonmembers should parse to the end of the string.
+      assert_match(str, '^()$', pos, 'suffix');
+   }
+   return t, array, member, pos;
+}
+
+// We want structural typing, not nominal typing, for Yang data.  The
+// "foo" member in "struct { struct { uint16 a; } foo; }" should not
+// have a unique type; we want to be able to instantiate a "struct {
+// uint16 a; }" and get a compatible value.  To do this, we parse out
+// nested "struct" types and only ever make one FFI type for each
+// compatible struct kind.  The user-facing interface is the "typeof"
+// function below; the "compile_type" helper handles nesting.
+//
+// It would be possible to avoid this complexity by having the grammar
+// generate something other than a string "ctype" representation, but
+// then we don't have a type name to serialize into binary data.  We
+// might as well embrace the type strings.
+var function compile_type(name) {
+   var function maybe_array_type(t, array) {
+      // If ARRAY is something like "[10]", make a corresponding type.
+      // Otherwise just return T.
+      if( array ) { return ffi.typeof('$'..array, t); }
+      return t;
+   }
+   var parsed, array = parse_type(name, 1, false);
+   var ret;
+   if( parsed->match('^struct[%s{]') ) {
+      // It's a struct type; parse out the members and rebuild.
+      var struct_type = 'struct { ';
+      var struct_type_args = {};
+      var function add_member(member_type, member_name) {
+         struct_type = struct_type..'$ '..member_name..'; ';
+         table.insert(struct_type_args, member_type);
+      }
+      // Loop from initial "struct {" to final "}".
+      var pos = assert(parsed->match('^struct%s*{%s*()'));
+      while( ! parsed->match('^}$', pos) ) {
+         var mtype, mname, marray;
+         mtype, marray, mname, pos = parse_type(parsed, pos, true);
+         // Recurse on mtype by calling the caching "typeof" defined
+         // below.
+         add_member(maybe_array_type(typeof(mtype), marray), mname);
+      }
+      struct_type = struct_type..'}';
+      ret = ffi.typeof(struct_type, unpack(struct_type_args));
+   } else {
+      // Otherwise the type is already structural and we can just use
+      // ffi.typeof.
+      ret = ffi.typeof(parsed);
+   }
+   return maybe_array_type(ret, array);
+}
+
+var type_cache = {};
+function typeof(name) {
+   assert(type(name) == 'string');
+   if( ! type_cache[name] ) { type_cache[name] = compile_type(name); }
+   return type_cache[name];
+}
+
+// If a "list" node has one key that is string-valued, we will represent
+// instances of that node as normal Lua tables where the key is the
+// table key and the value does not contain the key.
+var function table_string_key(keys) {
+   var string_key = null;
+   for( k,v in pairs(keys) ) {
+      if( v.type != 'scalar' ) { return null; }
+      if( v.argument_type.primitive_type != 'string' ) { return null; }
+      if( string_key != null ) { return null; }
+      string_key = k;
+   }
+   return string_key;
+}
+
+// We need to properly support unions.  It's a big FIXME!  As an
+// intermediate step, we pick the first type in the union.  Terrible.
+var function elide_unions(t) {
+   while( t.primitive_type == 'union' ) { t = t.union[1]; }
+   return t;
+}
+
+function data_grammar_from_schema(schema, is_config) {
+   var function is_empty(tab) {
+      for( k,v in pairs(tab) ) { return false; }
+      return true;
+   }
+   var function struct_ctype(members) {
+      var member_names = {};
+      for( k,v in pairs(members) ) {
+         if( ! v.ctype ) { return null; }
+         table.insert(member_names, k);
+      }
+      table.sort(member_names);
+      var ctype = 'struct { ';
+      for( _,k in ipairs(member_names) ) {
+         // Separate the array suffix off of things like "uint8_t[4]".
+         var head, tail = members[k].ctype->match('^([^%[]*)(.*)$');
+         ctype = ctype..head..' '..normalize_id(k)..tail..'; ';
+      }
+      ctype = ctype..'}';
+      return ctype;
+   }
+   var function value_ctype(type) {
+      // Note that not all primitive types have ctypes.
+      return assert(value.types[assert(type.primitive_type)]).ctype;
+   }
+   var handlers = {};
+   var function visit(node) {
+      var handler = handlers[node.kind];
+      if( handler ) { return handler(node); }
+   }
+   var function visit_body(node) {
+      var ret = {};
+      var norm = {};
+      for( k, child in pairs(node.body) ) {
+         var out = visit(child);
+         if( out ) {
+            ret[k] = out;
+            var id = normalize_id(k);
+            assert(! norm[id], 'duplicate data identifier: '..id);
+            norm[id] = k;
+         }
+      }
+      return ret;
+   }
+   function handlers.container(node) {
+      var members = visit_body(node);
+      if( is_empty(members) ) { return; }
+      return {type='struct', members=members, ctype=struct_ctype(members)};
+   }
+   function handlers.choice(node) {
+      var choices = {};
+      for( choice, n in pairs(node.body) ) {
+         var members = visit_body(n);
+         if( ! is_empty(members) ) { choices[choice] = members; }
+      }
+      if( is_empty(choices) ) { return; }
+      return {type="choice", default=node.default, mandatory=node.mandatory,
+              choices=choices};
+   }
+   handlers['leaf-list'] = function(node) {
+      if( node.config != is_config ) { return; }
+      var t = elide_unions(node.type);
+      return {type='array', element_type=t, ctype=value_ctype(t)};
+   };
+   function handlers.list(node) {
+      var norm = {};
+      var keys, values = {}, {};
+      if( node.key ) {
+         for( k in node.key->split(' +') ) {
+            var leaf = node.body[k];
+            assert(leaf, 'missing key leaf: '..k);
+            assert(leaf.kind == 'leaf', 'key not a leaf: '..k);
+            assert(! keys[k], 'duplicate key: '..k);
+            keys[k] = assert(handlers.leaf(leaf, true));
+            var id = normalize_id(k);
+            assert(! norm[id], 'duplicate data identifier: '..id);
+            norm[id] = k;
+         }
+      }
+      for( k,xnode in pairs(node.body) ) {
+         if( ! keys[k] ) {
+            values[k] = visit(xnode);
+            var id = normalize_id(k);
+            assert(! norm[id], 'duplicate data identifier: '..id);
+            norm[id] = k;
+         }
+      }
+      if( is_empty(values) && node.config != is_config ) { return; }
+      return {type='table', keys=keys, values=values,
+              string_key=table_string_key(keys),
+              key_ctype=struct_ctype(keys),
+              value_ctype=struct_ctype(values)};
+   }
+   function handlers.leaf(node, for_key) {
+      if( node.config != is_config && ! for_key ) { return; }
+      var ctype;
+      var t = elide_unions(node.type);
+      if( node.default || node.mandatory ) { ctype=value_ctype(t); }
+      return {type='scalar', argument_type=t,
+              default=node.default, mandatory=node.mandatory,
+              ctype=ctype};
+   }
+   var members = visit_body(schema);
+   return {type="struct", members=members, ctype=struct_ctype(members)};
+}
+data_grammar_from_schema = util.memoize(data_grammar_from_schema);
+
+function config_grammar_from_schema(schema) {
+   return data_grammar_from_schema(schema, true);
+}
+config_grammar_from_schema = util.memoize(config_grammar_from_schema);
+
+function state_grammar_from_schema(schema) {
+   return data_grammar_from_schema(schema, false);
+}
+state_grammar_from_schema = util.memoize(state_grammar_from_schema);
+
+function rpc_grammar_from_schema(schema) {
+   var grammar = {};
+   for( _,prop in ipairs({'input', 'output'}) ) {
+      grammar[prop] = { type="sequence", members={} };
+      for( k,rpc in pairs(schema.rpcs) ) {
+         var node = rpc[prop];
+         if( node ) {
+            // Hack to mark RPC is-config as being true
+            grammar[prop].members[k] = data_grammar_from_schema(node);
+         } else {
+            grammar[prop].members[k] = {type="struct", members={}};
+         }
+      }
+   }
+   return grammar;
+}
+
+function rpc_input_grammar_from_schema(schema) {
+   return rpc_grammar_from_schema(schema).input;
+}
+
+function rpc_output_grammar_from_schema(schema) {
+   return rpc_grammar_from_schema(schema).output;
+}
+
+var function integer_type(min, max) {
+   return function(str, k) {
+      return util.tointeger(str, k, min, max);
+   };
+}
+
+var function range_predicate(range, val) {
+   return function(val) {
+      for( _,part in ipairs(range) ) {
+         var l, r = unpack(part);
+         if( (l == 'min' || l <= val) && (r == 'max' || val <= r) ) {
+            return true;
+         }
+      }
+      return false;
+   };
+}
+
+var function range_validator(range, f) {
+   if( ! range ) { return f; }
+   var is_in_range = range_predicate(range.value);
+   return function(val, P) {
+      if( is_in_range(val) ) { return f(val, P); }
+      P->error('value '..val..' is out of the valid range');
+   };
+}
+var function length_validator(length, f) {
+   if( ! length ) { return f; }
+   var is_in_range = range_predicate(length.value);
+   return function(val, P) {
+      if( is_in_range(string.len(val)) ) { return f(val, P); }
+      P->error('length of string '..val..' is out of the valid range');
+   };
+}
+function pattern_validator(patterns, f) {
+   if( ! patterns || #patterns == 0 ) { return f; }
+   var compiled = {};
+   for( _, pattern in ipairs(patterns) ) {
+      compiled[pattern.value] = regexp.compile(pattern.value);
+   }
+   return function (val, P) {
+      if( type(val) == 'string' ) {
+         for( pattern, match in pairs(compiled) ) {
+            if( ! match(val) ) {
+               P->error("pattern mismatch\n"..pattern.."\n"..val);
+            }
+         }
+      }
+      return f(val, P);
+   };
+}
+var function bit_validator(range, f) {
+   // FIXME: Implement me!
+   return f;
+}
+var function enum_validator(enums, f) {
+   if( ! enums ) { return f; }
+   return function (val, P) {
+      if( ! enums[val] ) {
+         P->error('enumeration '..val..' is not a valid value');
+      }
+      return f(val, P);
+   };
+}
+var function identityref_validator(bases, default_prefix, f) {
+   if( ! default_prefix ) { return f; }
+   return function(val, P) {
+      if( ! val->match(':') ) { val = default_prefix..":"..val; }
+      var identity = schema.lookup_identity(val);
+      for( _, base in ipairs(bases) ) {
+         if( ! schema.identity_is_instance_of(identity, base) ) {
+            P->error('identity '..val..' not an instance of '..base);
+         }
+      }
+      return f(val, P);
+   };
+}
+
+function value_parser(typ) {
+   var prim = typ.primitive_type;
+   var parse = assert(value.types[prim], prim).parse;
+   var validate = function(val) { return val; };
+   var function enums (node) {
+      return node.primitive_type == 'enumeration' && node.enums || null;
+   }
+   validate = range_validator(typ.range, validate);
+   validate = length_validator(typ.length, validate);
+   validate = pattern_validator(typ.pattern, validate);
+   validate = bit_validator(typ.bit, validate);
+   validate = enum_validator(enums(typ), validate);
+   validate = identityref_validator(typ.bases, typ.default_prefix, validate);
+   // TODO: union, require-instance.
+   return function(str, k, P) {
+      return validate(parse(str, k), P);
+   };
+}
+
+var function struct_parser(keyword, members, ctype) {
+   var keys = {};
+   for( k,v in pairs(members) ) { table.insert(keys, k); }
+   var function init() { return null; }
+   var function parse1(P) {
+      var ret = {};
+      var expanded_members = {};
+      for( _,k in ipairs(keys) ) {
+         if( members[k].represents ) {
+            // Choice fields don't include the name of the choice block in the data. They
+            // need to be able to provide the parser for the leaves it represents.
+            var member_parser = members[k].stateful_parser();
+            for( _, node in pairs(members[k].represents()) ) {
+               // Choice fields need to keep state around as they're called multiple times
+               // and need to do some validation to comply with spec.
+               expanded_members[node] = member_parser;
+            }
+         } else {
+            ret[normalize_id(k)] = members[k].init();
+            expanded_members[k] = members[k];
+         }
+      }
+      P->skip_whitespace();
+      P->consume("{");
+      P->skip_whitespace();
+      while( ! P->check("}") ) {
+         var k = P->parse_identifier();
+         if( k == '' ) { P->error("Expected a keyword"); }
+         // Scalar/array parser responsible for requiring whitespace
+         // after keyword.  Struct/table don't need it as they have
+         // braces.
+         var sub = assert(expanded_members[k], 'unrecognized parameter: '..k);
+         var id = normalize_id(k);
+         ret[id] = sub.parse(P, ret[id], k);
+         P->skip_whitespace();
+      }
+      for( k,_ in pairs(expanded_members) ) {
+         var id = normalize_id(k);
+         ret[id] = expanded_members[k].finish(ret[id], k);
+      }
+      return ret;
+   }
+   var function parse(P, out) {
+      if( out != null ) { P->error('duplicate parameter: '..keyword); }
+      return parse1(P);
+   }
+   var struct_t = ctype && typeof(ctype);
+   var function finish(out, leaf) {
+     // FIXME check mandatory values.
+      if( struct_t ) {
+        var ret;
+        if( out == null ) { ret = struct_t();
+        } else { ret = struct_t(out); }
+        return ret;
+      } else {
+        return out;
+      }
+   }
+   return {init=init, parse=parse, finish=finish};
+}
+
+var function array_parser(keyword, element_type, ctype) {
+   var function init() { return {}; }
+   var parsev = value_parser(element_type);
+   var function parse1(P) {
+      P->consume_whitespace();
+      var str = P->parse_string();
+      P->skip_whitespace();
+      P->consume(";");
+      return parsev(str, keyword, P);
+   }
+   var function parse(P, out) {
+      table.insert(out, parse1(P));
+      return out;
+   }
+   var elt_t = ctype && typeof(ctype);
+   var array_t = ctype && ffi.typeof('$[?]', elt_t);
+   var function finish(out) {
+      // FIXME check min-elements
+      if( array_t ) {
+         out = util.ffi_array(array_t(#out, out), elt_t);
+      }
+      return out;
+   }
+   return {init=init, parse=parse, finish=finish};
+}
+
+var default_parser = {};
+function default_parser::error (...) { error(...); }
+
+var function scalar_parser(keyword, argument_type, default, mandatory) {
+   var function init() { return null; }
+   var parsev = value_parser(argument_type);
+   var function parse1(P) {
+      var maybe_str;
+      if( argument_type.primitive_type != 'empty' ) {
+         P->consume_whitespace();
+         maybe_str = P->parse_string();
+      }
+      P->skip_whitespace();
+      P->consume(";");
+      return parsev(maybe_str, keyword, P);
+   }
+   var function parse(P, out) {
+      if( out != null ) { P->error('duplicate parameter: '..keyword); }
+      return parse1(P);
+   }
+   var function finish(out) {
+      if( out != null ) { return out; }
+      if( default ) { return parsev(default, keyword, default_parser); }
+      if( mandatory ) { error('missing scalar value: '..keyword); }
+   }
+   return {init=init, parse=parse, finish=finish};
+}
+
+function choice_parser(keyword, choices, members, default, mandatory) {
+   // Create a table matching the leaf names to the case statement
+   var choice_map = {};
+   for( case, choice in pairs(choices) ) {
+      for( leaf in pairs(choice) ) {
+         choice_map[leaf] = case;
+      }
+   }
+
+   var function stateful_parser() {
+      // This holds the value of the chosen case block so we're able to prevent mixing of
+      // using different leaves from different case statements.
+      var chosen;
+
+      var function init() { return {}; }
+      var function parse(P, out, k) {
+         if( chosen && choice_map[k] != chosen ) {
+            error("Only one choice set can exist at one time: "..keyword);
+         } else {
+            chosen = choice_map[k];
+         }
+         return members[chosen][k].parse(P, members[chosen][k].init(), k);
+      }
+
+      // This holds a copy of all the nodes so we know when we've hit the last one.
+      var function finish(out, k) {
+         if( out != null ) { return out; }
+         if( mandatory && chosen == null ) { error("missing choice value: "..keyword); }
+         if( default && default == choice_map[k] ) {
+            return members[default][k].finish();
+         }
+      }
+      return {init=init, parse=parse, finish=finish};
+   }
+   var function represents() {
+      var nodes = {};
+      for( name, _ in pairs(choice_map) ) { table.insert(nodes, name); }
+      return nodes;
+   }
+   return {represents=represents, stateful_parser=stateful_parser};
+}
+
+var function ctable_builder(key_t, value_t) {
+   var res = ctable.new({ key_type=key_t, value_type=value_t,
+                            max_occupancy_rate = 0.4 });
+   var builder = {};
+   // Uncomment for progress counters.
+   // local counter = 0
+   function builder::add(key, value) {
+      // counter = counter + 1
+      // if counter % 1000 == 0 then print('ctable add', counter) end
+      res->add(key, value);
+   }
+   function builder::finish() { return res; }
+   return builder;
+}
+
+var function string_keyed_table_builder(string_key) {
+   var res = {};
+   var builder = {};
+   function builder::add(key, value) {
+      var str = assert(key[string_key]);
+      assert(res[str] == null, 'duplicate key: '..str);
+      res[str] = value;
+   }
+   function builder::finish() { return res; }
+   return builder;
+}
+
+var function cltable_builder(key_t) {
+   var res = cltable.new({ key_type=key_t });
+   var builder = {};
+   function builder::add(key, value) {
+      assert(res[key] == null, 'duplicate key');
+      res[key] = value;
+   }
+   function builder::finish() { return res; }
+   return builder;
+}
+
+var function ltable_builder() {
+   var res = {};
+   var builder = {};
+   function builder::add(key, value) { res[key] = value; }
+   function builder::finish() { return res; }
+   return builder;
+}
+
+var function table_parser(keyword, keys, values, string_key, key_ctype,
+                            value_ctype) {
+   var members = {};
+   for( k,v in pairs(keys) ) { members[k] = v; }
+   for( k,v in pairs(values) ) { members[k] = v; }
+   var parser = struct_parser(keyword, members);
+   var key_t = key_ctype && typeof(key_ctype);
+   var value_t = value_ctype && typeof(value_ctype);
+   var init;
+   if( key_t && value_t ) {
+      function init() { return ctable_builder(key_t, value_t); }
+   } else if( string_key ) {
+      function init() { return string_keyed_table_builder(string_key); }
+   } else if( key_t ) {
+      function init() { return cltable_builder(key_t); }
+   } else {
+      function init() { return ltable_builder(); }
+   }
+   var function parse1(P) {
+      return parser.finish(parser.parse(P, parser.init()));
+   }
+   var function parse(P, assoc) {
+      var struct = parse1(P);
+      var key, value = {}, {};
+      if( key_t ) { key = key_t(); }
+      if( value_t ) { value = value_t(); }
+      for( k,_ in pairs(keys) ) {
+         var id = normalize_id(k);
+         key[id] = struct[id];
+      }
+      for( k, v in pairs(struct) ) {
+         var id = normalize_id(k);
+         if( keys[k] == null ) {
+            value[id] = struct[id];
+         }
+      }
+      assoc->add(key, value);
+      return assoc;
+   }
+   var function finish(assoc) {
+      return assoc->finish();
+   }
+   return {init=init, parse=parse, finish=finish};
+}
+
+function data_parser_from_grammar(production) {
+   var handlers = {};
+   var function visit1(keyword, production) {
+      return assert(handlers[production.type])(keyword, production);
+   }
+   var function visitn(productions) {
+      var ret = {};
+      for( keyword,production in pairs(productions) ) {
+         ret[keyword] = visit1(keyword, production);
+      }
+      return ret;
+   }
+   function handlers.struct(keyword, production) {
+      var members = visitn(production.members);
+      return struct_parser(keyword, members, production.ctype);
+   }
+   function handlers.array(keyword, production) {
+      return array_parser(keyword, production.element_type, production.ctype);
+   }
+   function handlers.table(keyword, production) {
+      var keys, values = visitn(production.keys), visitn(production.values);
+      return table_parser(keyword, keys, values, production.string_key,
+                          production.key_ctype, production.value_ctype);
+   }
+   function handlers.scalar(keyword, production) {
+      return scalar_parser(keyword, production.argument_type,
+                           production.default, production.mandatory);
+   }
+   function handlers.choice(keyword, production) {
+      var members = {};
+      for( case, choice in pairs(production.choices) ) { members[case] = visitn(choice); }
+      return choice_parser(keyword, production.choices, members,
+                           production.default, production.mandatory);
+   }
+
+   var top_parsers = {};
+   function top_parsers.struct(production) {
+      var struct_t = production.ctype && typeof(production.ctype);
+      var members = visitn(production.members);
+      return function(str, filename) {
+         var P = parser_mod.Parser.new(str, filename);
+         var ret = {};
+         for( k,sub in pairs(members) ) { ret[normalize_id(k)] = sub.init(); }
+         while( true ) {
+            P->skip_whitespace();
+            if( P->is_eof() ) { break; }
+            var k = P->parse_identifier();
+            if( k == '' ) { P->error("Expected a keyword"); }
+            var sub = assert(members[k], 'unrecognized parameter: '..k);
+            var id = normalize_id(k);
+            ret[id] = sub.parse(P, ret[id], k);
+         }
+         for( k,sub in pairs(members) ) {
+            var id = normalize_id(k);
+            ret[id] = sub.finish(ret[id]);
+         }
+         if( struct_t ) { return struct_t(ret); } else { return ret; }
+      };
+   }
+   function top_parsers.sequence(production) {
+      var members = visitn(production.members);
+      return function(str, filename) {
+         var P = parser_mod.Parser.new(str, filename);
+         var ret = {};
+         while( true ) {
+            P->skip_whitespace();
+            if( P->is_eof() ) { break; }
+            var k = P->parse_identifier();
+            P->consume_whitespace();
+            var sub = assert(members[k], 'unrecognized rpc: '..k);
+            var data = sub.finish(sub.parse(P, sub.init(), k));
+            table.insert(ret, {id=k, data=data});
+         }
+         return ret;
+      };
+   }
+   function top_parsers.array(production) {
+      var parser = visit1('[bare array]', production);
+      return function(str, filename) {
+         var P = parser_mod.Parser.new(str, filename);
+         var out = parser.init();
+         while( true ) {
+            P->skip_whitespace();
+            if( P->is_eof() ) { break; }
+            out = parser.parse(P, out);
+         }
+         return parser.finish(out);
+      };
+   }
+   function top_parsers.table(production) {
+      var parser = visit1('[bare table]', production);
+      return function(str, filename) {
+         var P = parser_mod.Parser.new(str, filename);
+         var out = parser.init();
+         while( true ) {
+            P->skip_whitespace();
+            if( P->is_eof() ) { break; }
+            out = parser.parse(P, out);
+         }
+         return parser.finish(out);
+      };
+   }
+   function top_parsers.scalar(production) {
+      var parse = value_parser(production.argument_type);
+      return function(str, filename) {
+         return parse(parser_mod.parse_string(str, filename),
+                      '[bare scalar]',
+                      default_parser);
+      };
+   }
+   return assert(top_parsers[production.type])(production);
+}
+data_parser_from_grammar = util.memoize(data_parser_from_grammar);
+
+function data_parser_from_schema(schema, is_config) {
+   var grammar = data_grammar_from_schema(schema, is_config);
+   return data_parser_from_grammar(grammar);
+}
+
+function config_parser_from_schema(schema) {
+   return data_parser_from_schema(schema, true);
+}
+
+function state_parser_from_schema(schema) {
+   return data_parser_from_schema(schema, false);
+}
+
+function load_data_for_schema(schema, str, filename, is_config) {
+   return data_parser_from_schema(schema, is_config)(str, filename);
+}
+
+function load_config_for_schema(schema, str, filename) {
+   return load_data_for_schema(schema, str, filename, true);
+}
+
+function load_state_for_schema(schema, str, filename) {
+   return load_data_for_schema(schema, str, filename, false);
+}
+
+function load_data_for_schema_by_name(schema_name, str, filename, is_config) {
+   var schema = schema.load_schema_by_name(schema_name);
+   return load_data_for_schema(schema, str, filename, is_config);
+}
+
+function load_config_for_schema_by_name(schema_name, str, filename) {
+   return load_data_for_schema_by_name(schema_name, str, filename, true);
+}
+
+function load_state_for_schema_by_name(schema_name, str, filename) {
+   return load_data_for_schema_by_name(schema_name, str, filename, false);
+}
+
+function rpc_input_parser_from_schema(schema) {
+   return data_parser_from_grammar(rpc_input_grammar_from_schema(schema));
+}
+
+function rpc_output_parser_from_schema(schema) {
+   return data_parser_from_grammar(rpc_output_grammar_from_schema(schema));
+}
+
+var value_serializers = {};
+var function value_serializer(typ) {
+   var prim = typ.primitive_type;
+   if( value_serializers[prim] ) { return value_serializers[prim]; }
+   var tostring = assert(value.types[prim], prim).tostring;
+   value_serializers[prim] = tostring;
+   return tostring;
+}
+
+var function print_yang_string(str, file) {
+   if( #str == 0 ) {
+      file->write("''");
+   } else if( str->match("^[^%s;{}\"'/]*$") ) {
+      file->write(str);
+   } else {
+      file->write('"');
+      for( i=1,#str ) {
+         var chr = str->sub(i,i);
+         if( chr == '\n' ) {
+            file->write('\\n');
+         } else if( chr == '\t' ) {
+            file->write('\\t');
+         } else if( chr == '"' || chr == '\\' ) {
+            file->write('\\');
+            file->write(chr);
+         } else {
+            file->write(chr);
+         }
+      }
+      file->write('"');
+   }
+}
+
+function xpath_printer_from_grammar(production, print_default, root) {
+   if( #root == 1 && root->sub(1, 1) == '/' ) {
+      root = '';
+   }
+   var handlers = {};
+   var translators = {};
+   var function printer(keyword, production, printers) {
+      return assert(handlers[production.type])(keyword, production, printers);
+   }
+   var function print_keyword(k, file, path) {
+      path = path->sub(1, 1) != '[' && root..'/'..path || root..path;
+      file->write(path);
+      print_yang_string(k, file);
+      file->write(' ');
+   }
+   var function body_printer(productions, order) {
+      // Iterate over productions trying to translate to other statements. This
+      // is used for example in choice statements raising the lower statements
+      // in case blocks up to the level of the choice, in place of the choice.
+      var translated = {};
+      for( keyword,production in pairs(productions) ) {
+         var translator = translators[production.type];
+         if( translator != null ) {
+            var statements = translator(keyword, production);
+            for( k,v in pairs(statements) ) { translated[k] = v; }
+         } else {
+            translated[keyword] = production;
+         }
+      }
+      productions = translated;
+      if( ! order ) {
+         order = {};
+         for( k,_ in pairs(productions) ) { table.insert(order, k); }
+         table.sort(order);
+      }
+      var printers = {};
+      for( keyword,production in pairs(productions) ) {
+         var printer = printer(keyword, production, printers);
+         if( printer != null ) {
+            printers[keyword] = printer;
+         }
+      }
+      return function(data, file, indent) {
+         for( _,k in ipairs(order) ) {
+            var v = data[normalize_id(k)];
+            if( v != null ) { printers[k](v, file, indent); }
+         }
+      };
+   }
+   var function key_composer (productions, order) {
+      var printer = body_printer(productions, order);
+      var file = {t={}};
+      function file::write (str) {
+         str = str->match("([^%s]+)");
+         if( str && #str > 0 && str != ";" && str != root..'/' ) {
+            table.insert(this.t, str);
+         }
+      }
+      function file::flush () {
+         var ret = {};
+         for( i=1,#this.t,2 ) {
+            var key, value = this.t[i], this.t[i+1];
+            table.insert(ret, '['..key.."="..value..']');
+         }
+         this.t = {};
+         return table.concat(ret, '');
+      }
+      return function (data, path) {
+         path = path || '';
+         printer(data, file, path);
+         return file->flush();
+      };
+   }
+   function translators.choice(keyword, production) {
+      var rtn = {};
+      for( case, body in pairs(production.choices) ) {
+         for( name, statement in pairs(body) ) {
+            rtn[name] = statement;
+         }
+      }
+      return rtn;
+   }
+   function handlers.struct(keyword, production) {
+      var print_body = body_printer(production.members);
+      return function(data, file, path) {
+         print_body(data, file, path..keyword..'/');
+      };
+   }
+   function handlers.array(keyword, production) {
+      var serialize = value_serializer(production.element_type);
+      return function(data, file, indent) {
+         var count = 1;
+         for( _,v in ipairs(data) ) {
+            print_keyword(keyword.."[position()="..count.."]", file, '');
+            print_yang_string(serialize(v), file);
+            file->write('\n');
+            ++count    ;
+         }
+      };
+   }
+   // As a special case, the table handler allows the keyword to be nil,
+   // for printing tables at the top level without keywords.
+   function handlers.table(keyword, production) {
+      var key_order, value_order = {}, {};
+      for( k,_ in pairs(production.keys) ) { table.insert(key_order, k); }
+      for( k,_ in pairs(production.values) ) { table.insert(value_order, k); }
+      table.sort(key_order);
+      table.sort(value_order);
+      var compose_key = key_composer(production.keys, key_order);
+      var print_value = body_printer(production.values, value_order);
+      if( production.key_ctype && production.value_ctype ) {
+         return function(data, file, path) {
+            path = path || '';
+            for( entry in data->iterate() ) {
+               var key = compose_key(entry.key);
+               path = path..(keyword || '')..key..'/';
+               print_value(entry.value, file, path);
+            }
+         };
+      } else if( production.string_key ) {
+         var id = normalize_id(production.string_key);
+         return function(data, file, path) {
+            path = path || '';
+            for( key, value in pairs(data) ) {
+               key = compose_key({[id]=key});
+               path = path..(keyword || '')..key..'/';
+               print_value(value, file, path);
+            }
+         };
+      } else if( production.key_ctype ) {
+         return function(data, file, path) {
+            path = path || '';
+            for( key, value in cltable.pairs(data) ) {
+               key = compose_key(key);
+               path = path..(keyword || '')..key..'/';
+               print_value(value, file, path);
+            }
+         };
+      } else {
+         return function(data, file, path) {
+            path = path || '';
+            for( key, value in pairs(data) ) {
+               key = compose_key(key);
+               path = path..(keyword || '')..key..'/';
+               print_value(value, file, path);
+            }
+         };
+      }
+   }
+   function handlers.scalar(keyword, production) {
+      var serialize = value_serializer(production.argument_type);
+      return function(data, file, path) {
+         var str = serialize(data);
+         if( print_default || str != production.default ) {
+            print_keyword(keyword, file, path);
+            print_yang_string(str, file);
+            file->write('\n');
+         }
+      };
+   }
+
+   var top_printers = {};
+   function top_printers.struct(production) {
+      var printer = body_printer(production.members);
+      return function(data, file) {
+         printer(data, file, '');
+         return file->flush();
+      };
+   }
+   function top_printers.sequence(production) {
+      var printers = {};
+      for( k,v in pairs(production.members) ) {
+         printers[k] = printer(k, v);
+      }
+      return function(data, file) {
+         for( _,elt in ipairs(data) ) {
+            var id = assert(elt.id);
+            assert(printers[id])(elt.data, file, '');
+         }
+         return file->flush();
+      };
+   }
+   function top_printers.table(production) {
+      var printer = handlers.table(null, production);
+      return function(data, file) {
+         printer(data, file, '');
+         return file->flush();
+      };
+   }
+   function top_printers.array(production) {
+      var serialize = value_serializer(production.element_type);
+      return function(data, file, indent) {
+         var count = 1;
+         for( _,v in ipairs(data) ) {
+            file->write(root.."[position()="..count.."]");
+            file->write(' ');
+            print_yang_string(serialize(v), file);
+            file->write('\n');
+            ++count    ;
+         }
+         return file->flush();
+      };
+   }
+   function top_printers.scalar(production) {
+      var serialize = value_serializer(production.argument_type);
+      return function(data, file) {
+         var str = serialize(data);
+         if( print_default || str != production.default ) {
+            file->write(root);
+            file->write(' ');
+            print_yang_string(str, file);
+            file->write('\n');
+            return file->flush();
+         }
+      };
+   }
+
+   return assert(top_printers[production.type])(production);
+}
+xpath_printer_from_grammar = util.memoize(xpath_printer_from_grammar);
+
+function data_printer_from_grammar(production, print_default) {
+   var handlers = {};
+   var translators = {};
+   var function printer(keyword, production, printers) {
+      return assert(handlers[production.type])(keyword, production, printers);
+   }
+   var function print_keyword(k, file, indent) {
+      file->write(indent);
+      print_yang_string(k, file);
+      file->write(' ');
+   }
+   var function body_printer(productions, order) {
+      // Iterate over productions trying to translate to other statements. This
+      // is used for example in choice statements raising the lower statements
+      // in case blocks up to the level of the choice, in place of the choice.
+      var translated = {};
+      for( keyword,production in pairs(productions) ) {
+         var translator = translators[production.type];
+         if( translator != null ) {
+            var statements = translator(keyword, production);
+            for( k,v in pairs(statements) ) { translated[k] = v; }
+         } else {
+            translated[keyword] = production;
+         }
+      }
+      productions = translated;
+      if( ! order ) {
+         order = {};
+         for( k,_ in pairs(productions) ) { table.insert(order, k); }
+         table.sort(order);
+      }
+      var printers = {};
+      for( keyword,production in pairs(productions) ) {
+         var printer = printer(keyword, production, printers);
+         if( printer != null ) {
+            printers[keyword] = printer;
+         }
+      }
+      return function(data, file, indent) {
+         for( _,k in ipairs(order) ) {
+            var v = data[normalize_id(k)];
+            if( v != null ) { printers[k](v, file, indent); }
+         }
+      };
+   }
+   function translators.choice(keyword, production) {
+      var rtn = {};
+      for( case, body in pairs(production.choices) ) {
+         for( name, statement in pairs(body) ) {
+            rtn[name] = statement;
+         }
+      }
+      return rtn;
+   }
+   function handlers.struct(keyword, production) {
+      var print_body = body_printer(production.members);
+      return function(data, file, indent) {
+         print_keyword(keyword, file, indent);
+         file->write('{\n');
+         print_body(data, file, indent..'  ');
+         file->write(indent..'}\n');
+      };
+   }
+   function handlers.array(keyword, production) {
+      var serialize = value_serializer(production.element_type);
+      return function(data, file, indent) {
+         for( _,v in ipairs(data) ) {
+            print_keyword(keyword, file, indent);
+            print_yang_string(serialize(v), file);
+            file->write(';\n');
+         }
+      };
+   }
+   // As a special case, the table handler allows the keyword to be nil,
+   // for printing tables at the top level without keywords.
+   function handlers.table(keyword, production) {
+      var key_order, value_order = {}, {};
+      for( k,_ in pairs(production.keys) ) { table.insert(key_order, k); }
+      for( k,_ in pairs(production.values) ) { table.insert(value_order, k); }
+      table.sort(key_order);
+      table.sort(value_order);
+      var print_key = body_printer(production.keys, key_order);
+      var print_value = body_printer(production.values, value_order);
+      if( production.key_ctype && production.value_ctype ) {
+         return function(data, file, indent) {
+            for( entry in data->iterate() ) {
+               if( keyword ) { print_keyword(keyword, file, indent); }
+               file->write('{\n');
+               print_key(entry.key, file, indent..'  ');
+               print_value(entry.value, file, indent..'  ');
+               file->write(indent..'}\n');
+            }
+         };
+      } else if( production.string_key ) {
+         var id = normalize_id(production.string_key);
+         return function(data, file, indent) {
+            for( key, value in pairs(data) ) {
+               if( keyword ) { print_keyword(keyword, file, indent); }
+               file->write('{\n');
+               print_key({[id]=key}, file, indent..'  ');
+               print_value(value, file, indent..'  ');
+               file->write(indent..'}\n');
+            }
+         };
+      } else if( production.key_ctype ) {
+         return function(data, file, indent) {
+            for( key, value in cltable.pairs(data) ) {
+               if( keyword ) { print_keyword(keyword, file, indent); }
+               file->write('{\n');
+               print_key(key, file, indent..'  ');
+               print_value(value, file, indent..'  ');
+               file->write(indent..'}\n');
+            }
+         };
+      } else {
+         return function(data, file, indent) {
+            for( key, value in pairs(data) ) {
+               if( keyword ) { print_keyword(keyword, file, indent); }
+               file->write('{\n');
+               print_key(key, file, indent..'  ');
+               print_value(value, file, indent..'  ');
+               file->write(indent..'}\n');
+            }
+         };
+      }
+   }
+   function handlers.scalar(keyword, production) {
+      var serialize = value_serializer(production.argument_type);
+      return function(data, file, indent) {
+         var str = serialize(data);
+         if( print_default || str != production.default ) {
+            print_keyword(keyword, file, indent);
+            print_yang_string(str, file);
+            file->write(';\n');
+         }
+      };
+   }
+
+   var top_printers = {};
+   function top_printers.struct(production) {
+      var printer = body_printer(production.members);
+      return function(data, file) {
+         printer(data, file, '');
+         return file->flush();
+      };
+   }
+   function top_printers.sequence(production) {
+      var printers = {};
+      for( k,v in pairs(production.members) ) {
+         printers[k] = printer(k, v);
+      }
+      return function(data, file) {
+         for( _,elt in ipairs(data) ) {
+            var id = assert(elt.id);
+            assert(printers[id])(elt.data, file, '');
+         }
+         return file->flush();
+      };
+   }
+   function top_printers.table(production) {
+      var printer = handlers.table(null, production);
+      return function(data, file) {
+         printer(data, file, '');
+         return file->flush();
+      };
+   }
+   function top_printers.array(production) {
+      var serialize = value_serializer(production.element_type);
+      return function(data, file, indent) {
+         for( _,v in ipairs(data) ) {
+            print_yang_string(serialize(v), file);
+            file->write('\n');
+         }
+         return file->flush();
+      };
+   }
+   function top_printers.scalar(production) {
+      var serialize = value_serializer(production.argument_type);
+      return function(data, file) {
+         print_yang_string(serialize(data), file);
+         return file->flush();
+      };
+   }
+   return assert(top_printers[production.type])(production);
+}
+data_printer_from_grammar = util.memoize(data_printer_from_grammar);
+
+function data_printer_from_schema(schema, is_config) {
+   var grammar = data_grammar_from_schema(schema, is_config);
+   return data_printer_from_grammar(grammar);
+}
+
+function config_printer_from_schema(schema) {
+   return data_printer_from_schema(schema, true);
+}
+
+function state_printer_from_schema(schema) {
+   return data_printer_from_schema(schema, false);
+}
+
+function print_data_for_schema(schema, data, file, is_config) {
+   return data_printer_from_schema(schema, is_config)(data, file);
+}
+
+function print_config_for_schema(schema, data, file) {
+   return config_printer_from_schema(schema)(data, file);
+}
+
+function print_state_for_schema(schema, data, file) {
+   return state_printer_from_schema(schema)(data, file);
+}
+
+function print_data_for_schema_by_name(schema_name, data, file, is_config) {
+   var schema = schema.load_schema_by_name(schema_name);
+   return print_data_for_schema(schema, data, file, is_config);
+}
+
+function print_config_for_schema_by_name(schema_name, data, file) {
+   return print_data_for_schema_by_name(schema_name, data, file, true);
+}
+
+function print_state_for_schema_by_name(schema_name, data, file) {
+   return print_data_for_schema_by_name(schema_name, data, file, false);
+}
+
+function rpc_input_printer_from_schema(schema) {
+   return data_printer_from_grammar(rpc_input_grammar_from_schema(schema));
+}
+
+function rpc_output_printer_from_schema(schema) {
+   return data_printer_from_grammar(rpc_output_grammar_from_schema(schema));
+}
+
+function selftest() {
+   print('selfcheck: lib.yang.data');
+   var test_schema = schema.load_schema([=[module fruit {
+      namespace "urn:testing:fruit";
+      prefix "fruit";
+      import ietf-inet-types {prefix inet; }
+      grouping fruit {
+         leaf name {
+            type string;
+            mandatory true;
+         }
+         leaf score {
+            type uint8 { range 0..10; }
+            mandatory true;
+         }
+         leaf tree-grown { type boolean; }
+      }
+
+      container fruit-bowl {
+         leaf description { type string; }
+         list contents { uses fruit; key name; }
+      }
+      leaf addr {
+         description "internet of fruit";
+         type inet:ipv4-address;
+      }
+   }]=]);
+
+   var data = load_config_for_schema(test_schema, [=[
+     fruit-bowl {
+       description 'ohai';
+       contents { name foo; score 7; }
+       contents { name bar; score 8; }
+       contents { name baz; score 9; tree-grown true; }
+     }
+     addr 1.2.3.4;
+   ]=]);
+   for( i =1,2 ) {
+      assert(data.fruit_bowl.description == 'ohai');
+      var contents = data.fruit_bowl.contents;
+      assert(contents.foo.score == 7);
+      assert(contents.foo.tree_grown == null);
+      assert(contents.bar.score == 8);
+      assert(contents.bar.tree_grown == null);
+      assert(contents.baz.score == 9);
+      assert(contents.baz.tree_grown == true);
+      assert(data.addr == util.ipv4_pton('1.2.3.4'));
+
+      var tmp = os.tmpname();
+      var file = io.open(tmp, 'w');
+      print_config_for_schema(test_schema, data, file);
+      file->close();
+      file = io.open(tmp, 'r');
+      data = load_config_for_schema(test_schema, file->read('*a'), tmp);
+      file->close();
+      os.remove(tmp);
+   }
+   var scalar_uint32 =
+      { type='scalar', argument_type={primitive_type='uint32'} };
+   var parse_uint32 = data_parser_from_grammar(scalar_uint32);
+   var print_uint32 = data_printer_from_grammar(scalar_uint32);
+   assert(parse_uint32('1') == 1);
+   assert(parse_uint32('"1"') == 1);
+   assert(parse_uint32('    "1"   \n  ') == 1);
+   assert(print_uint32(1, util.string_io_file()) == '1');
+
+   // Verify that lists can lack keys when "config false;" is set.
+   var list_wo_key_config_false = [=[module config-false-schema {
+      namespace "urn:ietf:params:xml:ns:yang:config-false-schema";
+      prefix "test";
+
+      container test {
+         description "Top level node";
+         list node {
+            config false;
+            description "List without key as config false is set";
+            leaf name { type string; }
+         }
+      }
+   }]=];
+   var keyless_schema = schema.load_schema(list_wo_key_config_false);
+   var keyless_list_data = load_state_for_schema(keyless_schema, [=[
+   test {
+      node {
+         name "hello";
+      }
+   }]=]);
+
+   test_schema = [=[module test-schema {
+      namespace "urn:ietf:params:xml:ns:yang:test-schema";
+      prefix "test";
+
+      container summary {
+         leaf shelves-active {
+             type empty;
+         }
+      }
+   }]=];
+   var loaded_schema = schema.load_schema(test_schema);
+   var object = load_config_for_schema(loaded_schema, [=[
+      summary {
+         shelves-active;
+      }
+   ]=]);
+   assert(object.summary.shelves_active);
+
+   // Test choice field.
+   var choice_schema = schema.load_schema([=[module choice-schema {
+      namespace "urn:ietf:params:xml:ns:yang:choice-schema";
+      prefix "test";
+
+      list boat {
+         key "name";
+         leaf name { type string; }
+         choice country {
+            mandatory true;
+            case name {
+               leaf country-name { type string; }
+            }
+            case iso-code {
+               leaf country-code { type string; }
+            }
+         }
+      }
+   }]=]);
+   var choice_data = load_config_for_schema(choice_schema, [=[
+      boat {
+         name "Boaty McBoatFace";
+         country-name "United Kingdom";
+      }
+      boat {
+         name "Vasa";
+         country-code "SE";
+      }
+   ]=]);
+   assert(choice_data.boat["Boaty McBoatFace"].country_name == "United Kingdom");
+   assert(choice_data.boat["Vasa"].country_code == "SE");
+
+   // Test mandatory true on choice statement. (should fail)
+   var success, err = pcall(load_config_for_schema, choice_schema, [=[
+      boat {
+         name "Boaty McBoatFace";
+      }
+   ]=]);
+   assert(success == false);
+
+   // Test default statement.
+   var choice_default_schema = schema.load_schema([=[module choice-w-default-schema {
+      namespace "urn:ietf:params:xml:ns:yang:choice-w-default-schema";
+      prefix "test";
+
+      list boat {
+         key "name";
+         leaf name { type string; }
+         choice country {
+            default "iso-code";
+            case name {
+               leaf country-name { type string; }
+            }
+            case iso-code {
+               leaf country-code { type string; default "SE"; }
+            }
+         }
+      }
+   }]=]);
+
+   var choice_data_with_default = load_config_for_schema(choice_default_schema, [=[
+      boat {
+         name "Kronan";
+      }
+   ]=]);
+   assert(choice_data_with_default.boat["Kronan"].country_code == "SE");
+
+   // Check that we can't specify both of the choice fields. (should fail)
+   success, err = pcall(load_config_for_schema, choice_schema, [=[
+      boat {
+         name "Boaty McBoatFace";
+         country-name "United Kingdom";
+         country-code "GB";
+      }
+   ]=]);
+   assert(success == false);
+
+   // Test range / length restrictions.
+   var range_length_schema = schema.load_schema([=[module range-length-schema {
+      namespace "urn:ietf:params:xml:ns:yang:range-length-schema";
+      prefix "test";
+
+      leaf-list range_test {
+         type uint8 { range 1..10|20..30; }
+      }
+      leaf-list length_test {
+         type string { length 1..10|20..30; }
+      }
+   }]=]);
+
+   // Test range validation. (should fail)
+   success, err = pcall(load_config_for_schema, range_length_schema, [=[
+      range_test 9;
+      range_test 35;
+   ]=]);
+   assert(success == false);
+
+   // Test length validation. (should fail)
+   success, err = pcall(load_config_for_schema, range_length_schema, [=[
+      length_test "+++++++++++++++++++++++++++++++++++";
+      length_test "...............";
+   ]=]);
+   assert(success == false);
+
+   // Test range validation. (should succeed)
+   success, err = pcall(load_config_for_schema, range_length_schema, [=[
+      range_test 9;
+      range_test 22;
+   ]=]);
+   assert(success);
+
+   // Test length validation. (should succeed)
+   success, err = pcall(load_config_for_schema, range_length_schema, [=[
+      length_test ".........";
+      length_test "++++++++++++++++++++++";
+   ]=]);
+   assert(success);
+
+   print('selfcheck: ok');
+}

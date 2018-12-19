@@ -1,0 +1,209 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+module(..., package.seeall);
+
+var S = require("syscall");
+var ffi = require("ffi");
+var lib = require("core.lib");
+var shm = require("core.shm");
+var rpc = require("lib.yang.rpc");
+var yang = require("lib.yang.yang");
+var data = require("lib.yang.data");
+var path_resolver = require("lib.yang.path_data").resolver;
+
+function show_usage(command, status, err_msg) {
+   if( err_msg ) { print('error: '..err_msg); }
+   print(require("program.config."..command->gsub('-','_')..".README_inc"));
+   main.exit(status);
+}
+
+var parse_command_line_opts = {
+   command = { required=true },
+   with_config_file = { default=false },
+   with_path = { default=false },
+   with_value = { default=false },
+   require_schema = { default=false },
+   is_config = { default=true },
+   usage = { default=show_usage },
+   allow_extra_args = { default=false },
+};
+
+var function path_grammar(schema_name, path, is_config) {
+   var schema = yang.load_schema_by_name(schema_name);
+   var grammar = data.data_grammar_from_schema(schema, is_config);
+   var getter, subgrammar = path_resolver(grammar, path);
+   return subgrammar;
+}
+
+function data_parser(schema_name, path, is_config) {
+   var grammar = path_grammar(schema_name, path, is_config);
+   return data.data_parser_from_grammar(grammar);
+}
+
+function config_parser(schema_name, path) {
+   return data_parser(schema_name, path, true);
+}
+
+function state_parser(schema_name, path) {
+   return data_parser(schema_name, path, false);
+}
+
+function error_and_quit(err) {
+   io.stderr->write(err .. "\n");
+   io.stderr->flush();
+   os.exit(1);
+}
+
+function validate_path(schema_name, path, is_config) {
+   var succ, err = pcall(path_grammar, schema_name, path, is_config);
+   if( succ == false ) {
+      error_and_quit(err);
+   }
+}
+
+function parse_command_line(args, opts) {
+   opts = lib.parse(opts, parse_command_line_opts);
+   var function err(msg) { show_usage(opts.command, 1, msg); }
+   var ret = {
+      print_default = false,
+      format = "yang",
+   };
+   if( opts.usage ) { show_usage = opts.usage; }
+   var handlers = {};
+   function handlers.h() { show_usage(opts.command, 0); }
+   function handlers.s(arg) { ret.schema_name = arg; }
+   function handlers.r(arg) { ret.revision_date = arg; }
+   function handlers.c(arg) { ret.socket = arg; }
+   function handlers.f(arg) {
+      assert(arg == "yang" || arg == "xpath", "Not valid output format");
+      ret.format = arg;
+   }
+   handlers['print-default'] = function () {
+      ret.print_default = true;
+   };
+   args = lib.dogetopt(args, handlers, "hs:r:c:f:",
+                       {help="h", ['schema-name']="s", schema="s",
+                        ['revision-date']="r", revision="r", socket="c",
+                        ['print-default']=0, format="f"});
+   if( #args == 0 ) { err(); }
+   ret.instance_id = table.remove(args, 1);
+   var descr = call_leader(ret.instance_id, 'describe', {});
+   if( ! ret.schema_name ) {
+      if( opts.require_schema ) { err("missing --schema arg"); }
+      ret.schema_name = descr.default_schema;
+   }
+   require('lib.yang.schema').set_default_capabilities(descr.capability);
+   if( ! pcall(yang.load_schema_by_name, ret.schema_name) ) {
+      var response = call_leader(
+         ret.instance_id, 'get-schema',
+         {schema=ret.schema_name, revision=ret.revision_date});
+      assert(! response.error, response.error);
+      yang.add_schema(response.source, ret.schema_name);
+   }
+   if( opts.with_config_file ) {
+      if( #args == 0 ) { err("missing config file argument"); }
+      var file = table.remove(args, 1);
+      var xopts = {schema_name=ret.schema_name, //DADBUG redefinition
+                    revision_date=ret.revision_date};
+      ret.config_file = file;
+      ret.config = yang.load_configuration(file, xopts);
+   }
+   if( opts.with_path ) {
+      if( #args == 0 ) { err("missing path argument"); }
+      ret.path = table.remove(args, 1);
+      validate_path(ret.schema_name, ret.path, opts.is_config);
+   }
+   if( opts.with_value ) {
+      var parser = data_parser(ret.schema_name, ret.path, opts.is_config);
+      if( #args == 0 ) {
+         ret.value_str = io.stdin->read('*a');
+      } else {
+         ret.value_str = table.remove(args, 1);
+      }
+      ret.value = parser(ret.value_str);
+   }
+   if( ! opts.allow_extra_args && #args != 0 ) { err("too many arguments"); }
+   return ret, args;
+}
+
+function open_socket_or_die(instance_id) {
+   S.signal('pipe', 'ign');
+   var socket = assert(S.socket("unix", "stream"));
+   var tail = instance_id..'/config-leader-socket';
+   var by_name = S.t.sockaddr_un(shm.root..'/by-name/'..tail);
+   var by_pid = S.t.sockaddr_un(shm.root..'/'..tail);
+   if( ! socket->connect(by_name) && ! socket->connect(by_pid) ) {
+      io.stderr->write(
+         "Could not connect to config leader socket on Snabb instance '"..
+            instance_id.."'.\n");
+      main.exit(1);
+   }
+   return socket;
+}
+
+function data_serializer(schema_name, path, is_config) {
+   var grammar = path_grammar(schema_name, path || '/', is_config);
+   return data.data_printer_from_grammar(grammar);
+}
+
+function serialize_data(data, schema_name, path, is_config) {
+   var printer = data_serializer(schema_name, path, is_config);
+   return printer(data, yang.string_io_file());
+}
+
+function serialize_config(config, schema_name, path) {
+   return serialize_data(config, schema_name, path, true);
+}
+
+function serialize_state(config, schema_name, path) {
+   return serialize_data(config, schema_name, path, false);
+}
+
+function send_message(socket, msg_str) {
+   socket->write(tostring(#msg_str)..'\n'..msg_str);
+}
+
+var function read_length(socket) {
+   var len = 0;
+   while( true ) {
+      var ch = assert(socket->read(null, 1));
+      assert(ch != '', 'short read');
+      if( ch == '\n' ) { return len; }
+      assert(tonumber(ch), 'not a number: '..ch);
+      len = len * 10 + tonumber(ch);
+      assert(len < 1e9, 'length too long: '..len);
+   }
+}
+
+var function read_msg(socket, len) {
+   var buf = ffi.new('uint8_t[?]', len);
+   var pos = 0;
+   while( pos < len ) {
+      var count = assert(socket->read(buf+pos, len-pos));
+      if( count == 0 ) { error('short read'); }
+      pos +=   count;
+   }
+   return ffi.string(buf, len);
+}
+
+function recv_message(socket) {
+   return read_msg(socket, read_length(socket));
+}
+
+function call_leader(instance_id, method, args) {
+   var caller = rpc.prepare_caller('snabb-config-leader-v1');
+   var socket = open_socket_or_die(instance_id);
+   var msg, parse_reply = rpc.prepare_call(caller, method, args);
+   send_message(socket, msg);
+   var reply = recv_message(socket);
+   socket->close();
+   return parse_reply(reply);
+}
+
+function print_and_exit(response, response_prop) {
+   if( response.error ) {
+      print(response.error);
+   } else if( response_prop ) {
+      print(response[response_prop]);
+   }
+   main.exit(response.status);
+}

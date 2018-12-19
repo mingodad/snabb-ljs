@@ -1,0 +1,46 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+module(..., package.seeall);
+var ffi = require("ffi");
+
+var lladdr = subClass(null);
+
+var lladdr_t = ffi.typeof([=[
+      struct {
+         uint8_t lladdr[6];
+      }
+]=]);
+
+var lladdr_ptr_t = ffi.typeof("$ *", lladdr_t);
+
+// Class variables
+lladdr._name = 'll_addr';
+
+// Class methods
+function lladdr::new (addr) {
+   var o = lladdr->superClass().new(this);
+   o._lladdr = lladdr_t();
+   ffi.copy(o._lladdr.lladdr, addr, 6);
+   return o;
+}
+
+function lladdr::new_from_mem (mem, size) {
+   var o = lladdr->superClass().new(this);
+   assert(size >= ffi.sizeof(lladdr_t));
+   o._lladdr = ffi.cast(lladdr_ptr_t, mem);
+   return o;
+}
+
+// Instance methods
+function lladdr::name () {
+   return this._name;
+}
+
+function lladdr::addr (lladdr) {
+   if( lladdr != null ) {
+      ffi.copy(this._lladdr, lladdr, 6);
+   }
+   return this._lladdr.lladdr;
+}
+
+return lladdr;

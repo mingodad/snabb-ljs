@@ -1,0 +1,272 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+// register.lua -- Hardware device register abstraction
+
+module(...,package.seeall);
+
+var ffi = require("ffi");
+var lib = require("core.lib");
+
+//- ### Register object
+//- There are eight types of register objects, set by the mode when created:
+//- * `RO` - read only.
+//- * `RW` - read-write.
+//- * `RC` - read-only and return the sum of all values read.
+//-   mode is for counter registers that clear back to zero when read.
+//- * `RCR` - read-only counter for registers that don't reset on read
+//- Each has a corresponding 64bit version, `RO64`, `RW64`, `RC64`, `RCR64`
+
+Register = {};
+
+//- Read a standard register
+function Register::read () {
+   return this.ptr[0];
+}
+
+//- Read a counter register
+function Register::readrc () {
+   this.acc[0] = this.acc[0] + this.ptr[0];
+   return this.acc[0];
+}
+
+function Register::readrcr () {
+  var val = this.ptr[0];
+  this.acc[0] = this.acc[0] + val - this.last;
+  if( val < this.last ) {
+    this.acc[0] = this.acc[0] + 2**32;
+  }
+  this.last = val;
+  return this.acc[0];
+}
+
+//- Write a register
+function Register::write (value) {
+   this.ptr[0] = value;
+   return value;
+}
+
+//- Set and clear specific masked bits.
+function Register::set (bitmask) { this(bit.bor(this(), bitmask)); }
+function Register::clr (bitmask) { this(bit.band(this(), bit.bnot(bitmask))); }
+
+function ro_bits (register, start, length) {
+    return bit.band(bit.rshift(register(), start), 2**length - 1);
+}
+
+// Get / set length bits of the register at offset start
+// if bits == nil then return length bits from the register at offset start
+// if bits ~= nil then set length bits in the register at offset start
+function Register::bits (start, length, bits) {
+  if( bits == null ) {
+    return ro_bits(this, start, length);
+  } else {
+    var tmp = this();
+    var offmask = bit.bnot(bit.lshift(2**length - 1, start));
+    tmp = bit.band(tmp, offmask);
+    tmp = bit.bor(tmp, bit.lshift(bits, start));
+    this(tmp);
+  }
+}
+function ro_byte (register, start, byte) {
+  return register->bits(start * 8, 8);
+}
+// Get / set a byte length bytes from an offset of start bytes
+function Register::byte (start, byte) {
+  if( byte == null ) {
+    return ro_byte(this, start, byte);
+  } else {
+    this->bits(start * 8, 8, byte);
+  }
+}
+
+//- Block until applying `bitmask` to the register value gives `value`.
+//- If `value` is not given then until all bits in the mask are set.
+function Register::wait (bitmask, value) {
+   lib.waitfor(function () {
+      return bit.band(this(), bitmask) == (value || bitmask);
+   });
+}
+
+//- For type `RC`: Reset the accumulator to 0.
+function Register::reset () { this.acc[0] = 0ULL; }
+
+//- For other registers provide a noop
+function Register::noop () { }
+
+//- Print a standard register
+function Register::print () {
+   io.write(("%40s %s\n")->format(this, this.longname));
+}
+
+//- Print a counter register unless its accumulator value is 0.
+function Register::printrc () {
+   if( this() > 0 ) {
+      io.write(("%40s (%16s) %s\n")->format(this, lib.comma_value(this()), this.longname));
+   }
+}
+
+//- Register objects are "callable" as functions for convenience:
+//-     reg()      <=> reg:read()
+//-     reg(value) <=> reg:write(value)
+function Register::__call (value) {
+   if( value ) { return (this->write(value)); } else { return (this->read()); }
+}
+
+//- Registers print as `$NAME:$HEXVALUE` to make debugging easy.
+function Register::__tostring () {
+   return this.name.."["..bit.tohex(this.offset).."]:"..bit.tohex(this());
+}
+
+//- Metatables for the three different types of register
+var mt = {
+  RO = {__index = { read=Register.read, wait=Register.wait,
+                    reset=Register.noop, print=Register.print,
+                    bits=ro_bits, byte=ro_byte},
+        __call = Register.read, __tostring = Register.__tostring},
+  RW = {__index = { read=Register.read, write=Register.write, wait=Register.wait,
+                    set=Register.set, clr=Register.clr, reset=Register.noop,
+                    bits=Register.bits, byte=Register.byte, print=Register.print},
+        __call = Register.__call, __tostring = Register.__tostring},
+  RC = {__index = { read=Register.readrc, reset=Register.reset,
+                    bits=ro_bits, byte=ro_byte,
+                    print=Register.printrc},
+        __call = Register.readrc, __tostring = Register.__tostring},
+  RCR = { __index = { read=Register.readrcr, reset = Register.reset,
+                    bits=ro_bits, byte=ro_byte,
+                    print=Register.printrc},
+          __call = Register.readrc, __tostring = Register.__tostring  }
+};
+mt['RO64'] = mt.RO;
+mt['RW64'] = mt.RW;
+mt['RC64'] = mt.RC;
+mt['RCR64'] = mt.RCR;
+
+//- Create a register `offset` bytes from `base_ptr`.
+//-
+//- Example:
+//-     register.new("TPT", "Total Packets Transmitted", 0x040D4, ptr, "RC")
+function new (name, longname, offset, base_ptr, mode) {
+   var o = { name=name, longname=longname, offset=offset,
+               ptr=base_ptr + offset/4 };
+   var mt = mt[mode];
+   assert(mt);
+   if( string.find(mode, "^RC") ) {
+      o.acc = ffi.new("uint64_t[1]");
+   }
+   if( string.find(mode, "64$") ) {
+      o.ptr = ffi.cast("uint64_t*", o.ptr);
+   }
+   return setmetatable(o, mt);
+}
+
+//- returns true if an index string represents a range of registers
+function is_range (index) {
+   return index->match('^%+[%xx]+%*%d+%.%.%d+$') != null;
+}
+
+//- iterates the offset as defined in a range of registers
+function iter_range (offset, index) {
+   var step,s,e =  string.match(index, '+([%xx]+)%*(%d+)%.%.(%d+)');
+   step, s, e = tonumber(step), tonumber(s), tonumber(e);
+   var function iter(e, i) {
+      ++i    ;
+      if( i > e ) { return null; }
+      return i, offset+step*(i-s);
+   }
+   return iter, e, s-1;
+}
+
+//- returns the n-th offset in a register range
+function in_range (offset, index, n) {
+   offset = tonumber(offset);
+   if( offset == null ) { return null; }
+   n = tonumber(n) || 0;
+   var step,s,e =  string.match(index, '+([%xx]+)%*(%d+)%.%.(%d+)');
+   if( ! step ) { return offset; }
+   step, s, e = tonumber(step), tonumber(s), tonumber(e);
+   if( s <= n && n <= e ) {
+      return offset + step * (n-s);
+   }
+   return null;
+}
+
+//- formats a name for a specific member of a register range
+function range_name (index, name, i) {
+   var step,s,e =  string.match(index, '+([%xx]+)%*(%d+)%.%.(%d+)');
+   var ndigits = #(tostring(tonumber(e)));
+   var fmt = string.format('%%s[%%0%dd]', ndigits);
+   return string.format(fmt, name, i);
+}
+
+//- ### Define registers from string description.
+
+//- Define a set of registers described by a string.
+//- The register objects become named entries in `table`.
+//-
+//- This is an example line for a register description:
+//-     TXDCTL    0x06028 +0x40*0..127 RW Transmit Descriptor Control
+//-
+//- and this is the grammar:
+//-     Register   ::= Name Offset Indexing Mode Longname
+//-     Name       ::= <identifier>
+//-     Indexing   ::= "-"
+//-                ::= "+" OffsetStep "*" Min ".." Max
+//-     Mode       ::= "RO" | "RW" | "RC" | "RCR" | "RO64" | "RW64" | "RC64" | "RCR64"
+//-     Longname   ::= <string>
+//-     Offset ::= OffsetStep ::= Min ::= Max ::= <number>
+//-
+//- the optional 'n' argument specifies which register of an array gets
+//- created (default 0)
+function define (description, table, base_ptr, n) {
+   var pattern = [=[ *(%S+) +(%S+) +(%S+) +(%S+) (.-)
+]=];
+   for( name,offset,index,perm,longname in description->gmatch(pattern) ) {
+      var offs = in_range(offset, index, n);
+      if( offs != null ) {
+         table[name] = new(name, longname, offs, base_ptr, perm);
+      }
+   }
+}
+
+// registers of the form '+0xXX*j..k' are converted to
+// an array of registers.
+// naïve implementation: actually create the whole array
+function define_array (description, table, base_ptr) {
+   var pattern = [=[ *(%S+) +(%S+) +(%S+) +(%S+) (.-)
+]=];
+   for( name,offset,index,perm,longname in description->gmatch(pattern) ) {
+      if( is_range(index) ) {
+         table[name] = table[name] || {name=name};
+         for( i, xoffset in iter_range(offset, index) ) {
+            table[name][i] = new(range_name(index,name,i), longname, xoffset, base_ptr, perm);
+         }
+      } else {
+         table[name] = new(name, longname, offset, base_ptr, perm);
+      }
+   }
+}
+
+
+function is_array (t) {
+   return type(t)=='table' && getmetatable(t)==null;
+}
+
+
+// Print a pretty-printed register dump for a table of register objects.
+function dump (tab) {
+//   print "Register dump:"
+   var strings = {};
+   for( _,reg in pairs(tab) ) {
+      if( type(reg)=='table' ) {
+         table.insert(strings, reg);
+      }
+   }
+   table.sort(strings, function(a,b) { return a.name < b.name; });
+   for( _,reg in ipairs(strings) ) {
+      if( is_array(reg) ) {
+         dump(reg);
+      } else {
+         reg->print();
+      }
+   }
+}

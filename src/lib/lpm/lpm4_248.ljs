@@ -1,0 +1,91 @@
+module(..., package.seeall);
+
+var ffi = require("ffi");
+var C = ffi.C;
+
+var lpm4_trie = require("lib.lpm.lpm4_trie").LPM4_trie;
+var bit = require("bit");
+
+ffi.cdef([=[
+uint16_t lpm4_248_search(uint32_t ip, int16_t *big, int16_t *little);
+uint32_t lpm4_248_search32(uint32_t ip, int32_t *big, int32_t *little);
+]=]);
+
+LPM4_248 = setmetatable({ alloc_storable = { "lpm4_248_bigarry", "lpm4_248_lilarry" } }, { __index = lpm4_trie });
+
+function LPM4_248::search16 (ip) {
+   return C.lpm4_248_search(ip, this.lpm4_248_bigarry, this.lpm4_248_lilarry);
+}
+function LPM4_248::search32 (ip) {
+   return C.lpm4_248_search32(ip, this.lpm4_248_bigarry, this.lpm4_248_lilarry);
+}
+
+function LPM4_248::new (cfg) {
+   // call the superclass constructor while allowing lpm4_248 to be subclassed
+   this = lpm4_trie.new(this);
+   cfg = cfg || {};
+   this.keybits = cfg.keybits || 15;
+
+   var arrytype;
+   if( this.keybits == 15 ) {
+      arrytype = "uint16_t";
+      this.search = LPM4_248.search16;
+   } else if( this.keybits == 31 ) {
+      arrytype = "uint32_t";
+      this.search = LPM4_248.search32;
+   } else {
+      error("LPM4_248 supports 15 or 31 keybits");
+   }
+   this->alloc("lpm4_248_bigarry", ffi.typeof(arrytype), 2**24);
+   this->alloc("lpm4_248_lilarry", ffi.typeof(arrytype), 1024*256);
+   this.flag = ffi.new(arrytype, 2**this.keybits);
+   this.mask = this.flag - 1;
+   return this;
+}
+
+function LPM4_248::build () {
+   var taboff = 1;
+
+   var function add(ip, len, key) {
+      var base = bit.rshift(ip, 8);
+      if( len < 25 ) {
+         var count = 2**(24-len);
+         for( i = 0, count - 1 ) {
+            this.lpm4_248_bigarry[base + i] = key;
+         }
+      }
+      if( len > 24 ) {
+         var e = this.lpm4_248_bigarry[base];
+         var bottom = bit.band(ip, 0xff);
+         if( bit.band(this.flag, e) != this.flag ) {
+            if( e != 0 ) {
+               for( i = 0,255 ) {
+                  this.lpm4_248_lilarry[256*taboff + i] = e;
+               }
+            }
+            this.lpm4_248_bigarry[base] = taboff + this.flag;
+            taboff = taboff + 1;
+            // each tab is '8bits' of ip long, so multiply by 256, 512 is double 256
+            if( 256 * taboff == this->lpm4_248_lilarry_length() ) {
+               this->lpm4_248_lilarry_grow();
+            }
+         }
+         var tab = this.lpm4_248_lilarry + 256*bit.band(this.lpm4_248_bigarry[base], this.mask);
+         for( i = tonumber(bottom), tonumber(bottom) + 2**(32-len) - 1 ) {
+            tab[i] = key;
+         }
+      }
+   }
+   for( e in this->entries() ) {
+      add(e.ip, e.length, e.key);
+   }
+   print("Build 24_8 with " .. taboff-1 .. " tables");
+   return this;
+}
+
+function selftest () {
+   print("LPM4_248 15bit keys");
+   LPM4_248->selftest();
+   print("LPM4_248 31bit keys");
+   LPM4_248->selftest({ keybits = 31 });
+}

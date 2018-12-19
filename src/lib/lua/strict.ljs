@@ -1,0 +1,41 @@
+//
+// strict.lua
+// checks uses of undeclared global variables
+// All global variables must be 'declared' through a regular assignment
+// (even assigning nil will do) in a main chunk before being used
+// anywhere or assigned to inside a function.
+//
+
+var getinfo, error, rawset, rawget = debug.getinfo, error, rawset, rawget;
+
+var mt = getmetatable(_G);
+if( mt == null ) {
+  mt = {};
+  setmetatable(_G, mt);
+}
+
+mt.__declared = {};
+
+var function what () {
+  var d = getinfo(3, "S");
+  return d && d.what || "C";
+}
+
+mt.__newindex = function (t, n, v) {
+  if( ! mt.__declared[n] ) {
+    var w = what();
+    if( w != "main" && w != "C" ) {
+      error("assign to undeclared variable '"..n.."'", 2);
+    }
+    mt.__declared[n] = true;
+  }
+  rawset(t, n, v);
+};
+
+mt.__index = function (t, n) {
+  if( ! mt.__declared[n] && what() != "C" ) {
+    error("variable '"..n.."' is not declared", 2);
+  }
+  return rawget(t, n);
+};
+

@@ -1,0 +1,201 @@
+
+//unix socket app: transmit and receive packets through a named socket.
+//can be used in server (listening) or client (connecting) mode.
+
+module(...,package.seeall);
+
+var ffi    = require("ffi");
+var link   = require("core.link");
+var packet = require("core.packet");
+var S      = require("syscall");
+
+UnixSocket = {};
+UnixSocket.__index = UnixSocket;
+
+var modes = {stream = "stream", packet = "dgram"};
+
+function UnixSocket::new (arg) {
+
+   // Process args
+   assert(arg, "filename or options expected");
+
+   var file, listen, mode;
+   if( type(arg) == "string" ) {
+      file = arg;
+   } else {
+      file = arg.filename;
+      listen = arg.listen;
+      mode = arg.mode;
+   }
+   mode = assert(modes[mode || "stream"], "invalid mode");
+   assert(file, "filename expected");
+
+   // Open/close socket
+   var open, close;
+
+   if( listen ) { //server mode
+
+      var sock = assert(S.socket("unix", mode..", nonblock"));
+      S.unlink(file); //unlink to avoid EINVAL on bind()
+      var sa = S.t.sockaddr_un(file);
+      assert(sock->bind(sa));
+      if( mode == "stream" ) {
+         assert(sock->listen());
+      }
+
+      function close() {
+         sock->close();
+         S.unlink(file);
+      }
+
+      function open() {
+         if( mode == "dgram" ) {
+            return sock;
+         }
+         var sa = S.t.sockaddr_un();
+         var csock, err = sock->accept(sa);
+         if( ! csock ) {
+            if( err.AGAIN ) { return; }
+            assert(null, err);
+         }
+         var close0 = close;
+         function close() {
+            csock->close();
+            close0();
+         }
+         assert(csock->nonblock());
+         return csock;
+      }
+
+   } else { //client mode
+
+      var sock = assert(S.socket("unix", mode..", nonblock"));
+
+      function open() {
+         var sa = S.t.sockaddr_un(file);
+         var ok, err = sock->connect(sa);
+         if( ! ok ) {
+            if( err.CONNREFUSED || err.AGAIN || err.NOENT ) { return; }
+            assert(null, err);
+         }
+         return sock;
+      }
+
+      function close() {
+         sock->close();
+      }
+
+   }
+
+   // Get connected socket
+   var sock;
+   var function connect() {
+      sock = sock || open();
+      return sock;
+   }
+
+   // App object
+   var self = setmetatable({}, this);  //DADCONFUSE
+
+   // Preallocated buffer for the next packet.
+   var rxp = packet.allocate();
+   // Try to read payload into rxp.
+   // Return true on success or false if no data is available.
+   var function try_read () {
+      var bytes = S.read(sock, rxp.data, packet.max_payload);
+
+      // Error, likely EAGAIN
+      if( ! bytes ) {
+         return false;
+      }
+
+      // EOF, reset sock
+      if( bytes == 0 ) {
+         sock = null;
+         return false;
+      }
+
+      rxp.length = bytes;
+      return true;
+   }
+   function self::pull() {
+      connect();
+      var l = this.output.tx;
+      var limit = engine.pull_npackets;
+      if( sock && l != null ) {
+         while( limit > 0 && try_read() ) {
+            link.transmit(l, rxp);
+            rxp = packet.allocate();
+            --limit    ;
+         }
+      }
+   }
+
+   function self::push() {
+      var l = this.input.rx;
+      if( l != null ) {
+         // Transmit all queued packets.
+         // Let the kernel drop them if it does not have capacity.
+         while( sock && ! link.empty(l) ) {
+            var p = link.receive(l);
+            S.write(connect(), p.data, p.length);
+            packet.free(p);
+         }
+      }
+   }
+
+   function self::stop() {
+      close();
+   }
+
+   return self;
+}
+
+
+function selftest () {
+   print("selftest: socket/unix");
+   var checkapp = {};
+   function checkapp::new (name) {
+      return {
+         push = function(this) {
+            var l = this.input.rx;
+            if( l == null ) { return; }
+            while( ! link.empty(l) ) {
+               var p = link.receive(l);
+               assert(p, "No packet received");
+               packet.free(p);
+            }
+         }
+      };
+   }
+
+   var echoapp = {};
+   function echoapp::new (text) {
+      return {
+         pull = function(this) {
+            var l = this.output.tx;
+            if( l == null ) { return; }
+            for( i=1,engine.pull_npackets ) {
+               var p = packet.allocate();
+               ffi.copy(p.data, text);
+               p.length = #text;
+               link.transmit(l, p);
+            }
+         }
+      };
+   }
+
+   var file = "/var/tmp/selftest.sock";
+   var c = config.new();
+   config.app(c,  "server", UnixSocket, {filename = file, listen = true});
+   config.app(c,  "client", UnixSocket, file);
+   config.app(c,  "check_client_tx", checkapp, "client tx");
+   config.app(c,  "say_hello", echoapp, "hello ");
+   config.link(c, "client.tx -> check_client_tx.rx");
+   config.link(c, "say_hello.tx -> client.rx");
+   config.link(c, "server.tx -> server.rx");
+
+   engine.configure(c);
+   engine.main({duration=0.1, report = {showlinks=true}});
+   print("selftest: done");
+}

@@ -1,0 +1,90 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+module(...,package.seeall);
+
+var lib = require('core.lib');
+var json = require("lib.ptree.json");
+
+var Trace = {};
+var trace_config_spec = {
+   file = {required=true},
+   file_mode = {default="w"},
+};
+
+function new (conf) {
+   conf = lib.parse(conf, trace_config_spec);
+   var ret = setmetatable({}, {__index=Trace});
+   ret.id = 0;
+   ret.output = io.open(conf.file, conf.file_mode);
+   return ret;
+}
+
+var function listen_directive_for_rpc(rpc_id, args) {
+   var ret = { path=args.path, schema=args.schema, revision=args.revision };
+   if( rpc_id == 'get-config' ) {
+      ret.verb = 'get';
+      return ret;
+   } else if( rpc_id == 'set-config' ) {
+      ret.verb, ret.value = 'set', args.config;
+      return ret;
+   } else if( rpc_id == 'add-config' ) {
+      ret.verb, ret.value = 'add', args.config;
+      return ret;
+   } else if( rpc_id == 'remove-config' ) {
+      ret.verb = 'remove';
+      return ret;
+   } else if( rpc_id == 'get-state' ) {
+      ret.verb = 'get-state';
+      return ret;
+   } else {
+      return null;
+   }
+}
+
+function Trace::record(id, args) {
+   assert(this.output, "trace closed");
+   var obj = listen_directive_for_rpc(id, args);
+   if( ! obj ) { return; }
+   obj.id = tostring(this.id);
+   this.id = this.id + 1;
+   json.write_json_object(this.output, obj);
+   this.output->write('\n');
+   this.output->flush();
+}
+
+function Trace::close() {
+   this.output->close();
+   this.output = null;
+}
+
+function selftest () {
+   print('selftest: lib.ptree.trace');
+   var S = require('syscall');
+
+   var tmp = os.tmpname();
+   var trace = new({file=tmp});
+   trace->record("get-config",
+                {path="/", schema="foo", revision="bar"});
+   trace->record("set-config",
+                {path="/", schema="foo", revision="bar", config="baz"});
+   trace->record("unsupported-rpc",
+                {path="/", schema="foo", revision="bar", config="baz"});
+   trace->close();
+
+   var fd = S.open(tmp, 'rdonly');
+   var input = json.buffered_input(fd);
+   json.skip_whitespace(input);
+   var parsed = json.read_json_object(input);
+   assert(lib.equal(parsed, {id="0", verb="get", path="/",
+                             schema="foo", revision="bar"}));
+   json.skip_whitespace(input);
+   parsed = json.read_json_object(input);
+   assert(lib.equal(parsed, {id="1", verb="set", path="/",
+                             schema="foo", revision="bar", value="baz"}));
+   json.skip_whitespace(input);
+   assert(input->eof());
+   fd->close();
+   os.remove(tmp);
+
+   print('selftest: ok');
+}

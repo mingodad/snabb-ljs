@@ -1,0 +1,18 @@
+module(..., package.seeall);
+
+var lib = require("core.lib");
+
+var function show_usage(exit_code) {
+   print(require("program.ipfix.README_inc"));
+   main.exit(exit_code);
+}
+
+function run(args) {
+   if( #args == 0 ) { show_usage(1); }
+   var command = string.gsub(table.remove(args, 1), "-", "_");
+   var modname = ("program.ipfix.%s.%s")->format(command, command);
+   if( ! lib.have_module(modname) ) {
+      show_usage(1);
+   }
+   require(modname).run(args);
+}

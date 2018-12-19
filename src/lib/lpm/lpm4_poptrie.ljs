@@ -1,0 +1,201 @@
+module(..., package.seeall);
+
+var ffi = require("ffi");
+var C = ffi.C;
+var bit = require("bit");
+var lpm4_trie = require("lib.lpm.lpm4_trie").LPM4_trie;
+var bor, band, lshift, rshift, bnot = bit.bor, bit.band, bit.lshift, bit.rshift, bit.bnot;
+var tohex = bit.tohex;
+var ip4 = require("lib.lpm.ip4");
+var masked = ip4.masked;
+
+LPM4_poptrie = setmetatable({}, { __index = lpm4_trie });
+
+var node = ffi.typeof([=[
+struct {
+   int32_t jumpn;
+   int32_t jumpl;
+   uint64_t maskn;
+   uint64_t maskl;
+}
+]=]);
+function get_bits (ip, offset) {
+   assert(offset >= 0 && offset < 27);
+   return band(rshift(ip, 26-offset), 0x3f);
+}
+function mask_set_bit (mask, offset) {
+   return bor(mask, lshift(1ull, 63 - offset));
+}
+function mask_clear_bit (mask, offset) {
+   return band(mask, bnot(lshift(1ull, 63 - offset)));
+}
+function mask_get_bit (mask, offset) {
+   return band(1, rshift(mask, 63 - offset));
+}
+function mask_popcnt (mask) {
+   var c = 0;
+   for( i = 0,63 ) {
+      if( mask_get_bit(mask, i) == 1 ) {
+         ++c    ;
+      }
+   }
+   return c;
+}
+
+function LPM4_poptrie::new () {
+   this = lpm4_trie.new(this);
+   return this;
+}
+function LPM4_poptrie::print_nodes () {
+   var n = this.poptrie_nodes;
+   var i = 0;
+   do {
+      print("node", i, "jumpn", n[i].jumpn);
+      print("node", i, "maskn", tohex(n[i].maskn));
+      print("node", i, "jumpl", n[i].jumpl);
+      print("node", i, "maskl", tohex(n[i].maskl));
+      ++i    ;
+   } while(!( n[i].jumpl == 0 && n[i].maskl == 0 && n[i].maskn && n[i].jumpn == 0) );
+}
+function LPM4_poptrie::build () {
+   this->alloc("poptrie_nodes", ffi.typeof(node), 1000);
+   this->alloc("poptrie_leaves", ffi.typeof("uint16_t"), 1000);
+
+   var nodes = this.poptrie_nodes;
+   var leaves = this.poptrie_leaves;
+   var ts = this.trie;
+   var nextleaf = 0;
+   var nextnode = 1;
+
+   var function add(ip, len, key) {
+      var p = 0;
+      var offset = 0;
+      var ts = this.lpm4_trie;
+      while( true ) {
+         var e = nodes[p];
+         if( e.jumpl == 0 && e.maskl == 0 && e.maskn == 0 && e.jumpn == 0 ) {
+            // then nothing has been initialised :(
+            e.jumpl = nextleaf;
+            e.jumpn = nextnode;
+            var lastleaf;
+            var base = masked(ip, offset);
+            for( i=0,63 ) {
+               var slotip = bit.bor(base, lshift(i, 32 - (offset + 6)));
+               if( this->has_child(slotip, offset + 6) ) {
+                  e.maskn = mask_set_bit(e.maskn, get_bits(slotip, offset), 1);
+                  ++nextnode    ;
+               } else {
+                  // This prefix is a leaf
+                  var t = this->search_trie(slotip, offset + 6);
+                  var xkey = 0;
+                  if( t ) { xkey = ts[t].key; }
+                  if( lastleaf != xkey ) {
+                     var bits = get_bits(slotip, offset);
+                     e.maskl = mask_set_bit(e.maskl, bits, 1);
+                     leaves[nextleaf] = xkey;
+
+                     ++nextleaf    ;
+                     lastleaf = xkey;
+                  }
+               }
+            }
+         }
+         var bits = get_bits(ip, offset);
+         if( mask_get_bit(nodes[p].maskn, bits) == 0 ) { return; }
+
+         p = nodes[p].jumpn + mask_popcnt(bit.band(lshift(bit.bnot(0LL), 63 - bits), nodes[p].maskn)) - 1;
+         offset +=   6;
+      }
+   }
+   for( e in this->entries() ) {
+      this->print_entry(e);
+      add(e.ip, e.length, e.key);
+   }
+   return this;
+}
+function LPM4_poptrie::search (ip) {
+   var offset = 0;
+   var nodes = this.poptrie_nodes;
+   var leaves = this.poptrie_leaves;
+   var i = 0;
+
+   while( true ) {
+      var bits = get_bits(ip, offset);
+      if( mask_get_bit(nodes[i].maskn, bits) == 1 ) {
+         // a node keep going
+         i = nodes[i].jumpn - 1 + mask_popcnt(bit.band(lshift(bit.bnot(0LL), 63 - bits), nodes[i].maskn));
+         offset +=   6;
+      } else {
+         return leaves[nodes[i].jumpl - 1 + mask_popcnt(bit.band(lshift(bit.bnot(0LL), 63 - bits), nodes[i].maskl, bit.bnot(nodes[i].maskn)))];
+      }
+   }
+}
+
+function selftest_masks () {
+   print("selftest_masks()");
+   var msb = mask_set_bit;
+   var mgb = mask_get_bit;
+   var mcb = mask_clear_bit;
+   var popcnt = mask_popcnt;
+   assert(mgb(0, 63)  == 0);
+   assert(mgb(1, 63)  == 1);
+   assert(mgb(2, 62)  == 1);
+   assert(mgb(3, 62)  == 1);
+   assert(msb(0, 0)   == 0x8000000000000000ull);
+   assert(msb(0, 1)   == 0x4000000000000000ull);
+   assert(msb(1, 62)  == 0x0000000000000003ull);
+   assert(msb(1, 31)  == 0x0000000100000001ull);
+   assert(msb(1, 30)  == 0x0000000200000001ull);
+   assert(msb(1, 0)   == 0x8000000000000001ull);
+   assert(mcb(1, 63) == 0);
+   assert(mcb(msb(0,0), 0) == 0);
+   assert(popcnt(3ull) == 2);
+   assert(popcnt(msb(255, 0)) == 9);
+}
+function selftest_get_bits () {
+   print("selftest_get_bits()");
+   var p = ip4.parse;
+   var g = get_bits;
+   assert(g(p("63.0.0.0"),2) == 63);
+   assert(g(p("0.63.0.0"),10) == 63);
+   assert(g(p("0.0.63.0"),18) == 63);
+   assert(g(p("0.0.0.63"),26) == 63);
+   assert(g(p("0.3.0.0"),14) == 48);
+   assert(g(p("0.3.128.0"),14) == 56);
+   assert(g(p("192.0.0.0"),0) == 48);
+   var pmu = require("lib.pmu");
+   var avail, err = pmu.is_available();
+   if( ! avail ) {
+      print("PMU not available:");
+      print("  "..err);
+      print("Skipping benchmark.");
+   } else {
+      var n = 0;
+      pmu.profile(function() {
+         for( i =0, 1000*1000*1000 ) { n = n + g(i, 7); }
+      });
+   }
+}
+function selftest () {
+   var n = LPM4_poptrie->new();
+   n->add_string("128.0.0.0/1", 2);
+   n->add_string("192.0.0.0/2", 3);
+   n->add_string("224.0.0.0/3", 4);
+   n->add_string("240.0.0.0/4", 5);
+   n->add_string("240.128.0.0/10", 6);
+   n->build();
+   assert(n->search_string("128.0.0.0") == 2);
+   assert(n->search_string("192.0.0.0") == 3);
+   assert(n->search_string("224.0.0.0") == 4);
+   assert(n->search_string("240.0.0.0") == 5);
+   assert(n->search_string("241.0.0.0") == 5);
+   assert(n->search_string("242.0.0.0") == 5);
+   assert(n->search_string("243.0.0.0") == 5);
+   assert(n->search_string("244.0.0.0") == 5);
+   assert(n->search_string("240.128.0.0") == 6);
+   assert(n->search_string("240.129.0.0") == 6);
+   assert(n->search_string("240.192.0.0") == 5);
+
+   selftest_get_bits();
+   selftest_masks();
+}

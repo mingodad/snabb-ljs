@@ -1,0 +1,61 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+module(..., package.seeall);
+var ffi = require("ffi");
+var C = ffi.C;
+var bitfield = require("core.lib").bitfield;
+var nd_header = require("lib.protocol.icmp.nd.header");
+var proto_header = require("lib.protocol.header");
+
+var na = subClass(nd_header);
+
+// Class variables
+na._name = "neighbor advertisement";
+na._ulp = { method = null };
+proto_header.init(na,
+                  {
+                     [1] = ffi.typeof([=[
+                           struct {
+                              uint32_t flags;
+                              uint8_t  target[16];
+                           } __attribute__((packed))
+                     ]=])
+                  });
+
+// Class methods
+
+function na::new (target, router, solicited, override) {
+   var o = na->superClass().new(this);
+   o->target(target);
+   o->router(router);
+   o->solicited(solicited);
+   o->override(override);
+   return o;
+}
+
+// Instance methods
+
+function na::target (target) {
+   if( target != null ) {
+      ffi.copy(this->header().target, target, 16);
+   }
+   return this->header().target;
+}
+
+function na::target_eq (target) {
+   return C.memcmp(target, this->header().target, 16) == 0;
+}
+
+function na::router (r) {
+   return bitfield(32, this->header(), 'flags', 0, 1, r);
+}
+
+function na::solicited (s) {
+   return bitfield(32, this->header(), 'flags', 1, 1, s);
+}
+
+function na::override (o) {
+   return bitfield(32, this->header(), 'flags', 2, 1, o);
+}
+
+return na;

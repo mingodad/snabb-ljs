@@ -1,0 +1,96 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+module(...,package.seeall);
+
+var ffi = require("ffi");
+var C = ffi.C;
+
+var lib = require("core.lib");
+var app = require("core.app");
+var link = require("core.link");
+var intel_mp = require("apps.intel_mp.intel_mp");
+var memory = require("core.memory");
+var register = require("lib.hardware.register");
+var receive, empty = link.receive, link.empty;
+
+var can_transmit, transmit;
+var num_descriptors = 1024;
+
+LoadGen = {};
+
+function LoadGen::new (pciaddress) {
+   var function new_driver(conf) {
+      conf = lib.parse(conf, intel_mp.Intel82599.config);
+      return intel_mp.Intel82599->new(conf);
+   }
+   var o = {
+      pciaddress = pciaddress,
+      dev = new_driver({
+         pciaddr = pciaddress,
+         ring_buffer_size = num_descriptors,
+         wait_for_link = true,
+      })
+   };
+//   o.dev:open()
+//   o.dev:wait_linkup()
+   disable_tx_descriptor_writeback(o.dev);
+   zero_descriptors(o.dev);
+   return setmetatable(o, {__index = LoadGen});
+}
+
+function disable_tx_descriptor_writeback (dev) {
+   // Disable writeback of transmit descriptors.
+   // That way our transmit descriptors stay fresh and reusable.
+   // Tell hardware write them to this other memory instead.
+   var bytes = num_descriptors * ffi.sizeof(intel_mp.rxdesc_t);
+   var ptr, phy = memory.dma_alloc(bytes);
+   dev.r.TDWBAL(phy % 2**32);
+   dev.r.TDWBAH(phy / 2**32);
+}
+
+function zero_descriptors (dev) {
+   // Clear unused descriptors
+   var b = memory.dma_alloc(4096);
+   for( i = 0, num_descriptors-1 ) {
+      // Make each descriptors point to valid DMA memory but be 0 bytes long.
+      dev.txdesc[i].address = memory.virtual_to_physical(b);
+      dev.txdesc[i].flags = bit.lshift(1, 24); // End of Packet flag
+   }
+}
+
+function LoadGen::push () {
+   var dev = this.dev;
+   if( this.input.input ) {
+      while( ! link.empty(this.input.input) && dev->can_transmit() ) {
+         { var p = receive(this.input.input);
+            dev->transmit(p);
+         }
+      }
+   }
+}
+
+function LoadGen::pull () {
+   // Set TDT behind TDH to make all descriptors available for TX.
+   var dev = this.dev;
+   var tdh = dev.r.TDH();
+   if( dev.tdt == 0 ) { return; }
+   C.full_memory_barrier();
+   if( tdh == 0 ) {
+      dev.r.TDT(num_descriptors);
+   } else {
+      dev.r.TDT(tdh - 1);
+   }
+}
+
+function LoadGen::report () {
+   print(this.pciaddress,
+         "TXDGPC (TX packets)", lib.comma_value(tonumber(this.dev.r.TXDGPC())),
+         "GOTCL (TX bytes)", lib.comma_value(tonumber(this.dev.r.GOTCL())));
+   print(this.pciaddress,
+         "RXDGPC (RX packets)", lib.comma_value(tonumber(this.dev.r.RXDGPC())),
+         "GORCL (RX bytes)", lib.comma_value(tonumber(this.dev.r.GORCL())));
+   this.dev.r.TXDGPC->reset();
+   this.dev.r.GOTCL->reset();
+   this.dev.r.RXDGPC->reset();
+   this.dev.r.GORCL->reset();
+}

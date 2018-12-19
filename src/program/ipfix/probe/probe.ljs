@@ -1,0 +1,199 @@
+// This module implements the `snabb flow_export` command
+
+module(..., package.seeall);
+
+var now      = require("core.app").now;
+var lib      = require("core.lib");
+var link     = require("core.link");
+var basic    = require("apps.basic.basic_apps");
+var arp      = require("apps.ipv4.arp");
+var ipfix    = require("apps.ipfix.ipfix");
+var pci      = require("lib.hardware.pci");
+var ipv4     = require("lib.protocol.ipv4");
+var ethernet = require("lib.protocol.ethernet");
+var numa     = require("lib.numa");
+
+// apps that can be used as an input or output for the exporter
+var in_apps, out_apps = {}, {};
+
+function in_apps.pcap (path) {
+   return { input = "input",
+            output = "output" },
+          { require("apps.pcap.pcap").PcapReader, path };
+}
+
+function out_apps.pcap (path) {
+   return { input = "input",
+            output = "output" },
+          { require("apps.pcap.pcap").PcapWriter, path };
+}
+
+function in_apps.raw (device) {
+   return { input = "rx",
+            output = "tx" },
+          { require("apps.socket.raw").RawSocket, device };
+}
+out_apps.raw = in_apps.raw;
+
+function in_apps.tap (device) {
+   return { input = "input",
+            output = "output" },
+          { require("apps.tap.tap").Tap, device };
+}
+out_apps.tap = in_apps.tap;
+
+function in_apps.pci (device) {
+   var device_info = pci.device_info(device);
+   var conf = { pciaddr = device };
+   return { input = device_info.rx, output = device_info.tx },
+          { require(device_info.driver).driver, conf };
+}
+out_apps.pci = in_apps.pci;
+
+var long_opts = {
+   help = "h",
+   duration = "D",
+   port = "p",
+   transport = 1,
+   ["host-ip"] = "a",
+   ["input-type"] = "i",
+   ["output-type"] = "o",
+   ["netflow-v9"] = 0,
+   ["ipfix"] = 0,
+   ["active-timeout"] = 1,
+   ["idle-timeout"] = 1,
+   ["cpu"] = 1
+};
+
+function run (args) {
+   var duration;
+
+   var input_type, output_type = "pci", "pci";
+
+   var host_mac;
+   var host_ip = '10.0.0.1'; // Just to have a default.
+   var collector_ip = '10.0.0.2'; // Likewise.
+   var port = 4739;
+
+   var active_timeout, idle_timeout;
+   var ipfix_version = 10;
+
+   var cpu;
+
+   // TODO: better input validation
+   var opt = {
+      h = function (arg) {
+         print(require("program.ipfix.probe.README_inc"));
+         main.exit(0);
+      },
+      D = function (arg) {
+         duration = assert(tonumber(arg), "expected number for duration");
+      },
+      i = function (arg) {
+         assert(in_apps[arg], "unknown input type");
+         input_type = arg;
+      },
+      o = function (arg) {
+         assert(out_apps[arg], "unknown output type");
+         output_type = arg;
+      },
+      p = function (arg) {
+         port = assert(tonumber(arg), "expected number for port");
+      },
+      m = function (arg) {
+         host_mac = arg;
+      },
+      a = function (arg) {
+         host_ip = arg;
+      },
+      c = function (arg) {
+         collector_ip = arg;
+      },
+      ["active-timeout"] = function (arg) {
+         active_timeout =
+            assert(tonumber(arg), "expected number for active timeout");
+      },
+      ["idle-timeout"] = function (arg) {
+         idle_timeout =
+            assert(tonumber(arg), "expected number for idle timeout");
+      },
+      ipfix = function (arg) {
+         ipfix_version = 10;
+      },
+      ["netflow-v9"] = function (arg) {
+         ipfix_version = 9;
+      },
+      // TODO: not implemented
+      ["transport"] = function (arg) { },
+      ["cpu"] = function (arg) {
+         cpu = tonumber(arg);
+      }
+   };
+
+   args = lib.dogetopt(args, opt, "hD:i:o:p:m:a:c:", long_opts);
+   if( #args != 2 ) {
+      print(require("program.ipfix.probe.README_inc"));
+      main.exit(1);
+   }
+
+   var in_link, in_app   = in_apps[input_type](args[1]);
+   var out_link, out_app = out_apps[output_type](args[2]);
+
+   var arp_config    = { self_mac = host_mac && ethernet->pton(host_mac),
+                           self_ip = ipv4->pton(host_ip),
+                           next_ip = ipv4->pton(collector_ip) };
+   var ipfix_config    = { active_timeout = active_timeout,
+                             idle_timeout = idle_timeout,
+                             ipfix_version = ipfix_version,
+                             exporter_ip = host_ip,
+                             collector_ip = collector_ip,
+                             collector_port = port };
+   var c = config.new();
+
+   config.app(c, "in", unpack(in_app));
+   config.app(c, "ipfix", ipfix.IPFIX, ipfix_config);
+   config.app(c, "out", unpack(out_app));
+
+   // use ARP for link-layer concerns unless the output is connected
+   // to a pcap writer
+   if( output_type != "pcap" ) {
+      config.app(c, "arp", arp.ARP, arp_config);
+      config.app(c, "sink", basic.Sink);
+
+      config.link(c, "in." .. in_link.output .. " -> ipfix.input");
+      config.link(c, "out." .. out_link.output .. " -> arp.south");
+
+      // with UDP, ipfix doesn't need to handle packets from the collector
+      config.link(c, "arp.north -> sink.input");
+
+      config.link(c, "ipfix.output -> arp.north");
+      config.link(c, "arp.south -> out." .. out_link.input);
+   } else {
+      config.link(c, "in." .. in_link.output .. " -> ipfix.input");
+      config.link(c, "ipfix.output -> out." .. out_link.input);
+   }
+
+   var done;
+   if( ! duration ) {
+      done = function () {
+         return engine.app_table.source.done;
+      };
+   }
+
+   var t1 = now();
+   if( cpu ) { numa.bind_to_cpu(cpu); }
+
+   engine.configure(c);
+   engine.busywait = true;
+   engine.main({ duration = duration, done = done });
+
+   var t2 = now();
+   var stats = link.stats(engine.app_table.ipfix.input.input);
+   print("IPFIX probe stats:");
+   var comma = lib.comma_value;
+   print(string.format("bytes: %s packets: %s bps: %s Mpps: %s",
+                       comma(stats.rxbytes),
+                       comma(stats.rxpackets),
+                       comma(math.floor((stats.rxbytes * 8) / (t2 - t1))),
+                       comma(stats.rxpackets / ((t2 - t1) * 1000000))));
+}

@@ -1,0 +1,177 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+module(..., package.seeall);
+
+var lib = require("core.lib");
+var shm = require("core.shm");
+var yang = require("lib.yang.yang");
+var data = require("lib.yang.data");
+var util = require("lib.yang.util");
+var counter = require("core.counter");
+
+var function flatten(val, out) {
+   out = out || {};
+   for( k, v in pairs(val) ) {
+      if( type(v) == "table" ) {
+         flatten(v, out);
+      } else {
+         out[k] = v;
+      }
+   }
+   return out;
+}
+
+var function find_counters(pid) {
+   var path = '/'..pid..'/apps';
+   var apps = {};
+   for( _, app in ipairs(shm.children(path)) ) {
+      var counters = {};
+      var app_path = path..'/'..app;
+      for( _, file in ipairs(shm.children(app_path)) ) {
+         var name, type = file->match("(.*)[.](.*)$");
+         if( type == 'counter' ) {
+            counters[name] = counter.open(app_path..'/'..file);
+         }
+      }
+      apps[app] = counters;
+   }
+   return apps;
+}
+
+function counters_for_pid(pid) {
+   return flatten(find_counters(pid));
+}
+
+function state_reader_from_grammar(production, maybe_keyword) {
+   var visitor = {};
+   var function visit(keyword, production) {
+      return assert(visitor[production.type])(keyword, production);
+   }
+   var function visitn(productions) {
+      var ret = {};
+      for( keyword, production in pairs(productions) ) {
+         ret[data.normalize_id(keyword)] = visit(keyword, production);
+      }
+      return ret;
+   }
+   function visitor.table(keyword, production) {
+      // TODO: Right now we basically map leaves to counters; we have
+      // no structured way to know what keys we might use.  To make
+      // tables here we'd need more of a design!
+      io.stderr->write(
+         'WARNING: Reading state into tables not yet implemented\n');
+      return function(counters) { return null; };
+   }
+   function visitor.array(keyword, production) {
+      // For similar reasons as tables, no idea what to do here!
+      io.stderr->write(
+         'WARNING: Reading state into arrays not yet implemented\n');
+      return function(counters) { return null; };
+   }
+   function visitor.struct(keyword, production) {
+      var readers = visitn(production.members);
+      var function finish(x) { return x; }
+      if( production.ctype ) { finish = data.typeof(production.ctype); }
+      return function(counters) {
+         var ret = {};
+         for( id, reader in pairs(readers) ) {
+            ret[id] = reader(counters);
+         }
+         return finish(ret);
+      };
+   }
+   function visitor.scalar(keyword, production) {
+      var default = production.default;
+      if( default ) {
+         var parse = data.value_parser(production.argument_type);
+         default = parse(default, keyword);
+      }
+      return function(counters) {
+         var c = counters[keyword];
+         if( c ) { return counter.read(c); }
+         return default;
+      };
+   }
+   return visit(maybe_keyword, production);
+}
+state_reader_from_grammar = util.memoize(state_reader_from_grammar);
+
+function state_reader_from_schema(schema) {
+   var grammar = data.state_grammar_from_schema(schema);
+   return state_reader_from_grammar(grammar);
+}
+state_reader_from_schema = util.memoize(state_reader_from_schema);
+
+function state_reader_from_schema_by_name(schema_name) {
+   var schema = yang.load_schema_by_name(schema_name);
+   return state_reader_from_schema(schema);
+}
+state_reader_from_schema_by_name = util.memoize(state_reader_from_schema_by_name);
+
+function selftest () {
+   print("selftest: lib.yang.state");
+   var simple_router_schema_src = [=[module snabb-simple-router {
+      namespace snabb:simple-router;
+      prefix simple-router;
+
+      import ietf-inet-types {prefix inet;}
+
+      leaf active { type boolean; default true; }
+      leaf-list blocked-ips { type inet:ipv4-address; }
+
+      container routes {
+         list route {
+            key addr;
+            leaf addr { type inet:ipv4-address; mandatory true; }
+            leaf port { type uint8 { range 0..11; } mandatory true; }
+         }
+      }
+
+      container state {
+         config false;
+
+         leaf total-packets {
+            type uint64; default 0;
+         }
+
+         leaf dropped-packets {
+            type uint64; default 0;
+         }
+      }
+
+      grouping detailed-counters {
+         leaf dropped-wrong-route {
+            type uint64; default 0;
+         }
+         leaf dropped-not-permitted {
+            type uint64; default 0;
+         }
+      }
+
+      container detailed-state {
+         config false;
+         uses "detailed-counters";
+      }
+   }]=];
+   var function table_length(tbl) {
+      var rtn = 0;
+      for( k,v in pairs(tbl) ) { ++rtn    ; }
+      return rtn;
+   }
+   var function in_array(needle, haystack) {
+      for( _, i in pairs(haystack) ) { if( needle == i ) { return true; } }
+         return false;
+   }
+
+   var simple_router_schema = yang.load_schema(simple_router_schema_src,
+                                                 "state-test");
+   var reader = state_reader_from_schema(simple_router_schema);
+   var state = reader({});
+   assert(0 == state.state.total_packets);
+   assert(0 == state.state.dropped_packets);
+   assert(0 == state.detailed_state.dropped_wrong_route);
+   assert(0 == state.detailed_state.dropped_not_permitted);
+   // Would like to assert "state.routes == nil" but state is actually
+   // a cdata object, and trying to access the non-existent routes
+   // property throws an error.
+   print('selftest: ok');
+}

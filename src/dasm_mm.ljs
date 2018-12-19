@@ -1,0 +1,144 @@
+
+//wrappers around mmap to support dynamic code exection.
+//Written by Cosmin Apreutesei. Public Domain.
+//Tested with Windows, Linux and OSX, x86 and x86-64.
+
+var ffi = require('ffi');
+var C = ffi.C;
+
+var function checkh(ptr) { return assert(ptr != null && ptr); }
+var function checkz(ret) { assert(ret == 0); }
+var function checknz(ret) { assert(ret != 0); }
+
+var new, free, protect;
+
+//Using VirtualAlloc allows memory protection, but can only allocate memory in multiple-of-64K chunks.
+var USE_VIRTUALALLOC = false;
+
+if( ffi.os == 'Windows' ) {
+
+	if( USE_VIRTUALALLOC ) {
+
+		ffi.cdef([=[
+		void* VirtualAlloc(void* lpAddress, size_t dwSize, uint32_t flAllocationType, uint32_t flProtect);
+		int VirtualFree(void* lpAddress, size_t dwSize, uint32_t dwFreeType);
+		int VirtualProtect(void* lpAddress, size_t dwSize, uint32_t flNewProtect, uint32_t* lpflOldProtect);
+		]=]);
+
+		var PAGE_READWRITE    = 0x04;
+		var PAGE_EXECUTE_READ = 0x20;
+		var MEM_COMMIT  = 0x1000;
+		var MEM_RESERVE = 0x2000;
+		var MEM_RELEASE = 0x8000;
+
+		function new(size) {
+			return checkh(C.VirtualAlloc(null, size, bit.bor(MEM_RESERVE, MEM_COMMIT), PAGE_READWRITE));
+		}
+
+		function protect(addr, size) {
+			var oldprotect = ffi.new('uint32_t[1]'); //because null not accepted
+			checknz(C.VirtualProtect(addr, size, PAGE_EXECUTE_READ, oldprotect));
+		}
+
+		function free(addr, size) {
+			assert(size, 'size required'); //on other platforms
+			checknz(C.VirtualFree(addr, 0, MEM_RELEASE));
+		}
+
+	} else {
+
+		var HEAP_NO_SERIALIZE          = 0x00000001;
+		var HEAP_ZERO_MEMORY           = 0x00000008;
+		var HEAP_CREATE_ENABLE_EXECUTE = 0x00040000;
+
+		ffi.cdef([=[
+		void* HeapCreate(uint32_t flOptions, size_t dwInitialSize, size_t dwMaximumSize);
+		void* HeapAlloc(void* hHeap, uint32_t dwFlags, size_t dwBytes);
+		int HeapFree(void* hHeap, uint32_t dwFlags, void* lpMem);
+		]=]);
+
+		var heap;
+
+		function new(size) {
+			heap = heap || checkh(C.HeapCreate(bit.bor(HEAP_NO_SERIALIZE, HEAP_CREATE_ENABLE_EXECUTE), 0, 0));
+			return checkh(C.HeapAlloc(heap, HEAP_ZERO_MEMORY, size));
+		}
+
+		function protect(addr, size) { }
+
+		function free(addr, size) {
+			assert(size, 'size required'); //on other platforms
+			checknz(C.HeapFree(heap, HEAP_NO_SERIALIZE, addr));
+		}
+
+	}
+
+} else if( ffi.os == 'Linux' || ffi.os == 'OSX' ) {
+
+	if( ffi.os == 'OSX' ) {
+		ffi.cdef('typedef int64_t off_t;');
+	} else {
+		ffi.cdef('typedef long int off_t;');
+	}
+
+	ffi.cdef([=[
+	void* mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset);
+	int munmap(void *addr, size_t length);
+	int mprotect(void *addr, size_t len, int prot);
+	]=]);
+
+	var PROT_READ  = 1;
+	var PROT_WRITE = 2;
+	var PROT_EXEC  = 4;
+	var MAP_PRIVATE   = 2;
+	var MAP_ANON = ffi.os == 'Linux' && 0x20 || 0x1000;
+
+	function new(size) {
+		var ret = C.mmap(null, size, bit.bor(PROT_READ, PROT_WRITE), bit.bor(MAP_PRIVATE, MAP_ANON), -1, 0);
+		if( ffi.cast('intptr_t', ret) == ffi.cast('intptr_t', -1) ) {
+			error(string.format('mmap errno: %d', ffi.errno()));
+		}
+		return checkh(ret);
+	}
+
+	function protect(addr, size) {
+		checkz(C.mprotect(addr, size, bit.bor(PROT_READ, PROT_EXEC)));
+	}
+
+	function free(addr, size) {
+		checkz(C.munmap(addr, size));
+	}
+
+}
+
+var xnew = function(size) { //override for hooking to gc
+	var addr = new(size);
+	ffi.gc(addr, function(addr) {
+		free(addr, size);
+		ffi.gc(addr, null);
+	});
+	return addr;
+};
+
+if( ! ... ) {
+	var function test(size) {
+		var addr = xnew(size);
+		print(addr);
+		addr = ffi.cast('int32_t*', addr);
+		assert(addr[0] == 0);
+		addr[0] = 1234; //writable
+		assert(addr[0] == 1234);
+		protect(addr, size);
+		//addr[0] = 4321 --uncomment this to get a crash (r/o memory); TODO: test if executable
+		//addr = nil; collectgarbage() --enable this to fail the assertion below
+		return addr;
+	}
+	var a1 = test(64*1024*1000); //64MB
+	var a2 = test(16); //16 bytes
+	assert(a1 != a2); //different pages
+	a1 = null;
+	a2 = null;
+	collectgarbage(); //TODO: test if finalizer was called
+}
+
+return {new = xnew, free = free, protect = protect};

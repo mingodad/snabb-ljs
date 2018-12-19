@@ -1,0 +1,168 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+// Application to connect to a virtio-net driver implementation
+//
+// Copyright (c) 2015 Virtual Open Systems
+//
+
+module(..., package.seeall);
+
+var debug = _G.developer_debug;
+
+var ffi    = require("ffi");
+var C      = ffi.C;
+var memory = require('core.memory');
+var packet = require('core.packet');
+var band   = require('bit').band;
+require("lib.virtio.virtio.h");
+require("lib.virtio.virtio_vring.h");
+
+var physical = memory.virtual_to_physical;
+
+var VirtioVirtq = {};
+VirtioVirtq.__index = VirtioVirtq;
+
+var VRING_F_NO_INTERRUPT = C.VRING_F_NO_INTERRUPT;
+var VRING_F_NO_NOTIFY = C.VRING_F_NO_NOTIFY;
+
+var pk_header_t = ffi.typeof("struct virtio_net_hdr");
+var pk_header_size = ffi.sizeof(pk_header_t);
+var vring_desc_t = ffi.typeof("struct vring_desc");
+
+var ringtypes = {};
+var function vring_type(n) {
+   if( ringtypes[n] ) { return ringtypes[n]; }
+
+   var rng = ffi.typeof([=[
+      struct {
+         struct vring_desc desc[$] __attribute__((aligned(8)));
+         struct {
+            uint16_t flags;
+            uint16_t idx;
+            uint16_t ring[$];
+         } avail            __attribute__((aligned(8)));
+         struct {
+            uint16_t flags;
+            uint16_t idx;
+            struct {
+               uint32_t id;
+               uint32_t len;
+            } ring[$];
+         } used             __attribute__((aligned(4096)));
+      }
+   ]=], n, n, n);
+   var t = ffi.typeof([=[
+      struct {
+         int num, num_free;
+         uint16_t free_head, last_avail_idx, last_used_idx;
+         $ *vring;
+         uint64_t vring_physaddr;
+         struct packet *packets[$];
+      }
+   ]=], rng, n);
+   ffi.metatype(t, VirtioVirtq);
+   ringtypes[n] = t;
+   return t;
+}
+
+var function allocate_virtq(n) {
+   var ct = vring_type(n);
+   var vr = ffi.new(ct, { num = n });
+   var ring_t = ffi.typeof(vr.vring[0]);
+   var ptr, phys = memory.dma_alloc(ffi.sizeof(vr.vring[0]));
+   vr.vring = ffi.cast(ring_t, ptr);
+   vr.vring_physaddr = phys;
+   // Initialize free list.
+   vr.free_head = -1;
+   vr.num_free = 0;
+   for( i = n-1, 0, -1 ) {
+      vr.vring.desc[i].next = vr.free_head;
+      vr.free_head = i;
+      vr.num_free = vr.num_free + 1;
+   }
+   // Disable the interrupts forever, we don't need them
+   vr.vring.avail.flags = VRING_F_NO_INTERRUPT;
+   return vr;
+}
+
+function VirtioVirtq::can_add() {
+   return this.num_free;
+}
+
+function VirtioVirtq::add(p, len, flags, csum_start, csum_offset) {
+   var idx = this.free_head;
+   var desc = this.vring.desc[idx];
+   this.free_head = desc.next;
+   this.num_free = this.num_free -1;
+   desc.next = -1;
+
+   p = packet.shiftright(p, pk_header_size);
+   var header = ffi.cast("struct virtio_net_hdr *", p.data);
+   header.flags = flags;
+   header.gso_type = 0;
+   header.hdr_len = 0;
+   header.gso_size = 0;
+   header.csum_start = csum_start;
+   header.csum_offset = csum_offset;
+   desc.addr = physical(p.data);
+   desc.len = len + pk_header_size;
+   desc.flags = 0;
+   desc.next = -1;
+
+   this.vring.avail.ring[band(this.last_avail_idx, this.num-1)] = idx;
+   this.last_avail_idx = this.last_avail_idx + 1;
+   this.packets[idx] = p;
+}
+
+function VirtioVirtq::add_empty_header(p, len) {
+   this->add(p, len, 0, 0, 0);
+}
+
+function VirtioVirtq::update_avail_idx() {
+   C.full_memory_barrier();
+   this.vring.avail.idx = this.last_avail_idx;
+}
+
+function VirtioVirtq::can_get() {
+   //C.full_memory_barrier()
+
+   var idx1, idx2 = this.vring.used.idx, this.last_used_idx;
+   var adjust = 0;
+
+   if( idx2 > idx1 ) { adjust = 0x10000; }
+
+   return idx1 - idx2 + adjust;
+}
+
+function VirtioVirtq::get() {
+   var last_used_idx = band(this.last_used_idx, this.num-1);
+   var used = this.vring.used.ring[last_used_idx];
+   var idx = used.id;
+   var desc = this.vring.desc[idx];
+
+   // FIXME: we should allow the NEXT flag or something, though with worse perf
+   if( debug ) { assert(desc.flags == 0); }
+   var p = this.packets[idx];
+   this.packets[idx] = null;
+   if( debug ) { assert(p != null); }
+   if( debug ) { assert(physical(p.data) == desc.addr); }
+   p.length = used.len;
+   p = packet.shiftleft(p, pk_header_size);
+
+   this.last_used_idx = this.last_used_idx + 1;
+   desc.next = this.free_head;
+   this.free_head = idx;
+   this.num_free = this.num_free + 1;
+
+   return p;
+}
+
+function VirtioVirtq::should_notify() {
+   // Notify only if the used ring lacks the "no notify" flag
+   return band(this.vring.used.flags, VRING_F_NO_NOTIFY) == 0;
+}
+
+return {
+   allocate_virtq = allocate_virtq,
+   pk_header_t = pk_header_t
+};

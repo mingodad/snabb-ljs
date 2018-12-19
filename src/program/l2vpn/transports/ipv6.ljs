@@ -1,0 +1,29 @@
+var ipv6 = require("lib.protocol.ipv6");
+var packet = require("core.packet");
+
+var transport = subClass(null);
+
+function transport::new (conf, tunnel_proto, logger) {
+   var o = transport->superClass().new(this);
+   assert(conf && conf.src && conf.dst,
+          "missing transport configuration");
+   for( _, key in ipairs({'src', 'dst'}) ) {
+      if( type(conf[key]) == "string" ) {
+         conf[key] = ipv6->pton(conf[key]);
+      }
+   }
+   o.header = ipv6->new({ next_header = tunnel_proto,
+                         hop_limit = conf.hop_limit || null,
+                         src = conf.src,
+                         dst = conf.dst });
+   o.peer = ipv6->ntop(conf.dst);
+   o.logger = logger;
+   return o;
+}
+
+function transport::encapsulate (datagram, tunnel_header) {
+   this.header->payload_length(tunnel_header->sizeof()
+                                 + datagram->packet().length);
+}
+
+return transport;

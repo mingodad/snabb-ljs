@@ -1,0 +1,79 @@
+module(..., package.seeall);
+
+var app = require("core.app");
+var config = require("core.config");
+var lib = require("core.lib");
+var cpuset = require("lib.cpuset");
+var csv_stats  = require("program.lwaftr.csv_stats");
+var setup = require("program.lwaftr.setup");
+var shm = require("core.shm");
+var S = require("syscall");
+
+
+function show_usage(code) {
+   print(require("program.lwaftr.bench.README_inc"));
+   main.exit(code);
+}
+
+function parse_args(args) {
+   var handlers = {};
+   var opts = {};
+   var scheduling = {};
+   function handlers.D(arg) {
+      opts.duration = assert(tonumber(arg), "duration must be a number");
+      assert(opts.duration >= 0, "duration can't be negative");
+   }
+   function handlers.cpu(arg) {
+      cpuset.global_cpuset()->add_from_string(arg);
+   }
+   function handlers.n(arg) { opts.name = assert(arg); }
+   function handlers.t (arg) { opts.trace = assert(arg); }
+   function handlers.b(arg) { opts.bench_file = arg; }
+   function handlers.y() { opts.hydra = true; }
+   function handlers.j(arg) { scheduling.j = arg; }
+   function handlers.h() { show_usage(0); }
+   args = lib.dogetopt(args, handlers, "j:n:hyb:D:t:", {
+      help="h", hydra="y", ["bench-file"]="b", duration="D", name="n", cpu=1,
+      trace="t" });
+   if( #args != 3 ) { show_usage(1); }
+   return opts, scheduling, unpack(args);
+}
+
+function run(args) {
+   var opts, scheduling, conf_file, inv4_pcap, inv6_pcap = parse_args(args);
+   var conf = setup.read_config(conf_file);
+
+   // If there is a name defined on the command line, it should override
+   // anything defined in the config.
+   if( opts.name ) {
+      conf.softwire_config.name = opts.name;
+   }
+
+   var function setup_fn(graph, lwconfig) {
+      return setup.load_bench(graph, lwconfig, inv4_pcap, inv6_pcap, 'sinkv4',
+			      'sinkv6');
+   }
+
+   var manager_opts = { worker_default_scheduling=scheduling,
+                          rpc_trace_file=opts.trace };
+   var manager = setup.ptree_manager(setup_fn, conf, manager_opts);
+
+   var stats = {csv={}};
+   function stats::worker_starting(id) { }
+   function stats::worker_started(id, pid) {
+      var csv = csv_stats.CSVStatsTimer->new(opts.bench_file, opts.hydra, pid);
+      csv->add_app('sinkv4', { 'input' }, { input=opts.hydra && 'decap' || 'Decap.' });
+      csv->add_app('sinkv6', { 'input' }, { input=opts.hydra && 'encap' || 'Encap.' });
+      this.csv[id] = csv;
+      this.csv[id]->start();
+   }
+   function stats::worker_stopping(id) {
+      this.csv[id]->stop();
+      this.csv[id] = null;
+   }
+   function stats::worker_stopped(id) { }
+   manager->add_state_change_listener(stats);
+
+   manager->main(opts.duration);
+   manager->stop();
+}

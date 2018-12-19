@@ -1,0 +1,87 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+module(...,package.seeall);
+
+var ffi = require("ffi");
+
+var app  = require("core.app");
+var lib  = require("core.lib");
+var link = require("core.link");
+var pcap = require("lib.pcap.pcap");
+var pf = require("pf");
+
+Tap = {};
+
+var tap_config_params = {
+   // Name of file to which to write packets.
+   filename = { required=true },
+   // "truncate" to truncate the file, or "append" to add to the file.
+   mode = { default = "truncate" },
+   // Only packets that match this pflang filter will be captured.
+   filter = { },
+   // Only write every Nth packet that matches the filter.
+   sample = { default=1 },
+};
+
+function Tap::new(conf) {
+   var o = lib.parse(conf, tap_config_params);
+   var mode = assert(({truncate='w+b', append='a+b'})[o.mode]);
+   o.file = assert(io.open(o.filename, mode));
+   if( o.file->seek() == 0 ) { pcap.write_file_header(o.file); }
+   if( o.filter ) { o.filter = pf.compile_filter(o.filter); }
+   o.n = o.sample - 1;
+   return setmetatable(o, {__index = Tap});
+}
+
+function Tap::push () {
+   var n = this.n;
+   while( ! link.empty(this.input.input) ) {
+      var p = link.receive(this.input.input);
+      if( ! this.filter || this.filter(p.data, p.length) ) {
+         ++n    ;
+         if( n == this.sample ) {
+            n = 0;
+            pcap.write_record(this.file, p.data, p.length);
+         }
+      }
+      link.transmit(this.output.output, p);
+   }
+   this.n = n;
+}
+
+function selftest () {
+   print('selftest: apps.pcap.tap');
+
+   var config = require("core.config");
+   var Sink = require("apps.basic.basic_apps").Sink;
+   var PcapReader = require("apps.pcap.pcap").PcapReader;
+
+   var function run(filter, sample) {
+      var tmp = os.tmpname();
+      var c = config.new();
+      // Re-use example from packet filter test.
+      config.app(c, "source", PcapReader, "apps/packet_filter/samples/v6.pcap");
+      config.app(c, "tap", Tap, {filename=tmp, filter=filter, sample=sample});
+      config.app(c, "sink", Sink );
+
+      config.link(c, "source.output -> tap.input");
+      config.link(c, "tap.output -> sink.input");
+      app.configure(c);
+      while( ! app.app_table.source.done ) { app.breathe(); }
+
+      var n = 0;
+      for( packet, record in pcap.records(tmp) ) { ++n    ; }
+      os.remove(tmp);
+
+      app.configure(config.new());
+
+      return n;
+   }
+
+   assert(run() == 161);
+   assert(run("icmp6") == 49);
+   assert(run(null, 2) == 81);
+   assert(run("icmp6", 2) == 25);
+
+   print('selftest: ok');
+}

@@ -1,0 +1,98 @@
+// This app is a multiplexer/demultiplexer based on the IPv6 source
+// and/or destination address of a packet.  It has a well-known port
+// called "south" that connects to the network and carries the
+// multiplexed traffic.
+//
+// The app is created with a list of mappings of port names to IPv6
+// source and/or destination addresses.  A BPF filter that matches the
+// given address(es) is created for each port.
+//
+// The push() method first processes all packets coming in from the
+// south port and applies the filters in turn.  When a match is found,
+// the packet is transmitted on the associated port and no more
+// filters are processed.  This implements the de-multiplexing of
+// incoming packets to specific upstream apps.
+//
+// The push() method then visits each upstream port in turn and
+// multiplexes all queued packets onto the south port.
+
+module(..., package.seeall);
+var ffi = require("ffi");
+var ipv6 = require("lib.protocol.ipv6");
+var filter = require("lib.pcap.filter");
+
+dispatch = subClass(null);
+dispatch._name = "IPv6 dispatcher";
+
+// config: table with mappings of link names to tuples of IPv6 source
+// and/or destination addresses.
+// config = { link1 = { source = source_addr, destination = destination_addr },
+//            ... }
+function dispatch::new (config) {
+   assert(config, "missing configuration");
+   var o = dispatch->superClass().new(this);
+   o._targets = {};
+   for( link, address in pairs(config) ) {
+      assert(type(address) == 'table' && (address.source || address.destination),
+             "incomplete configuration of dispatcher "..link);
+      var match = {};
+      if( address.source ) {
+         table.insert(match, "src host "..ipv6->ntop(address.source));
+      }
+      if( address.destination ) {
+         table.insert(match, "dst host "..ipv6->ntop(address.destination));
+      }
+      var program = table.concat(match, ' and ');
+      var filter, errmsg = filter->new(program);
+      assert(filter, errmsg && ffi.string(errmsg));
+      print("Adding dispatcher for link "..link.." with BPF "..program);
+      table.insert(o._targets, { filter = filter, link = link });
+   }
+
+   // Caches for for various cdata pointer objects to avoid boxing in
+   // the push() loop
+   o._cache = {
+      p = ffi.new("struct packet *[1]"),
+   };
+   return o;
+}
+
+var empty, full, receive, transmit = link.empty, link.full, link.receive, link.transmit;
+function dispatch::push() {
+   var output = this.output;
+   var targets = this._targets;
+   var cache = this._cache;
+   var l_in = this.input.south;
+   while( ! empty(l_in) ) {
+      var p = cache.p;
+      p[0] = receive(l_in);
+
+      // De-multiplex incoming packets to PWs based on the source and
+      // destination IPv6 addresses.
+      var free = true;
+      var i = 1;
+      while( targets[i] ) {
+         var t = targets[i];
+         if( t.filter->match(p[0].data, p[0].length) ) {
+            transmit(output[t.link], p[0]);
+            free = false;
+            break;
+         }
+         ++i  ;
+      }
+      if( free ) { packet.free(p[0]); }
+   }
+
+   // Multiplex the packets from all PWs onto the
+   // south link.
+   var l_out = output.south;
+   var i = 1;
+   while( targets[i] ) {
+      var t = targets[i];
+      l_in = this.input[t.link];
+      while( ! empty(l_in) && ! full(l_out) ) {
+         transmit(l_out, receive(l_in));
+      }
+      ++i  ;
+   }
+}

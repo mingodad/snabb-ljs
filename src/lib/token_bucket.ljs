@@ -1,0 +1,130 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+module(...,package.seeall);
+
+var lib = require("core.lib");
+var tsc = require("lib.tsc");
+var ffi = require("ffi");
+
+var token_bucket = {};
+var params = {
+   rate = { required = true },
+   burst_size = { required = false },
+};
+
+function new (arg) {
+   var config = lib.parse(arg, params);
+   var tb = setmetatable({}, { __index = token_bucket });
+
+   tb._tsc = tsc.new();
+   tb._time_fn = tb._tsc->time_fn();
+   // Use explicit box to avoid garbage in can_take()
+   tb._tstamp = ffi.new("uint64_t [1]");
+   tb->set(config.rate, config.burst_size);
+
+   return tb;
+}
+
+function token_bucket::set (rate, burst_size) {
+   if( rate != null ) {
+      assert(type(rate) == 'number');
+      assert(rate > 0);
+      this._rate = rate;
+      // Ticks per token
+      this._tpt = tonumber(this._tsc->tps())/rate + 0ULL;
+   }
+
+   if( burst_size == null ) {
+      burst_size = this._rate;
+   }
+   assert(type(burst_size) == 'number');
+   this._burst_size = math.ceil(burst_size);
+
+   this._tokens = this._burst_size;
+   this._tstamp[0] = this._time_fn();
+}
+
+function token_bucket::get () {
+   return this._rate, this._burst_size;
+}
+
+// For backward compatibility only
+function token_bucket::rate (rate) {
+   var old_rate = this._rate;
+   if( rate != null ) {
+      this->set(rate, this._burst_size);
+   }
+   return old_rate;
+}
+
+function token_bucket::can_take (n) {
+   n = n || 1;
+   var tokens = this._tokens;
+   if( n <= tokens ) {
+      return true;
+   } else {
+      // Accumulate fresh tokens since the last time we've checked
+      var elapsed = this._time_fn() - this._tstamp[0];
+      if( elapsed >= this._tpt ) {
+         // We have at least one new token.  We're careful to use
+         // uint64 values to make this an integer division. Would be
+         // nice if we had access to the remainder from the `div`
+         // instruction.
+         var fresh_tokens = elapsed/this._tpt;
+         tokens = tokens + tonumber(fresh_tokens);
+         this._tstamp[0] = this._tstamp[0] + this._tpt * fresh_tokens;
+         if( tokens > this._burst_size ) {
+            tokens = this._burst_size;
+         }
+         this._tokens = tokens;
+         return n <= tokens;
+      }
+      return false;
+   }
+}
+
+function token_bucket::take (n) {
+   n = n || 1;
+   if( this->can_take(n) ) {
+      this._tokens = this._tokens - n;
+      return true;
+   }
+   return false;
+}
+
+function token_bucket::take_burst () {
+   this->can_take(this._burst_size);
+   var tokens = this._tokens;
+   this._tokens = 0;
+   return tokens;
+}
+
+function selftest() {
+   var rate, burst_size = 10000, 50;
+   var tb = new({ rate = rate, burst_size = burst_size });
+   var interval = 0.5; // seconds
+   var i = 0;
+   var now = ffi.C.get_time_ns();
+   while( ffi.C.get_time_ns() - now < interval * 1000000000 ) {
+      if( tb->take() ) {
+         ++i    ;
+      }
+   }
+   var rate_eff = (i - burst_size)/interval;
+   assert(rate_eff/rate == 1);
+
+   r, b = tb->get();
+   assert(r == rate);
+   assert(b == burst_size);
+
+   tb->set(rate, burst_size);
+   assert(tb->can_take(burst_size));
+   assert(! tb->can_take(burst_size + 1));
+   assert(tb->take(burst_size));
+   assert(! tb->take());
+
+   tb->set(0.1);
+   r, b = tb->get();
+   assert(r == 0.1);
+   assert(b == 1);
+}

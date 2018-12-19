@@ -1,0 +1,541 @@
+module(..., package.seeall);
+
+// This module provides functions for generating snabb config
+// commands with random path queries and values
+
+var ffi       = require("ffi");
+var schema    = require("lib.yang.schema");
+var data      = require("lib.yang.data");
+var path_data = require("lib.yang.path_data");
+var util      = require("lib.yang.util");
+
+var capabilities = {['ietf-softwire-br']={feature={'binding'}},};
+require('lib.yang.schema').set_default_capabilities(capabilities);
+
+var schemas = { "ietf-softwire-br", "snabb-softwire-v2" };
+
+// choose an element of an array randomly
+var function choose(choices) {
+   var idx = math.random(#choices);
+   return choices[idx];
+}
+
+var function maybe(f, default, prob) {
+   return function(...) {
+      if( math.random() < (prob || 0.8) ) { return f(...); }
+      return default;
+   };
+}
+
+// Generate a get/set/add/remove string given a pid string and optional schema
+function generate_any(pid, schema) {
+   var cmd = choose({ "get", "add", "remove", "set" });
+
+   var query, val;
+   if( cmd == "get" ) {
+      query, schema = generate_config_xpath(schema);
+      return string.format("./snabb config get -s %s %s \"%s\"", schema, pid, query);
+   } else if( cmd == "set" ) {
+      query, val, schema = generate_config_xpath_and_val(schema);
+      return string.format("./snabb config set -s %s %s \"%s\" \"%s\"",
+                           schema, pid, query, val);
+   // use rejection sampling for add and remove commands to restrict to list or
+   // leaf-list cases (for remove, we need a case with a selector too)
+   // Note: this assumes a list or leaf-list case exists in the schema at all
+   } else if( cmd == "add" ) {
+      query, val, schema = generate_config_xpath_and_val(schema);
+      return string.format("./snabb config add -s %s %s \"%s\" \"%s\"",
+                           schema, pid, query, val);
+   } else {
+      query, val, schema = generate_config_xpath_and_val(schema);
+      return string.format("./snabb config remove -s %s %s \"%s\"",
+                           schema, pid, query);
+   }
+}
+
+// Generate a get command string given a pid string and optional schema/query
+function generate_get(pid, schema, query) {
+   if( ! query ) {
+      query, schema = generate_config_xpath(schema);
+   }
+   return string.format("./snabb config get -s %s %s \"%s\"", schema, pid, query);
+}
+
+// Like generate_get but for state queries
+function generate_get_state(pid, schema, query) {
+   if( ! query ) {
+      query, schema = generate_state_xpath(schema);
+   }
+   return string.format("./snabb config get-state -s %s %s \"%s\"", schema, pid, query);
+}
+
+// Used primarily for repeating a set with a value seen before from a get
+function generate_set(pid, schema, query, val) {
+   return string.format("./snabb config set -s %s %s \"%s\" \"%s\"",
+                        schema, pid, query, val);
+}
+
+function run_yang(yang_cmd) {
+   var f = io.popen(yang_cmd);
+   var result = f->read("*a");
+   f->close();
+   return result;
+}
+
+// choose a natural number (e.g., index or length of array) by
+// repeating a cointoss
+var function choose_nat() {
+   var r = math.random();
+
+   var function flip(next) {
+      var r = math.random();
+      if( r < 0.5 ) {
+         return next;
+      } else {
+         return flip(next + 1);
+      }
+   }
+
+   // evenly weight first two
+   if( r < 0.5 ) {
+      return choose({1, 2});
+   } else {
+      return flip(3);
+   }
+}
+
+var function random_hex() {
+  return string.format("%x", math.random(0, 15));
+}
+
+var function random_hexes() {
+   var str = "";
+   for( i=1, 4 ) {
+      str = str .. random_hex();
+   }
+   return str;
+}
+
+// generate a random 64-bit integer
+var function random64() {
+   var result = 0;
+   var r1 = ffi.cast("uint64_t", math.random(0, 2 ** 32 - 1));
+   var r2 = ffi.cast("uint64_t", math.random(0, 2 ** 32 - 1));
+
+   return r1 * 4294967296ULL + r2;
+}
+
+// return a random number, preferring boundary values and
+// sometimes returning results out of range
+var function choose_bounded(lo, hi, generate_invalid) {
+   var r = math.random();
+   // occasionally return values that are invalid for type
+   // to provoke crashes
+   if( generate_invalid && r < 0.05 ) {
+      var off = math.random(1, 100);
+      return choose({ lo - off, hi + off });
+   } else if( r < 0.15 ) {
+      var mid = math.ceil((hi + lo) / 2);
+      return choose({ lo, lo + 1, mid, mid +  1,  hi - 1, hi });
+   } else {
+      return math.random(lo, hi);
+   }
+}
+
+// Choose a random number from within a range of valid value.  RANGES
+// is an array of {LO, HI} arrays; each of LO and HI can be numbers.
+// LO can additionally be "min" and HI can be "max".
+var function choose_value_from_ranges(ranges, type_min, type_max, generate_invalid) {
+   var r = math.random();
+
+   if( #ranges == 0 || (generate_invalid && r < 0.1) ) {
+      return choose_bounded(type_min, type_max, generate_invalid);
+   } else {
+      var lo, hi = unpack(ranges[math.random(1,#ranges)]);
+      if( lo == "min" ) { lo = type_min; }
+      if( hi == "max" ) { hi = type_max; }
+      return choose_bounded(lo, hi, generate_invalid);
+   }
+}
+
+var function value_from_type(a_type, generate_invalid) {
+   var prim = a_type.primitive_type;
+   var ranges;
+
+   if( a_type.range ) {
+      ranges = a_type.range.value;
+   } else {
+      ranges = {};
+   }
+
+   if( prim == "int8" ) {
+      return choose_value_from_ranges(ranges, -128, 127, generate_invalid);
+   } else if( prim == "int16" ) {
+      return choose_value_from_ranges(ranges, -32768, 32767, generate_invalid);
+   } else if( prim == "int32" ) {
+      return choose_value_from_ranges(ranges, -2147483648, 2147483647, generate_invalid);
+   } else if( prim == "int64" ) {
+      return ffi.cast("int64_t", random64());
+   } else if( prim == "uint8" ) {
+      return choose_value_from_ranges(ranges, 0, 255, generate_invalid);
+   } else if( prim == "uint16" ) {
+      return choose_value_from_ranges(ranges, 0, 65535, generate_invalid);
+   } else if( prim == "uint32" ) {
+      return choose_value_from_ranges(ranges, 0, 4294967295, generate_invalid);
+   } else if( prim == "uint64" ) {
+      return random64();
+   // TODO: account for fraction-digits and range
+   } else if( prim == "decimal64" ) {
+      var int64 = ffi.cast("int64_t", random64());
+      var exp   = math.random(1, 18);
+      // see RFC 6020 sec 9.3.1 for lexical representation
+      return string.format("%f", tonumber(int64 * (10 ** -exp)));
+   } else if( prim == "boolean" ) {
+      return choose({ true, false });
+   } else if( prim == "ipv4-address" || prim == "ipv4-prefix" ) {
+      var addr = {};
+      for( i=1,4 ) {
+         table.insert(addr, math.random(255));
+      }
+      addr = table.concat(addr, ".");
+      if( prim == "ipv4-prefix" ) {
+         return ("%s/%d")->format(addr, math.random(32));
+      }
+      return addr;
+   } else if( prim == "ipv6-address" || prim == "ipv6-prefix" ) {
+      var addr = random_hexes();
+      for( i=1, 7 ) {
+          addr = addr .. ":" .. random_hexes();
+      }
+
+      if( prim == "ipv6-prefix" ) {
+         return addr .. "/" .. math.random(0, 128);
+      }
+
+      return addr;
+   } else if( prim == "mac-address" ) {
+      var addr = random_hex() .. random_hex();
+      for( i=1,5 ) {
+         addr = addr .. ":" .. random_hex() .. random_hex();
+      }
+      return addr;
+   } else if( prim == "union" ) {
+      return value_from_type(choose(a_type.union), generate_invalid);
+   // TODO: follow pattern statement
+   } else if( prim == "string" ) {
+      var len = choose_nat();
+      // just ascii for now
+      var str = "";
+      for( i=0, len ) {
+         str = str .. string.char(math.random(97, 122));
+      }
+      return str;
+   } else if( prim == "binary" ) {
+      // TODO: if restricted with length statement this should pick based
+      //       on the octet length instead and introduce padding chars
+      //       if necessary
+      var encoded = "";
+      var encoded_len = choose_nat() * 4;
+
+      for( i=1, encoded_len ) {
+         var r = math.random(0, 63);
+         var byte;
+
+         if( r <= 25 ) {
+            byte = string.byte("A") + r;
+         } else if( r > 25 && r <= 51 ) {
+            byte = string.byte("a") + r-26;
+         } else if( r > 51 && r <= 61 ) {
+            byte = string.byte("0") + r-52;
+         } else if( r == 63 ) {
+            byte = string.byte("+");
+         } else {
+            byte = string.byte("/");
+         }
+
+         encoded = encoded .. string.char(byte);
+      }
+
+      return encoded;
+   } else if( prim == "empty" ) {
+      return "";
+   } else if( prim == "enumeration" ) {
+      var enum = choose(a_type.enums);
+      return enum.value;
+   }
+
+   // TODO: these appear unused in the current YANG schemas so
+   //       they're left out for now
+   // bits
+   // identityref
+   // instance-identifier
+   // leafref
+
+   error("NYI or unknown type: "..prim);
+}
+
+var function value_generator(typ, generate_invalid) {
+   // FIXME: memoize dispatch.
+   return function() { return tostring(value_from_type(typ), generate_invalid); };
+}
+
+var function data_generator_from_grammar(production, generate_invalid) {
+   var handlers = {};
+   var function visit1(keyword, production) {
+      return assert(handlers[production.type])(keyword, production);
+   }
+   var function body_generator(productions) {
+      var order = {};
+      var gens = {};
+      for( k,v in pairs(productions) ) {
+         table.insert(order, k);
+         gens[k] = visit1(k, v);
+         if( ! v.mandatory ) { gens[k] = maybe(gens[k]); }
+      }
+      table.sort(order);
+      return function() {
+         var ret = {};
+         for( _,k in ipairs(order) ) {
+            var v = gens[k]();
+            if( v != null ) { table.insert(ret, v); }
+         }
+         return table.concat(ret, ' ');
+      };
+   }
+   function handlers.struct(keyword, production) {
+      var gen = body_generator(production.members);
+      var prefix, suffix = '', '';
+      if( keyword ) { prefix, suffix = keyword..' {', '}'; }
+      return function() {
+         return table.concat({prefix, gen(), suffix}, " ");
+      };
+   }
+   function handlers.array(keyword, production) {
+      var gen = value_generator(production.element_type, generate_invalid);
+      var prefix, suffix = '', ';';
+      if( keyword ) { prefix = keyword..' '..prefix; }
+      return function() {
+         var ret = {};
+         while( math.random() < 0.9 ) {
+            table.insert(ret, prefix..gen()..suffix);
+         }
+         return table.concat(ret, " ");
+      };
+   }
+   var function shallow_copy(t) {
+      var ret = {};
+      for( k,v in pairs(t) ) { ret[k]=v; }
+      return ret;
+   }
+   function handlers.table(keyword, production) {
+      var keys = {};
+      for( k,v in pairs(production.keys) ) {
+         keys[k] = shallow_copy(v);
+         keys[k].mandatory = true;
+      }
+      var gen_key = body_generator(production.keys);
+      var gen_value = body_generator(production.values);
+      var prefix, suffix = '{', '}';
+      if( keyword ) { prefix = keyword..' '..prefix; }
+      return function() {
+         var ret = {};
+         while( math.random() < 0.9 ) {
+            var x = table.concat({prefix,gen_key(),gen_value(),suffix}, " ");
+            table.insert(ret, x);
+         }
+         return table.concat(ret, " ");
+      };
+   }
+   function handlers.scalar(keyword, production) {
+      var prefix, suffix = '', '';
+      if( keyword ) {
+         prefix, suffix = keyword..' '..prefix, ';';
+      }
+      var gen = value_generator(production.argument_type, generate_invalid);
+      return function() {
+         return prefix..gen()..suffix;
+      };
+   }
+   function handlers.choice(keyword, production) {
+      var choices = {};
+      var cases = {};
+      for( case, choice in pairs(production.choices) ) {
+         table.insert(cases, case);
+         choices[case] = body_generator(choice);
+      }
+      table.sort(cases);
+      return function () {
+         return choices[choose(cases)]();
+      };
+   }
+   return visit1(null, production);
+}
+data_generator_from_grammar = util.memoize(data_generator_from_grammar);
+
+var function path_generator_from_grammar(production, generate_invalid) {
+   var handlers = {};
+   var function visit1(keyword, production) {
+      return assert(handlers[production.type])(keyword, production);
+   }
+   function handlers.struct(keyword, production) {
+      var members, gen_tail = {}, {};
+      for( k,v in pairs(production.members) ) {
+         table.insert(members, k);
+         gen_tail[k] = assert(visit1(k, v));
+      }
+      table.sort(members);
+      return function () {
+         var head = keyword || '';
+         if( math.random() < 0.1 ) { return head; }
+         if( head != '' ) { head = head..'/'; }
+         var k = choose(members);
+         return head..gen_tail[k]();
+      };
+   }
+   function handlers.array(keyword, production) {
+      return function () {
+         var head = keyword;
+         if( math.random() < 0.3 ) { return head; }
+         return head..'[position()='..math.random(1,100)..']';
+      };
+   }
+   function handlers.table(keyword, production) {
+      var keys, values, gen_key, gen_tail = {}, {}, {}, {};
+      for( k,v in pairs(production.keys) ) {
+         table.insert(keys, k);
+         gen_key[k] = data_generator_from_grammar(v, generate_invalid);
+      }
+      for( k,v in pairs(production.values) ) {
+         table.insert(values, k);
+         gen_tail[k] = visit1(k, v);
+      }
+      table.sort(keys);
+      table.sort(values);
+      return function () {
+         var head = keyword;
+         if( math.random() < 0.1 ) { return head; }
+         for( _,k in ipairs(keys) ) {
+            head = head..'['..k..'='..gen_key[k]()..']';
+         }
+         if( math.random() < 0.1 ) { return head; }
+         return head..'/'..gen_tail[choose(values)]();
+      };
+   }
+   function handlers.scalar(keyword, production) {
+      assert(keyword);
+      return function() { return keyword; };
+   }
+   function handlers.choice(keyword, production) {
+      var choices, cases = {}, {};
+      for( case, choice in pairs(production.choices) ) {
+         table.insert(cases, case);
+         choices[case] = visit1(null, {type='struct',members=choice});
+      }
+      table.sort(cases);
+      return function() { return choices[choose(cases)](); };
+   }
+   var gen = visit1(null, production);
+   return function() { return '/'..gen(); };
+}
+path_generator_from_grammar = util.memoize(path_generator_from_grammar);
+
+var function choose_path_for_grammar(grammar, generate_invalid) {
+   return path_generator_from_grammar(grammar, generate_invalid)();
+}
+
+var function choose_path_and_value_generator_for_grammar(grammar, generate_invalid) {
+   var path = choose_path_for_grammar(grammar, generate_invalid);
+   var getter, subgrammar = path_data.resolver(grammar, path);
+   return path, data_generator_from_grammar(subgrammar, generate_invalid);
+}
+
+var function choose_path_and_value_generator(schema, is_config, generate_invalid) {
+   var grammar = data.data_grammar_from_schema(schema, is_config);
+   return choose_path_and_value_generator_for_grammar(grammar, generate_invalid);
+}
+
+var function generate_xpath(schema, is_config, generate_invalid) {
+   var grammar = data.data_grammar_from_schema(schema, is_config);
+   return choose_path_for_grammar(grammar, generate_invalid);
+}
+
+var function generate_xpath_and_val(schema, is_config, generate_invalid) {
+   var path, gen_value = choose_path_and_value_generator(
+      schema, is_config, generate_invalid);
+   return path, gen_value();
+}
+
+function generate_config_xpath(schema_name, generate_invalid) {
+   schema_name = schema_name || choose(schemas);
+   var schema = schema.load_schema_by_name(schema_name);
+   return generate_xpath(schema, true, generate_invalid), schema_name;
+}
+
+// types that may be randomly picked for a fuzzed test case
+var types = { "int8", "int16", "int32", "int64", "uint8", "uint16",
+                "uint32", "uint64", "decimal64", "boolean", "ipv4-address",
+                "ipv6-address", "ipv6-prefix", "mac-address", "string",
+                "binary" };
+
+function generate_config_xpath_and_val(schema_name, generate_invalid) {
+   schema_name = schema_name || choose(schemas);
+   var schema = schema.load_schema_by_name(schema_name);
+   var r = math.random();
+   var path, val;
+
+   // once in a while, generate a nonsense value
+   if( generate_invalid && r < 0.05 ) {
+     path = generate_xpath(schema, true);
+     val = value_from_type({ primitive_type=choose(types) }, generate_invalid);
+   } else {
+     path, val = generate_xpath_and_val(schema, true, generate_invalid);
+   }
+
+   return path, val, schema_name;
+}
+
+function generate_state_xpath(schema_name, generate_invalid) {
+   schema_name = schema_name || choose(schemas);
+   var schema = schema.load_schema_by_name(schema_name);
+   return generate_xpath(schema, false, generate_invalid), schema_name;
+}
+
+function selftest() {
+   print('selftest: program.lwaftr.tests.propbased.genyang');
+   var schema = schema.load_schema_by_name("snabb-softwire-v2");
+   var grammar = data.config_grammar_from_schema(schema);
+
+   for( i=1,1000 ) { generate_xpath_and_val(schema, true); }
+   for( i=1,1000 ) { generate_xpath_and_val(schema, false); }
+
+   // check some int types with range statements
+   for( i=1, 100 ) {
+      var val1 = value_from_type({ primitive_type="uint8",
+                                     range={ value = {{1, 16}} } });
+      var val2 = value_from_type({ primitive_type="uint8",
+                                     range={ value = {{1, 16}, {18, 32}} } });
+      var val3 = value_from_type({ primitive_type="uint8",
+                                     range={ value = {{"min", 10}, {250, "max"}} } });
+      assert(val1 >= 1 && val1 <= 16, string.format("test value: %d", val1));
+      assert(val2 >= 1 && val2 <= 32 && val2 != 17,
+             string.format("test value: %d", val2));
+      assert(val3 >= 0 && val3 <= 255 && ! (val3 > 10 && val3 < 250),
+             string.format("test value: %d", val3));
+   }
+
+   // ensure decimal64 values match the right regexp
+   for( i=1, 100 ) {
+      var val = value_from_type({ primitive_type="decimal64",
+                                    range={ value={} } });
+      assert(string.match(val, "^-?%d+[.]%d+$"), string.format("test value: %s", val));
+   }
+
+   // ensure generated base64 values are decodeable
+   for( i=1, 100 ) {
+      var val = value_from_type({ primitive_type="binary",
+                                    range={ value={} }});
+      var cmd = string.format("echo \"%s\" | base64 -d > /dev/null", val);
+      assert(os.execute(cmd) == 0, string.format("test value: %s", val));
+   }
+   print('selftest: ok');
+}

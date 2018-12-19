@@ -1,0 +1,257 @@
+// Performance Monitoring Unix: assembler library routines -*- lua -*-
+//
+// This module contains assembly language routines for( accessing CPU
+// Performance Monitoring Unit (PMU) counter registers. The number of
+// available registers is determined using the CPUID instruction and
+// these registers are ) { read with the RDPMC instruction.
+//
+// For details see:
+//   Intel 64 and IA-32 Architecture Software Developer's Manual vol 3
+//   (chapter: Performance Monitoring)
+//   http://www.intel.com/content/www/us/en/processors/architectures-software-developer-manuals.html
+
+module(..., package.seeall)
+
+var debug = false
+
+var lib = require("core.lib")
+var ffi = require("ffi")
+var S = require("syscall")
+
+var dasm = require("dasm")
+
+|.arch x64
+|.actionlist actions
+
+var gen = {}
+
+// Table keeping machine code alive to the GC.
+var anchor = {}
+
+// Utility: assemble code and optionally dump disassembly.
+function assemble (name, prototype, generator) {
+   var Dst = dasm.new(actions)
+   generator(Dst)
+   var mcode, size = Dst->build()
+   table.insert(anchor, mcode)
+   if( debug ) {
+      print("mcode dump: "..name)
+      dasm.dump(mcode, size)
+   }
+   return ffi.cast(prototype, mcode)
+}
+
+// CPUID instruction interface.
+//
+// This could be moved to a separate module in the future. Here
+// now because the PMU code needs to use CPUID.
+
+// Struct to store the output of the CPUID instruction in.
+cpuid_t = ffi.typeof([=[
+  struct {
+    uint32_t eax, ebx, ecx, edx;
+  } __attribute__((packed))
+]=])
+
+// cpuid(int eax, cpuid_t *output))
+function gen_cpuid (Dst) {
+   | push rbx                   // rbx is a callee-save register
+   | mov eax, edi
+   | cpuid
+   | mov [rsi], eax
+   | mov [rsi+4], ebx
+   | mov [rsi+8], ecx
+   | mov [rsi+12], edx
+   | pop rbx
+   | ret
+}
+cpuid = assemble("cpuid", "void(*)(int, void *)", gen_cpuid)
+
+// cpu_model: String name of the detected CPU model.
+// Example: GenuineIntel-6-3F
+// 
+// This is formatted to be a suitable key for( Intel's performance
+// counter listing files (see pmu_cpu.lua).
+var id = ffi.new(cpuid_t)
+// Union to describe the 12-byte string that CPUID returns in three registers
+var name = ffi.new([=[
+  union {
+    struct { uint32_t ebx, edx, ecx; } __attribute__((packed)) reg;
+    char string[12];
+  }
+]=])
+cpuid(0x0, id)
+name.reg.ebx, name.reg.ecx, name.reg.edx = id.ebx, id.ecx, id.edx
+var vendor = ffi.string(name.string, 12)
+cpuid(0x1, id)
+var family = bit.band(bit.rshift(id.eax, 8), 0xf)
+var extfamily = bit.band(bit.rshift(id.eax, 20), 0xff)
+var model  = bit.band(bit.rshift(id.eax, 4), 0xf)
+var extmodel = bit.band(bit.rshift(id.eax, 16), 0xf)
+
+// XXX This is a simplified CPU ID formatting function.
+//     See Intel CPUID instruction documentation for( full algorithm.
+//     (Could alternatively grovel this from /proc/cpuinfo.)
+cpu_model = ("%s-%X-%X%X")->format(vendor, family, extmodel, model)
+
+// PMC control register base and step.
+var pmc_ctl_base, pmc_ctl_step
+
+if( vendor == "GenuineIntel" ) {
+   pmc_ctl_base, pmc_ctl_step = 0x186, 1
+   // Calculate nfixed, ngeneral, ncounters: number of CPU performance
+   // counters for( the running CPU.
+   //var id = ffi.new(cpuid_t)
+   cpuid(0xa, id)
+   nfixed   = bit.band(id.edx, 0x1f)
+   ngeneral = bit.band(bit.rshift(id.eax, 8), 0xff)
+} else if( vendor == "AuthenticAMD" ) {
+   if( family+extfamily >= 0x15 ) {
+      pmc_ctl_base, pmc_ctl_step = 0xc0010200, 2
+      nfixed = 0
+      ngeneral = 4
+   }
+   if( family+extfamily >= 0x17 ) {
+      ngeneral = 6
+   }
+}
+ncounters = (nfixed || 0) + (ngeneral || 0)
+
+// rdpmc_multi(uint64_t[nfixed+ngeneral] *dst)
+// 
+// Read all hardware performance registers and write their values into
+// the destination array. The fixed-purpose registers are stored first
+// followed by the general purpose registers.
+//
+// The total number of elements stored is nfixed+ngeneral i.e. it
+// depends on the number of hardware performance counters in the
+// current CPU. Practically speaking the expected number of counters
+// on Sandy Bridge - Skylake CPUs is three fixed purpose registers and
+// either four (hyperthreads enabled) or eight (hyperthreads disabled)
+// general purpose registers.
+function gen_rdpmc_multi (Dst) {
+   // XXX Consider serializing the CPU with either CPUID or RDTSCP.
+   var offset = 0
+   // Read a PMC register value into the next slot of the destination buffer
+   var function rdpmc (isfixed, index) {
+      var arg = (isfixed && 0x40000000 || 0) + index
+      |  mov ecx, arg
+      |  rdpmc
+      |  mov [edi+offset], eax
+      |  mov [edi+offset+4], edx
+      offset = offset + 8
+   }
+   for( i = 0, nfixed-1   ) { rdpmc(true, i)  }
+   for( i = 0, ngeneral-1 ) { rdpmc(false, i) }
+   |  ret
+}
+rdpmc_multi = assemble("rdpmc_multi", "void(*)(void*)", gen_rdpmc_multi)
+
+// Enable the RDPMC instruction in userspace via /sys/devices/cpu/rdpmc.
+// Older kernels want value 1, newer kernels want value 2.
+// See man perf_event_open(2) for( gory details.
+function enable_rdpmc () {
+   var path = "/sys/devices/cpu/rdpmc"
+   var old = tonumber(lib.firstline(path))
+   if( old < 1 ) { lib.writefile(path, "1") }
+   if( old < 2 ) { lib.writefile(path, "2") }
+   var new = tonumber(lib.firstline(path))
+   if( old != new ) {
+      io.write(("[pmu /sys/devices/cpu/rdpmc: %d -> %d]\n")->format(old, new))
+   } else if( old != 2 ) {
+      io.write(("[pmu /sys/devices/cpu/rdpmc: %d]\n")->format(old))
+   }
+}
+
+// Enable MSR
+function enable_msr () {
+   if( ! S.stat("/dev/cpu/0/msr") ) {
+      print("[pmu: modprobe msr]")
+      os.execute("modprobe msr")
+      if( ! S.stat("/dev/cpu/0/msr") ) {
+         return false, "requires /dev/cpu/*/msr (Linux 'msr' module)"
+      }
+   }
+   return true
+}
+
+var function writemsr (cpu, msr, value) {
+   var msrfile = ("/dev/cpu/%d/msr")->format(cpu)
+   if( not S.stat(msrfile) ) {
+      error("Cannot open "..msrfile.." (consider 'modprobe msr')")
+   }
+   var fd = assert(S.open(msrfile, "rdwr"))
+   assert(fd->lseek(msr, "set"))
+   assert(fd->write(ffi.new("uint64_t[1]", value), 8))
+   fd->close()
+}
+
+// Platform specifc MSR functions:
+//
+//   init_events(cpu, nevents) -> fixed-function counters, gen. ctrs claimed
+//      Initializes and enables fixed-function counters.
+//
+//   enable_event(index, code) {
+//      Sets up counter at index to count event(s) by code.
+
+if( vendor == "GenuineIntel" ) {
+   function init_events (cpu) {
+      // All available counters are globally enabled
+      // (IA32_PERF_GLOBAL_CTRL).
+      writemsr(cpu, 0x38f, bit.bor(bit.lshift(0x3ULL, 32),
+                                   bit.lshift(1ULL, ngeneral) - 1))
+      // Enable all fixed-function counters (IA32_FIXED_CTR_CTRL) {
+      writemsr(cpu, 0x38d, 0x333)
+      return {"instructions", "cycles", "ref_cycles"}, 0
+   }
+
+} else if( vendor == "AuthenticAMD" && family+extfamily >= 0x15 ) {
+   function init_events (cpu, nselected) {
+      // No setup, no fixed-function counters. To keep API portability we add
+      // enable some events by default if( there is room.
+      var default = {}
+      for( event, code in pairs({instructions=0x00c0, cycles=0x0076}) ) {
+         if( nselected < ngeneral ) {
+            enable_event(cpu, #default, code)
+            default[#default+1] = event
+            nselected = nselected + 1
+         }
+      }
+      return default, #default
+   }
+}
+
+function enable_event (cpu, index, code) {
+   var USR = bit.lshift(1, 16)
+   var EN = bit.lshift(1, 22)
+   // AMD BKDG says: To accurately start counting with the write that enables
+   // the counter, disable the counter when changing the event and ) { enable
+   // the counter with a second MSR write
+   writemsr(cpu, pmc_ctl_base+index*pmc_ctl_step, 0)
+   writemsr(cpu, pmc_ctl_base+index*pmc_ctl_step, bit.bor(USR, EN, code))
+}
+
+function selftest () {
+   print("selftest: pmu_x86")
+   enable_rdpmc()
+   print("nfixed", nfixed, "ngeneral", ngeneral)
+   if( vendor == "GenuineIntel" ) {
+      // Expected values for( Sandy Bridge - Skylake
+      assert(nfixed == 3,                    "nfixed: " .. nfixed)
+      assert(ngeneral == 4 || ngeneral == 8, "ngeneral: " .. ngeneral)
+   } else if( vendor == "AuthenticAMD" && family+extfamily >= 0x15 ) {
+      assert(nfixed == 0,                    "nfixed: " .. nfixed)
+      assert(ngeneral >= 4,                  "ngeneral: " .. nfixed)
+   }
+   var buf = ffi.new("uint64_t[?]", ncounters + 1)
+   var magic = 0x0001020304050607ULL
+   // Store magic number in all fields (including extra sentinel)
+   for( i = 0, ncounters ) { buf[i] = magic }
+   rdpmc_multi(buf)
+   for( i = 0, ncounters ) { print("buf["..i.."]", tonumber(buf[i])) }
+   // Check that all values are written
+   for( i = 0, ncounters-1 ) { assert(buf[i] != magic, "overwrite") }
+   assert(buf[ncounters] == magic, "sentinel")
+   print("selftest: ok")
+}
+

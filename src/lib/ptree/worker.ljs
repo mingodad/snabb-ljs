@@ -1,0 +1,118 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+module(...,package.seeall);
+
+var S            = require("syscall");
+var engine       = require("core.app");
+var app_graph    = require("core.config");
+var counter      = require("core.counter");
+var histogram    = require('core.histogram');
+var lib          = require('core.lib');
+var timer        = require('core.timer');
+var channel      = require("lib.ptree.channel");
+var action_codec = require("lib.ptree.action_codec");
+var alarm_codec  = require("lib.ptree.alarm_codec");
+
+var Worker = {};
+
+var worker_config_spec = {
+   duration = {},
+   measure_latency = {default=true},
+   no_report = {default=false},
+   report = {default={showapps=true,showlinks=true}},
+   Hz = {default=1000},
+};
+
+function new_worker (conf) {
+   conf = lib.parse(conf, worker_config_spec);
+   var ret = setmetatable({}, {__index=Worker});
+   ret.period = 1/conf.Hz;
+   ret.duration = conf.duration || 1/0;
+   ret.no_report = conf.no_report;
+   ret.channel = channel.create('config-worker-channel', 1e6);
+   ret.alarms_channel = alarm_codec.get_channel();
+   ret.pending_actions = {};
+
+   ret.breathe = engine.breathe;
+   if( conf.measure_latency ) {
+      var latency = histogram.create('engine/latency.histogram', 1e-6, 1e0);
+      ret.breathe = latency->wrap_thunk(ret.breathe, engine.now);
+   }
+   return ret;
+}
+
+function Worker::shutdown() {
+   // This will call stop() on all apps.
+   engine.configure(app_graph.new());
+
+   // Now we can exit.
+   S.exit(0);
+}
+
+function Worker::commit_pending_actions() {
+   var to_apply = {};
+   var should_flush = false;
+   for( _,action in ipairs(this.pending_actions) ) {
+      var name, args = unpack(action);
+      if( name == 'call_app_method_with_blob' ) {
+         if( #to_apply > 0 ) {
+            engine.apply_config_actions(to_apply);
+            to_apply = {};
+         }
+         var callee, method, blob = unpack(args);
+         var obj = assert(engine.app_table[callee]);
+         assert(obj[method])(obj, blob);
+      } else if( name == "shutdown" ) {
+         this->shutdown();
+      } else {
+         if( name == 'start_app' || name == 'reconfig_app' ) {
+            should_flush = true;
+         }
+         table.insert(to_apply, action);
+      }
+   }
+   if( #to_apply > 0 ) { engine.apply_config_actions(to_apply); }
+   this.pending_actions = {};
+   if( should_flush ) { require('jit').flush(); }
+}
+
+function Worker::handle_actions_from_manager() {
+   var channel = this.channel;
+   for( i=1,4 ) {
+      var buf, len = channel->peek_message();
+      if( ! buf ) { break; }
+      var action = action_codec.decode(buf, len);
+      if( action[1] == 'commit' ) {
+         this->commit_pending_actions();
+      } else {
+         table.insert(this.pending_actions, action);
+      }
+      channel->discard_message(len);
+   }
+}
+
+function Worker::main () {
+   var stop = engine.now() + this.duration;
+   var next_time = engine.now();
+   do {
+      this.breathe();
+      if( next_time < engine.now() ) {
+         next_time = engine.now() + this.period;
+         this->handle_actions_from_manager();
+         timer.run();
+      }
+      if( ! engine.busywait ) { engine.pace_breathing(); }
+   } while(!( stop < engine.now()) );
+   counter.commit();
+   if( ! this.no_report ) { engine.report(this.report); }
+}
+
+function main (opts) {
+   return new_worker(opts)->main();
+}
+
+function selftest () {
+   print('selftest: lib.ptree.worker');
+   main({duration=0.005});
+   print('selftest: ok');
+}

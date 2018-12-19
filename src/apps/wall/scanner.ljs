@@ -1,0 +1,346 @@
+module(..., package.seeall);
+
+var util  = require("apps.wall.util");
+var const = require("apps.wall.constants");
+var lib   = require("core.lib");
+var bit   = require("bit");
+var ffi   = require("ffi");
+
+var rd16, rd32 = util.rd16, util.rd32;
+var ipv4_addr_cmp, ipv6_addr_cmp = util.ipv4_addr_cmp, util.ipv6_addr_cmp;
+var tobit, lshift, rshift = bit.tobit, bit.lshift, bit.rshift;
+var band, bxor, bnot = bit.band, bit.bxor, bit.bnot;
+var ETH_TYPE_IPv4         = const.ETH_TYPE_IPv4;
+var ETH_TYPE_IPv6         = const.ETH_TYPE_IPv6;
+var ETH_TYPE_VLAN         = const.ETH_TYPE_VLAN;
+var ETH_TYPE_OFFSET       = const.ETH_TYPE_OFFSET;
+var ETH_HEADER_SIZE       = const.ETH_HEADER_SIZE;
+var IPv4_PROTO_OFFSET     = const.IPv4_PROTO_OFFSET;
+var IPv4_SRC_ADDR_OFFSET  = const.IPv4_SRC_ADDR_OFFSET;
+var IPv4_DST_ADDR_OFFSET  = const.IPv4_DST_ADDR_OFFSET;
+var IPv4_PROTO_TCP        = const.IPv4_PROTO_TCP;
+var IPv4_PROTO_UDP        = const.IPv4_PROTO_UDP;
+var IPv6_NEXTHDR_OFFSET   = const.IPv6_NEXTHDR_OFFSET;
+var IPv6_SRC_ADDR_OFFSET  = const.IPv6_SRC_ADDR_OFFSET;
+var IPv6_DST_ADDR_OFFSET  = const.IPv6_DST_ADDR_OFFSET;
+var IPv6_NEXTHDR_HOPBYHOP = const.IPv6_NEXTHDR_HOPBYHOP;
+var IPv6_NEXTHDR_TCP      = const.IPv6_NEXTHDR_TCP;
+var IPv6_NEXTHDR_UDP      = const.IPv6_NEXTHDR_UDP;
+var IPv6_NEXTHDR_ROUTING  = const.IPv6_NEXTHDR_ROUTING;
+var IPv6_NEXTHDR_FRAGMENT = const.IPv6_NEXTHDR_FRAGMENT;
+var IPv6_NEXTHDR_AH       = const.IPv6_NEXTHDR_AH;
+var IPv6_NEXTHDR_NONE     = const.IPv6_NEXTHDR_NONE;
+var IPv6_NEXTHDR_DSTOPTS  = const.IPv6_NEXTHDR_DSTOPTS;
+var TCP_SRC_PORT_OFFSET   = const.TCP_SRC_PORT_OFFSET;
+var TCP_DST_PORT_OFFSET   = const.TCP_DST_PORT_OFFSET;
+var UDP_SRC_PORT_OFFSET   = const.UDP_SRC_PORT_OFFSET;
+var UDP_DST_PORT_OFFSET   = const.UDP_DST_PORT_OFFSET;
+
+ffi.cdef ([=[
+   struct swall_flow_key_ipv4 {
+      uint16_t vlan_id;
+      uint8_t  __pad;
+      uint8_t  ip_proto;
+      uint8_t  lo_addr[4];
+      uint8_t  hi_addr[4];
+      uint16_t lo_port;
+      uint16_t hi_port;
+   } __attribute__((packed));
+
+   struct swall_flow_key_ipv6 {
+      uint16_t vlan_id;
+      uint8_t  __pad;
+      uint8_t  ip_proto;
+      uint8_t  lo_addr[16];
+      uint8_t  hi_addr[16];
+      uint16_t lo_port;
+      uint16_t hi_port;
+   } __attribute__((packed));
+]=]);
+
+var function hash32(i32) {
+   i32 = tobit(i32);
+   i32 = i32 + bnot(lshift(i32, 15));
+   i32 = bxor(i32, (rshift(i32, 10)));
+   i32 = i32 + lshift(i32, 3);
+   i32 = bxor(i32, rshift(i32, 6));
+   i32 = i32 + bnot(lshift(i32, 11));
+   i32 = bxor(i32, rshift(i32, 16));
+   return i32;
+}
+
+var uint32_ptr_t = ffi.typeof("uint32_t*");
+var function make_cdata_hash_function(sizeof) {
+   assert(sizeof >= 4);
+   assert(sizeof % 4 == 0);
+
+   var rounds = (sizeof / 4) - 1;
+   return function (cdata) {
+      cdata = ffi.cast(uint32_ptr_t, cdata);
+      var h = hash32(cdata[0]);
+      for( i = 1, rounds ) {
+         h = hash32(bxor(h, hash32(cdata[i])));
+      }
+      return h;
+   };
+}
+
+
+var flow_key_ipv4 = ffi.metatype("struct swall_flow_key_ipv4", {
+   __index = {
+      hash = make_cdata_hash_function(ffi.sizeof("struct swall_flow_key_ipv4")),
+      eth_type = function (this) { return ETH_TYPE_IPv4; },
+   }
+});
+
+var the_flow_key_ipv4 = flow_key_ipv4();
+
+var flow_key_ipv6 = ffi.metatype("struct swall_flow_key_ipv6", {
+   __index = {
+      hash = make_cdata_hash_function(ffi.sizeof("struct swall_flow_key_ipv6")),
+      eth_type = function (this) { return ETH_TYPE_IPv6; },
+   }
+});
+
+var the_flow_key_ipv6 = flow_key_ipv6();
+
+// Helper functions
+
+//
+// Obtain the Internet Header Length (IHL) of an IPv4 packet, and return
+// its value converted to bytes.
+//
+var function ihl(p, offset) {
+   var ver_and_ihl = p.data[offset];
+   return band(ver_and_ihl, 0x0F) * 4;
+}
+
+//
+// Traverse an IPv6 header which has the following layout:
+//
+//     0         8        16
+//     | NextHdr | HdrLen | ...
+//
+//  where "NextHdr" is the type code of the next header, and "HdrLen" is the
+//  length of the header in 8-octet units, sans the first 8 octets.
+//
+var function ipv6_nexthdr_type_len_skip (p) {
+   return p[0], p + 8 + (p[1] * 8);
+}
+
+var ipv6_walk_header_funcs = {
+   [IPv6_NEXTHDR_HOPBYHOP] = ipv6_nexthdr_type_len_skip,
+   [IPv6_NEXTHDR_ROUTING]  = ipv6_nexthdr_type_len_skip,
+   [IPv6_NEXTHDR_DSTOPTS]  = ipv6_nexthdr_type_len_skip,
+   [IPv6_NEXTHDR_FRAGMENT] = function (p) {
+      return p[0], p + 8;
+   },
+   [IPv6_NEXTHDR_AH] = function (p) {
+      // Size specified in 4-octet units (plus two octets).
+      return p[0], p + 2 + (p[1] * 4);
+   },
+};
+
+//
+// Traverses all the IPv6 headers (using the "next header" fields) until an
+// upper-level protocol header (e.g. TCP, UDP) is found. The returned value
+// is the type of the upper level protocol code and pointer to the beginning
+// of the upper level protocol header data.
+//
+var function ipv6_walk_headers (p, offset) {
+   var ptr = p.data + offset;
+   var nexthdr = ptr[IPv6_NEXTHDR_OFFSET];
+   while( ipv6_walk_header_funcs[nexthdr] ) {
+      var new_nexthdr, new_ptr = ipv6_walk_header_funcs[nexthdr](ptr);
+      if( new_ptr > p.data + p.length ) {
+         break;
+      }
+      nexthdr, ptr = new_nexthdr, new_ptr;
+   }
+   return nexthdr, ptr;
+}
+
+
+Scanner = subClass();
+Scanner._name = "SnabbWall base packet Scanner";
+
+function Scanner::extract_packet_info(p) {
+   var eth_type  = rd16(p.data + ETH_TYPE_OFFSET);
+   var ip_offset = ETH_HEADER_SIZE;
+   var vlan_id   = 0;
+
+   while( eth_type == ETH_TYPE_VLAN ) {
+      vlan_id   = rd16(p.data + ip_offset);
+      eth_type  = rd16(p.data + ip_offset + 2);
+      ip_offset +=   4;
+   }
+
+   var key, src_addr, src_port, dst_addr, dst_port, ip_proto;
+   if( eth_type == ETH_TYPE_IPv4 ) {
+      key = the_flow_key_ipv4;
+      src_addr = p.data + ip_offset + IPv4_SRC_ADDR_OFFSET;
+      dst_addr = p.data + ip_offset + IPv4_DST_ADDR_OFFSET;
+      if( ipv4_addr_cmp(src_addr, dst_addr) <= 0 ) {
+         ffi.copy(key.lo_addr, src_addr, 4);
+         ffi.copy(key.hi_addr, dst_addr, 4);
+      } else {
+         ffi.copy(key.lo_addr, dst_addr, 4);
+         ffi.copy(key.hi_addr, src_addr, 4);
+      }
+
+      ip_proto = p.data[ip_offset + IPv4_PROTO_OFFSET];
+      var ip_payload_offset = ip_offset + ihl(p, ip_offset);
+      if( ip_proto == IPv4_PROTO_TCP ) {
+         src_port = rd16(p.data + ip_payload_offset + TCP_SRC_PORT_OFFSET);
+         dst_port = rd16(p.data + ip_payload_offset + TCP_DST_PORT_OFFSET);
+      } else if( ip_proto == IPv4_PROTO_UDP ) {
+         src_port = rd16(p.data + ip_payload_offset + UDP_SRC_PORT_OFFSET);
+         dst_port = rd16(p.data + ip_payload_offset + UDP_DST_PORT_OFFSET);
+      }
+   } else if( eth_type == ETH_TYPE_IPv6 ) {
+      key = the_flow_key_ipv6;
+      src_addr = p.data + ip_offset + IPv6_SRC_ADDR_OFFSET;
+      dst_addr = p.data + ip_offset + IPv6_DST_ADDR_OFFSET;
+      if( ipv6_addr_cmp(src_addr, dst_addr) <= 0 ) {
+         ffi.copy(key.lo_addr, src_addr, 16);
+         ffi.copy(key.hi_addr, dst_addr, 16);
+      } else {
+         ffi.copy(key.lo_addr, dst_addr, 16);
+         ffi.copy(key.hi_addr, src_addr, 16);
+      }
+
+      var proto_header_ptr;
+      ip_proto, proto_header_ptr = ipv6_walk_headers (p, ip_offset);
+      if( ip_proto == IPv6_NEXTHDR_TCP ) {
+         src_port = rd16(proto_header_ptr + TCP_SRC_PORT_OFFSET);
+         dst_port = rd16(proto_header_ptr + TCP_DST_PORT_OFFSET);
+      } else if( ip_proto == IPv6_NEXTHDR_UDP ) {
+         src_port = rd16(proto_header_ptr + UDP_SRC_PORT_OFFSET);
+         dst_port = rd16(proto_header_ptr + UDP_DST_PORT_OFFSET);
+      }
+   } else {
+      return null;
+   }
+
+   key.vlan_id = vlan_id;
+   key.ip_proto = ip_proto;
+
+   if( src_port && dst_port ) {
+      if( src_port < dst_port ) {
+         key.lo_port, key.hi_port = src_port, dst_port;
+      } else {
+         key.lo_port, key.hi_port = dst_port, src_port;
+      }
+   }
+
+   return key, ip_offset, src_addr, src_port, dst_addr, dst_port;
+}
+
+function Scanner::get_flow(p) {
+   error("method must be overriden in a subclass");
+}
+
+function Scanner::flows() {
+   error("method must be overriden in a subclass");
+}
+
+function Scanner::scan_packet(p, time) {
+   error("method must be overriden in a subclass");
+}
+
+function Scanner::protocol_name(protocol) {
+   return tostring(protocol);
+}
+
+function selftest() {
+   var ipv6 = require("lib.protocol.ipv6");
+   var ipv4 = require("lib.protocol.ipv4");
+
+   { // Test comparison of IPv6 addresses
+      assert(ipv6_addr_cmp(ipv6->pton("2001:fd::1"),
+                           ipv6->pton("2001:fd::2")) <= 0);
+
+      var a = ipv6->pton("2001:fd48::01");
+      var b = ipv6->pton("2001:fd48::02");  // Last byte differs
+      var c = ipv6->pton("2002:fd48::01");  // Second byte differs
+      var d = ipv6->pton("2102:fd48::01");  // First byte differs
+
+      assert(ipv6_addr_cmp(a, a) == 0);
+      assert(ipv6_addr_cmp(b, b) == 0);
+      assert(ipv6_addr_cmp(c, c) == 0);
+      assert(ipv6_addr_cmp(d, d) == 0);
+
+      assert(ipv6_addr_cmp(a, b) < 0);
+      assert(ipv6_addr_cmp(a, c) < 0);
+      assert(ipv6_addr_cmp(a, d) < 0);
+
+      assert(ipv6_addr_cmp(b, a) > 0);
+      assert(ipv6_addr_cmp(b, c) < 0);
+      assert(ipv6_addr_cmp(b, d) < 0);
+
+      assert(ipv6_addr_cmp(c, a) > 0);
+      assert(ipv6_addr_cmp(c, b) > 0);
+      assert(ipv6_addr_cmp(c, d) < 0);
+   }
+
+   { // Test hashing of IPv4 flow keys
+      var function make_ipv4_key() {
+         var key = flow_key_ipv4();
+         key.vlan_id = 10;
+         key.ip_proto = IPv4_PROTO_UDP;
+         ffi.copy(key.lo_addr, ipv4->pton("10.0.0.1"), 4);
+         ffi.copy(key.hi_addr, ipv4->pton("10.0.0.2"), 4);
+         key.lo_port = 8080;
+         key.hi_port = 1010;
+         return key;
+      }
+      var k = make_ipv4_key();
+      assert(k->hash() == make_ipv4_key()->hash());
+      // Changing any value makes the hash vary
+      k.lo_port = 2020;
+      assert(k->hash() != make_ipv4_key()->hash());
+   }
+
+   { // Test hashing of IPv6 flow keys
+      var function make_ipv6_key() {
+         var key = flow_key_ipv6();
+         key.vlan_id = 42;
+         key.ip_proto = IPv6_NEXTHDR_TCP;
+         ffi.copy(key.lo_addr, ipv6->pton("2001:fd::1"), 16);
+         ffi.copy(key.hi_addr, ipv6->pton("2001:fd::2"), 16);
+         key.lo_port = 4040;
+         key.hi_port = 3030;
+         return key;
+      }
+      var k = make_ipv6_key();
+      assert(k->hash() == make_ipv6_key()->hash());
+      // Changing any value makes the hash vary
+      k.lo_port = IPv6_NEXTHDR_UDP;
+      assert(k->hash() != make_ipv6_key()->hash());
+   }
+
+   { // Test Scanner:extract_packet_info()
+      var s = Scanner->new();
+
+      var datagram = require("lib.protocol.datagram");
+      var ethernet = require("lib.protocol.ethernet");
+      var dg = datagram->new();
+      dg->push(ipv6->new({ src = ipv6->pton("2001:fd::1"),
+                         dst = ipv6->pton("2001:fd::2"),
+                         next_header = IPv6_NEXTHDR_NONE }));
+      dg->push(ethernet->new({ src = ethernet->pton("02:00:00:00:00:01"),
+                             dst = ethernet->pton("02:00:00:00:00:02"),
+                             type = lib.ntohs(ETH_TYPE_IPv6) }));
+
+      var key, ip_offset, src_addr, src_port, dst_addr, dst_port =
+            s->extract_packet_info(dg->packet());
+      assert(key.vlan_id == 0);
+      assert(key.ip_proto == IPv6_NEXTHDR_NONE);
+      assert(ipv6_addr_cmp(key.lo_addr, ipv6->pton("2001:fd::1")) == 0);
+      assert(ipv6_addr_cmp(key.hi_addr, ipv6->pton("2001:fd::2")) == 0);
+      assert(key.lo_port == 0);
+      assert(key.hi_port == 0);
+   }
+
+   print("selftest ok");
+}

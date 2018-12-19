@@ -1,0 +1,100 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+module(..., package.seeall);
+var pci = require("lib.hardware.pci");
+var RawSocket = require("apps.socket.raw").RawSocket;
+var LearningBridge = require("apps.bridge.learning").bridge;
+var FloodingBridge = require("apps.bridge.flooding").bridge;
+var vlan = require("apps.vlan.vlan");
+var basic_apps = require("apps.basic.basic_apps");
+var Synth = require("apps.test.synth").Synth;
+
+function configure (c, ports, io) {
+   var links;
+   if( io && io.pci ) {
+      var device = pci.device_info(io.pci);
+      if( device && device.driver ) {
+         links = configureVMDq(c, device, ports);
+      } else {
+         error("Unknown device: "..io.pci);
+      }
+   } else {
+      var Switch = "Switch";
+      var switch_ports = {};
+      for( i, port in ipairs(ports) ) {
+         switch_ports[i] = port_name(port);
+      }
+      var Trunk;
+      if( io && io.iface ) {
+         config.app(c, "TrunkIface", RawSocket, io.iface);
+         Trunk = {port = "TrunkIface",
+                  input = "TrunkIface.rx",
+                  output = "TrunkIface.tx"};
+      }
+      if( io && io.bench ) {
+         config.app(c, "BenchSource", Synth, io.bench);
+         config.app(c, "BenchSink", basic_apps.Sink);
+         Trunk = {port = "TrunkBench",
+                  input = "BenchSink.rx",
+                  output = "BenchSource.tx"};
+      }
+      if( Trunk ) { switch_ports[#switch_ports+1] = Trunk.port; }
+      if( #ports <= 2 ) {
+         config.app(c, Switch, FloodingBridge, {ports = switch_ports});
+      } else {
+         config.app(c, Switch, LearningBridge, {ports = switch_ports});
+      }
+      if( Trunk ) {
+         config.link(c, Trunk.output.." -> "..Switch.."."..Trunk.port);
+         config.link(c, Switch.."."..Trunk.port.." -> "..Trunk.input);
+      }
+      links = {};
+      for( i, port in ipairs(ports) ) {
+         var name = port_name(port);
+         var Switch_link = Switch.."."..name;
+         var Port_tx, Port_rx = Switch_link, Switch_link;
+         if( port.vlan ) {
+            var VlanTag, VlanUntag = name.."_VlanTag", name.."_VlanUntag";
+            config.app(c, VlanTag, vlan.Tagger, {tag = port.vlan});
+            config.link(c, VlanTag..".output -> "..Port_rx);
+            Port_rx = VlanTag..".input";
+            config.app(c, VlanUntag, vlan.Untagger, {tag = port.vlan});
+            config.link(c, Port_tx.." -> "..VlanUntag..".input");
+            Port_tx = VlanUntag..".output";
+         }
+         links[i] = {input = Port_rx, output = Port_tx};
+      }
+   }
+   return links;
+}
+
+// Return name of port in <port_config>.
+function port_name (port_config) {
+   return port_config.port_id->gsub("-", "_");
+}
+
+function configureVMDq (c, device, ports) {
+   var links = {};
+   for( i, port in ipairs(ports) ) {
+      var name = port_name(port);
+      var NIC = name.."_NIC";
+      var vmdq = true;
+      if( ! port.mac_address ) {
+         if( #ports != 1 ) {
+            error("multiple ports defined but promiscuous mode requested for port: "..name);
+         }
+         if( port.vlan ) {
+            error("vlan specified but promiscuous mode requested for port: "..name);
+         }
+         vmdq = false;
+      }
+      config.app(c, NIC, require(device.driver).driver,
+                 {pciaddr = device.pciaddress,
+                  vmdq = vmdq,
+                  macaddr = port.mac_address,
+                  vlan = port.vlan});
+      links[i] = {input = NIC.."."..device.rx,
+                  output = NIC.."."..device.tx};
+   }
+   return links;
+}

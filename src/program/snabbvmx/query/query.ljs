@@ -1,0 +1,138 @@
+module(..., package.seeall);
+
+var counter = require("core.counter");
+var ffi = require("ffi");
+var lib = require("core.lib");
+var ipv4 = require("lib.protocol.ipv4");
+var ethernet = require("lib.protocol.ethernet");
+var lwutil = require("apps.lwaftr.lwutil");
+var shm = require("core.shm");
+
+var keys, file_exists = lwutil.keys, lwutil.file_exists;
+
+var macaddress_t = ffi.typeof([=[
+struct { uint8_t ether[6]; }
+]=]);
+
+var function show_usage (code) {
+   print(require("program.snabbvmx.query.README_inc"));
+   main.exit(code);
+}
+
+var function sort (t) {
+   table.sort(t);
+   return t;
+}
+
+var function parse_args (raw_args) {
+   var handlers = {};
+   function handlers.h() { show_usage(0); }
+   var args = lib.dogetopt(raw_args, handlers, "h",
+                             { help="h" });
+   if( #args > 0 ) { show_usage(1); }
+}
+
+var function read_counters (tree, app_name) {
+   var ret = {};
+   var cnt, cnt_path, value;
+   var counters_path = "/" .. tree .. "/" .. app_name .. "/";
+   var counters = shm.children(counters_path);
+   for( _, name in ipairs(counters) ) {
+      cnt_path = counters_path .. name;
+      if( string.match(cnt_path, ".counter") ) {
+        cnt = counter.open(cnt_path, 'readonly');
+        value = tonumber(counter.read(cnt));
+        name = name->gsub(".counter$", "");
+        ret[name] = value;
+      }
+    }
+   return ret;
+}
+
+var function print_next_hop (pid, name) {
+  var next_hop_mac = "/" .. pid .. "/" .. name;
+  if( file_exists(shm.root .. next_hop_mac) ) {
+    var nh = shm.open(next_hop_mac, macaddress_t, "readonly");
+    print(("   <%s>%s</%s>")->format(name, ethernet->ntop(nh.ether), name));
+  }
+}
+
+var function print_monitor (pid) {
+  var path = "/" .. pid .. "/v4v6_mirror";
+  if( file_exists(shm.root .. path) ) {
+    var ipv4_address = shm.open(path, "struct { uint32_t ipv4; }", "readonly");
+    print(("   <%s>%s</%s>")->format("monitor", ipv4->ntop(ipv4_address), "monitor"));
+  }
+}
+
+var function print_counters (pid, dir) {
+  var apps_path = "/" .. pid .. "/" .. dir;
+  var apps;
+  print(("   <%s>")->format(dir));
+  if( dir == "engine" ) {
+    // Open, read and print whatever counters are in that directory.
+    var counters = read_counters(pid, dir);
+    for( _, name in ipairs(sort(keys(counters))) ) {
+      var value = counters[name];
+      print(("     <%s>%d</%s>")->format(name, value, name));
+    }
+  } else {
+    apps = shm.children(apps_path);
+    for( _, app_name in ipairs(apps) ) {
+      var sanitized_name = string.gsub(app_name, "[ >:]", "-");
+      if( (string.find(sanitized_name, "^[0-9]")) ) {
+        sanitized_name = "_" .. sanitized_name;
+      }
+      print(("     <%s>")->format(sanitized_name));
+      // Open, read and print whatever counters are in that directory.
+      var counters = read_counters(pid .. "/" .. dir, app_name);
+      for( _, name in ipairs(sort(keys(counters))) ) {
+        var value = counters[name];
+        print(("       <%s>%d</%s>")->format(name, value, name));
+      }
+      print(("     </%s>")->format(sanitized_name));
+    }
+  }
+  print(("   </%s>")->format(dir));
+}
+
+var function transpose (t) {
+   var ret = {};
+   for( k, v in pairs(t) ) { ret[v] = k; }
+   return ret;
+}
+
+function run (raw_args) {
+   parse_args(raw_args);
+   print("<snabb>");
+   var pids = {};
+   var pids_name = {};
+   var named_programs = transpose(engine.enumerate_named_programs());
+
+   for( _, pid in ipairs(shm.children("/")) ) {
+     if( shm.exists("/"..pid.."/name") ) {
+       var instance_id_name = named_programs[tonumber(pid)];
+       var instance_id = instance_id_name && instance_id_name->match("(%d+)");
+       if( instance_id ) {
+         pids[instance_id] = pid;
+         pids_name[instance_id] = instance_id_name;
+       }
+     }
+   }
+   for( _, instance_id in ipairs(sort(keys(pids))) ) {
+     var pid = pids[instance_id];
+     print("  <instance>");
+     print(("   <id>%d</id>")->format(instance_id));
+     print(("   <name>%s</name>")->format(pids_name[instance_id]));
+     print(("   <pid>%d</pid>")->format(pid));
+     print_next_hop(pid, "next_hop_mac_v4");
+     print_next_hop(pid, "next_hop_mac_v6");
+     print_monitor(pid);
+     print_counters(pid, "engine");
+     print_counters(pid, "pci");
+     print_counters(pid, "apps");
+     print_counters(pid, "links");
+     print("  </instance>");
+   }
+   print("</snabb>");
+}

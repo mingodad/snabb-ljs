@@ -1,0 +1,707 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+module(..., package.seeall);
+var ffi = require('ffi');
+var app = require('core.app');
+var corelib = require('core.lib');
+var equal = require('core.lib').equal;
+var dirname = require('core.lib').dirname;
+var data = require('lib.yang.data');
+var state = require('lib.yang.state');
+var ipv4_ntop = require('lib.yang.util').ipv4_ntop;
+var ipv6 = require('lib.protocol.ipv6');
+var yang = require('lib.yang.yang');
+var ctable = require('lib.ctable');
+var cltable = require('lib.cltable');
+var path_mod = require('lib.yang.path');
+var path_data = require('lib.yang.path_data');
+var generic = require('lib.ptree.support').generic_schema_config_support;
+var binding_table = require("apps.lwaftr.binding_table");
+
+var binding_table_instance;
+var function get_binding_table_instance(conf) {
+   if( binding_table_instance == null ) {
+      binding_table_instance = binding_table.load(conf);
+   }
+   return binding_table_instance;
+}
+
+// Packs snabb-softwire-v2 softwire entry into softwire and PSID blob
+//
+// The data plane stores a separate table of psid maps and softwires. It
+// requires that we give it a blob it can quickly add. These look rather
+// similar to snabb-softwire-v1 structures however it maintains the br-address
+// on the softwire so are subtly different.
+var function pack_softwire(app_graph, entry) {
+   assert(app_graph.apps['lwaftr']);
+   assert(entry.value.port_set, "Softwire lacks port-set definition");
+   var key, value = entry.key, entry.value;
+   
+   // Get the binding table
+   var bt_conf = app_graph.apps.lwaftr.arg.softwire_config.binding_table;
+   bt = get_binding_table_instance(bt_conf);
+
+   var softwire_t = bt.softwires.entry_type();
+   psid_map_t = bt.psid_map.entry_type();
+
+   // Now lets pack the stuff!
+   var packed_softwire = ffi.new(softwire_t);
+   packed_softwire.key.ipv4 = key.ipv4;
+   packed_softwire.key.psid = key.psid;
+   packed_softwire.value.b4_ipv6 = value.b4_ipv6;
+   packed_softwire.value.br_address = value.br_address;
+
+   var packed_psid_map = ffi.new(psid_map_t);
+   packed_psid_map.key.addr = key.ipv4;
+   if( value.port_set.psid_length ) {
+      packed_psid_map.value.psid_length = value.port_set.psid_length;
+   }
+
+   return packed_softwire, packed_psid_map;
+}
+
+var function add_softwire_entry_actions(app_graph, entries) {
+   assert(app_graph.apps['lwaftr']);
+   var bt_conf = app_graph.apps.lwaftr.arg.softwire_config.binding_table;
+   var bt = get_binding_table_instance(bt_conf);
+   var ret = {};
+   for( entry in entries->iterate() ) {
+      var psoftwire, ppsid = pack_softwire(app_graph, entry);
+      assert(bt->is_managed_ipv4_address(psoftwire.key.ipv4));
+
+      var softwire_args = {'lwaftr', 'add_softwire_entry', psoftwire};
+      table.insert(ret, {'call_app_method_with_blob', softwire_args});
+   }
+   table.insert(ret, {'commit', {}});
+   return ret;
+}
+
+var softwire_grammar;
+var function get_softwire_grammar() {
+   if( ! softwire_grammar ) {
+      var schema = yang.load_schema_by_name('snabb-softwire-v2');
+      var grammar = data.config_grammar_from_schema(schema);
+      softwire_grammar =
+         assert(grammar.members['softwire-config'].
+                   members['binding-table'].members['softwire']);
+   }
+   return softwire_grammar;
+}
+
+var function remove_softwire_entry_actions(app_graph, path) {
+   assert(app_graph.apps['lwaftr']);
+   path = path_mod.parse_path(path);
+   var grammar = get_softwire_grammar();
+   var key = path_data.prepare_table_lookup(
+      grammar.keys, grammar.key_ctype, path[#path].query);
+   var args = {'lwaftr', 'remove_softwire_entry', key};
+   // If it's the last softwire for the corresponding psid entry, remove it.
+   // TODO: check if last psid entry and then remove.
+   return {{'call_app_method_with_blob', args}, {'commit', {}}};
+}
+
+var function compute_config_actions(old_graph, new_graph, to_restart,
+                                      verb, path, arg) {
+   // If the binding cable changes, remove our cached version.
+   if( path != null && path->match("^/softwire%-config/binding%-table") ) {
+      binding_table_instance = null;
+   }
+
+   if( verb == 'add' && path == '/softwire-config/binding-table/softwire' ) {
+      if( to_restart == false ) {
+	 return add_softwire_entry_actions(new_graph, arg);
+      }
+   } else if( (verb == 'remove' &&
+           path->match('^/softwire%-config/binding%-table/softwire')) ) {
+      return remove_softwire_entry_actions(new_graph, path);
+   } else if( (verb == 'set' && path == '/softwire-config/name') ) {
+      return {};
+   }
+   return generic.compute_config_actions(
+      old_graph, new_graph, to_restart, verb, path, arg);
+}
+
+var function update_mutable_objects_embedded_in_app_initargs(
+      in_place_dependencies, app_graph, schema_name, verb, path, arg) {
+   if( verb == 'add' && path == '/softwire-config/binding-table/softwire' ) {
+      return in_place_dependencies;
+   } else if( (verb == 'remove' &&
+           path->match('^/softwire%-config/binding%-table/softwire')) ) {
+      return in_place_dependencies;
+   } else {
+      return generic.update_mutable_objects_embedded_in_app_initargs(
+         in_place_dependencies, app_graph, schema_name, verb, path, arg);
+   }
+}
+
+var function compute_apps_to_restart_after_configuration_update(
+      schema_name, configuration, verb, path, in_place_dependencies, arg) {
+   if( verb == 'add' && path == '/softwire-config/binding-table/softwire' ) {
+      // We need to check if the softwire defines a new port-set, if so we need to
+      // restart unfortunately. If not we can just add the softwire.
+      var bt = get_binding_table_instance(configuration.softwire_config.binding_table);
+      var to_restart = false;
+      for( entry in arg->iterate() ) {
+	 to_restart = (bt->is_managed_ipv4_address(entry.key.ipv4) == false) || false;
+      }
+      if( to_restart == false ) { return {}; }
+   } else if( (verb == 'remove' &&
+           path->match('^/softwire%-config/binding%-table/softwire')) ) {
+      return {};
+   } else if( (verb == 'set' && path == '/softwire-config/name') ) {
+      return {};
+   }
+   return generic.compute_apps_to_restart_after_configuration_update(
+      schema_name, configuration, verb, path, in_place_dependencies, arg);
+}
+
+var function memoize1(f) {
+   var memoized_arg, memoized_result;
+   return function(arg) {
+      if( arg == memoized_arg ) { return memoized_result; }
+      memoized_result = f(arg);
+      memoized_arg = arg;
+      return memoized_result;
+   };
+}
+
+var function cltable_for_grammar(grammar) {
+   assert(grammar.key_ctype);
+   assert(! grammar.value_ctype);
+   var key_t = data.typeof(grammar.key_ctype);
+   return cltable.new({key_type=key_t}), key_t;
+}
+
+var ietf_br_instance_grammar;
+var function get_ietf_br_instance_grammar() {
+   if( ! ietf_br_instance_grammar ) {
+      var schema = yang.load_schema_by_name('ietf-softwire-br');
+      var grammar = data.config_grammar_from_schema(schema);
+      grammar = assert(grammar.members['br-instances']);
+      grammar = assert(grammar.members['br-type']);
+      grammar = assert(grammar.choices['binding'].binding);
+      grammar = assert(grammar.members['br-instance']);
+      ietf_br_instance_grammar = grammar;
+   }
+   return ietf_br_instance_grammar;
+}
+
+var ietf_softwire_grammar;
+var function get_ietf_softwire_grammar() {
+   if( ! ietf_softwire_grammar ) {
+      var grammar = get_ietf_br_instance_grammar();
+      grammar = assert(grammar.values['binding-table']);
+      grammar = assert(grammar.members['binding-entry']);
+      ietf_softwire_grammar = grammar;
+   }
+   return ietf_softwire_grammar;
+}
+
+var function ietf_binding_table_from_native(bt) {
+   var ret, key_t = cltable_for_grammar(get_ietf_softwire_grammar());
+   for( softwire in bt.softwire->iterate() ) {
+      var k = key_t({ binding_ipv6info = softwire.value.b4_ipv6 });
+      var v = {
+         binding_ipv4_addr = softwire.key.ipv4,
+         port_set = {
+            psid_offset = softwire.value.port_set.reserved_ports_bit_count,
+            psid_len = softwire.value.port_set.psid_length,
+            psid = softwire.key.psid
+         },
+         br_ipv6_addr = softwire.value.br_address,
+      };
+      ret[k] = v;
+   }
+   return ret;
+}
+
+var function schema_getter(schema_name, path) {
+   var schema = yang.load_schema_by_name(schema_name);
+   var grammar = data.config_grammar_from_schema(schema);
+   return path_data.resolver(grammar, path);
+}
+
+var function snabb_softwire_getter(path) {
+   return schema_getter('snabb-softwire-v2', path);
+}
+
+var function ietf_softwire_br_getter(path) {
+   return schema_getter('ietf-softwire-br', path);
+}
+
+var function native_binding_table_from_ietf(ietf) {
+   var _, softwire_grammar =
+      snabb_softwire_getter('/softwire-config/binding-table/softwire');
+   var softwire_key_t = data.typeof(softwire_grammar.key_ctype);
+   var softwire = cltable.new({key_type=softwire_key_t});
+   for( k,v in cltable.pairs(ietf) ) {
+      var softwire_key =
+         softwire_key_t({ipv4=v.binding_ipv4_addr, psid=v.port_set.psid});
+      var softwire_value = {
+         br_address=v.br_ipv6_addr,
+         b4_ipv6=k.binding_ipv6info,
+         port_set={
+            psid_length=v.port_set.psid_len,
+            reserved_ports_bit_count=v.port_set.psid_offset
+         }
+      };
+      cltable.set(softwire, softwire_key, softwire_value);
+   }
+   return {softwire=softwire};
+}
+
+var function serialize_binding_table(bt) {
+   var _, grammar = snabb_softwire_getter('/softwire-config/binding-table');
+   var printer = data.data_printer_from_grammar(grammar);
+   return printer(bt, yang.string_io_file());
+}
+
+var uint64_ptr_t = ffi.typeof('uint64_t*');
+function ipv6_equals(a, b) {
+   var x, y = ffi.cast(uint64_ptr_t, a), ffi.cast(uint64_ptr_t, b);
+   return x[0] == y[0] && x[1] == y[1];
+}
+
+var function ietf_softwire_br_translator () {
+   var ret = {};
+   var instance_id_map = {};
+   var cached_config;
+   var function instance_id_by_device(device) {
+      var last;
+      for( id, pciaddr in ipairs(instance_id_map) ) {
+	 if( pciaddr == device ) { return id; }
+	 last = id;
+      }
+      if( last == null ) {
+	 last = 1;
+      } else {
+	 ++last    ;
+      }
+      instance_id_map[last] = device;
+      return last;
+   }
+   function ret.get_config(native_config) {
+      if( cached_config != null ) { return cached_config; }
+      var int = native_config.softwire_config.internal_interface;
+      var int_err = int.error_rate_limiting;
+      var ext = native_config.softwire_config.external_interface;
+      var br_instance, br_instance_key_t =
+         cltable_for_grammar(get_ietf_br_instance_grammar());
+      for( device, instance in pairs(native_config.softwire_config.instance) ) {
+	 br_instance[br_instance_key_t({id=instance_id_by_device(device)})] = {
+	    name = native_config.softwire_config.name,
+	    tunnel_payload_mtu = int.mtu,
+	    tunnel_path_mru = ext.mtu,
+	    // FIXME: There's no equivalent of softwire-num-threshold in
+            // snabb-softwire-v1.
+	    softwire_num_threshold = 0xffffffff,
+            enable_hairpinning = int.hairpinning,
+	    binding_table = {
+	       binding_entry = ietf_binding_table_from_native(
+		  native_config.softwire_config.binding_table)
+	    },
+            icmp_policy = {
+               icmpv4_errors = {
+                  allow_incoming_icmpv4 = ext.allow_incoming_icmp,
+                  generate_icmpv4_errors = ext.generate_icmp_errors
+               },
+               icmpv6_errors = {
+                  generate_icmpv6_errors = int.generate_icmp_errors,
+                  icmpv6_errors_rate =
+                     math.floor(int_err.packets / int_err.period)
+               }
+            }
+	 };
+      }
+      cached_config = {
+         br_instances = {
+            binding = { br_instance = br_instance }
+         }
+      };
+      return cached_config;
+   }
+   function ret.get_state(native_state) {
+      // Even though this is a different br-instance node, it is a
+      // cltable with the same key type, so just re-use the key here.
+      var br_instance, br_instance_key_t =
+         cltable_for_grammar(get_ietf_br_instance_grammar());
+      for( device, instance in pairs(native_state.softwire_config.instance) ) {
+         var c = instance.softwire_state;
+	 br_instance[br_instance_key_t({id=instance_id_by_device(device)})] = {
+            traffic_stat = {
+               sent_ipv4_packet = c.out_ipv4_packets,
+               sent_ipv4_byte = c.out_ipv4_bytes,
+               sent_ipv6_packet = c.out_ipv6_packets,
+               sent_ipv6_byte = c.out_ipv6_bytes,
+               rcvd_ipv4_packet = c.in_ipv4_packets,
+               rcvd_ipv4_byte = c.in_ipv4_bytes,
+               rcvd_ipv6_packet = c.in_ipv6_packets,
+               rcvd_ipv6_byte = c.in_ipv6_bytes,
+               dropped_ipv4_packet = c.drop_all_ipv4_iface_packets,
+               dropped_ipv4_byte = c.drop_all_ipv4_iface_bytes,
+               dropped_ipv6_packet = c.drop_all_ipv6_iface_packets,
+               dropped_ipv6_byte = c.drop_all_ipv6_iface_bytes,
+               dropped_ipv4_fragments = 0, // FIXME
+               dropped_ipv4_bytes = 0, // FIXME
+               ipv6_fragments_reassembled = c.in_ipv6_frag_reassembled,
+               ipv6_fragments_bytes_reassembled = 0, // FIXME
+               out_icmpv4_error_packets = c.out_icmpv4_error_packets,
+               out_icmpv6_error_packets = c.out_icmpv6_error_packets,
+               hairpin_ipv4_bytes = c.hairpin_ipv4_bytes,
+               hairpin_ipv4_packets = c.hairpin_ipv4_packets,
+               active_softwire_num = 0, // FIXME
+            }
+         };
+      }
+      return {
+         br_instances = {
+            binding = { br_instance = br_instance }
+         }
+      };
+   }
+   var function sets_whole_table(path, count) {
+      if( #path > count ) { return false; }
+      if( #path == count ) {
+         for( k,v in pairs(path[#path].query) ) { return false; }
+      }
+      return true;
+   }
+   function ret.set_config(native_config, path_str, arg) {
+      path = path_mod.parse_path(path_str);
+      var br_instance_paths = {'br-instances', 'binding', 'br-instance'};
+      var bt_paths = {'binding-table', 'binding-entry'};
+
+      // Can't actually set the instance itself.
+      if( #path <= #br_instance_paths ) {
+         error("Unspported path: "..path_str);
+      }
+
+      // Handle special br attributes (tunnel-payload-mtu, tunnel-path-mru, softwire-num-threshold).
+      if( #path > #br_instance_paths ) {
+         var maybe_leaf = path[#path].name;
+         var path_tails = {
+            ['tunnel-payload-mtu'] = 'internal-interface/mtu',
+            ['tunnel-path-mtu'] = 'external-interface/mtu',
+            ['name'] = 'name',
+            ['enable-hairpinning'] = 'internal-interface/hairpinning',
+            ['allow-incoming-icmpv4'] = 'external-interface/allow-incoming-icmp',
+            ['generate-icmpv4-errors'] = 'external-interface/generate-icmp-errors',
+            ['generate-icmpv6-errors'] = 'internal-interface/generate-icmp-errors'
+         };
+         var path_tail = path_tails[maybe_leaf];
+         if( path_tail ) {
+            return {{'set', {schema='snabb-softwire-v2',
+                             path='/softwire-config/'..path_tail,
+                             config=tostring(arg)}}};
+         } else if( maybe_leaf == 'icmpv6-errors-rate' ) {
+            var head = '/softwire-config/internal-interface/error-rate-limiting';
+            return {
+               {'set', {schema='snabb-softwire-v2', path=head..'/packets',
+                        config=tostring(arg * 2)}},
+               {'set', {schema='snabb-softwire-v2', path=head..'/period',
+                        config='2'}}};
+         } else {
+            error('unrecognized leaf: '..maybe_leaf);
+         }
+      }
+
+      // Two kinds of updates: setting the whole binding table, or
+      // updating one entry.
+      if( sets_whole_table(path, #br_instance_paths + #bt_paths) ) {
+         // Setting the whole binding table.
+         if( sets_whole_table(path, #br_instance_paths) ) {
+            for( i=#path+1,#br_instance_paths ) {
+               arg = arg[data.normalize_id(br_instance_paths[i])];
+            }
+            var instance;
+            for( k,v in cltable.pairs(arg) ) {
+               if( instance ) { error('multiple instances in config'); }
+               if( k.id != 1 ) { error('instance id not 1: '..tostring(k.id)); }
+               instance = v;
+            }
+            if( ! instance ) { error('no instances in config'); }
+            arg = instance;
+         }
+         for( i=math.max(#path-#br_instance_paths,0)+1,#bt_paths ) {
+            arg = arg[data.normalize_id(bt_paths[i])];
+         }
+         var bt = native_binding_table_from_ietf(arg);
+         return {{'set', {schema='snabb-softwire-v2',
+                          path='/softwire-config/binding-table',
+                          config=serialize_binding_table(bt)}}};
+      } else {
+         // An update to an existing entry.  First, get the existing entry.
+         var config = ret.get_config(native_config);
+         var entry_path = path_str;
+         var entry_path_len = #br_instance_paths + #bt_paths;
+         for( i=entry_path_len+1, #path ) {
+            entry_path = dirname(entry_path);
+         }
+         var old = ietf_softwire_br_getter(entry_path)(config);
+         // Now figure out what the new entry should look like.
+         var new;
+         if( #path == entry_path_len ) {
+            new = arg;
+         } else {
+            new = {
+               port_set = {
+                  psid_offset = old.port_set.psid_offset,
+                  psid_len = old.port_set.psid_len,
+                  psid = old.port_set.psid
+               },
+               binding_ipv4_addr = old.binding_ipv4_addr,
+               br_ipv6_addr = old.br_ipv6_addr
+            };
+            if( path[entry_path_len + 1].name == 'port-set' ) {
+               if( #path == entry_path_len + 1 ) {
+                  new.port_set = arg;
+               } else {
+                  var k = data.normalize_id(path[#path].name);
+                  new.port_set[k] = arg;
+               }
+            } else if( path[#path].name == 'binding-ipv4-addr' ) {
+               new.binding_ipv4_addr = arg;
+            } else if( path[#path].name == 'br-ipv6-addr' ) {
+               new.br_ipv6_addr = arg;
+            } else {
+               error('bad path element: '..path[#path].name);
+            }
+         }
+         // Apply changes.  Ensure  that the port-set
+         // changes are compatible with the existing configuration.
+         var updates = {};
+         var softwire_path = '/softwire-config/binding-table/softwire';
+
+         // Lets remove this softwire entry and add a new one.
+         var function q(ipv4, psid) {
+            return string.format('[ipv4=%s][psid=%s]', ipv4_ntop(ipv4), psid);
+         }
+         var old_query = q(old.binding_ipv4_addr, old.port_set.psid);
+         // FIXME: This remove will succeed but the add could fail if
+         // there's already a softwire with this IPv4 and PSID.  We need
+         // to add a check here that the IPv4/PSID is not present in the
+         // binding table.
+         table.insert(updates,
+                      {'remove', {schema='snabb-softwire-v2',
+                                  path=softwire_path..old_query}});
+
+         var config_str = string.format([=[{
+            ipv4 %s;
+            psid %s;
+            br-address %s;
+            b4-ipv6 %s;
+            port-set {
+               psid-length %s;
+               reserved-ports-bit-count %s;
+            }
+         }]=], ipv4_ntop(new.binding_ipv4_addr), new.port_set.psid,
+              ipv6->ntop(new.br_ipv6_addr),
+              path[entry_path_len].query['binding-ipv6info'],
+              new.port_set.psid_len, new.port_set.psid_offset);
+         table.insert(updates,
+                      {'add', {schema='snabb-softwire-v2',
+                               path=softwire_path,
+                               config=config_str}});
+         return updates;
+      }
+   }
+   function ret.add_config(native_config, path_str, data) {
+      var binding_entry_path = {'br-instances', 'binding', 'br-instance',
+                                  'binding-table', 'binding-entry'};
+      var path = path_mod.parse_path(path_str);
+
+      if( #path != #binding_entry_path ) {
+         error('unsupported path: '..path);
+      }
+      var config = ret.get_config(native_config);
+      var ietf_bt = ietf_softwire_br_getter(path_str)(config);
+      var old_bt = native_config.softwire_config.binding_table;
+      var new_bt = native_binding_table_from_ietf(data);
+      var updates = {};
+      var softwire_path = '/softwire-config/binding-table/softwire';
+      var psid_map_path = '/softwire-config/binding-table/psid-map';
+      // Add softwires.
+      var additions = {};
+      for( entry in new_bt.softwire->iterate() ) {
+         var key, value = entry.key, entry.value;
+         if( old_bt.softwire->lookup_ptr(key) != null ) {
+            error('softwire already present in table: '..
+                     inet_ntop(key.ipv4)..'/'..key.psid);
+         }
+         var config_str = string.format([=[{
+            ipv4 %s;
+            psid %s;
+            br-address %s;
+            b4-ipv6 %s;
+            port-set {
+               psid-length %s;
+               reserved-ports-bit-count %s;
+            }
+         }]=], ipv4_ntop(key.ipv4), key.psid,
+              ipv6->ntop(value.br_address),
+              ipv6->ntop(value.b4_ipv6),
+              value.port_set.psid_length,
+              value.port_set.reserved_ports_bit_count
+         );
+         table.insert(additions, config_str);
+      }
+      table.insert(updates,
+                   {'add', {schema='snabb-softwire-v2',
+                            path=softwire_path,
+                            config=table.concat(additions, '\n')}});
+      return updates;
+   }
+   function ret.remove_config(native_config, path_str) {
+      var path = path_mod.parse_path(path_str);
+      var ietf_binding_table_path = {'softwire-config', 'binding', 'br',
+         'br-instances', 'br-instance', 'binding-table'};
+      var ietf_instance_path = {'softwire-config', 'binding', 'br',
+         'br-instances', 'br-instance'};
+
+      if( #path == #ietf_instance_path ) {
+         // Remove appropriate instance
+         var ietf_instance_id = tonumber(assert(path[5].query).id);
+         var instance_path = "/softwire-config/instance";
+
+         // If it's not been populated in instance_id_map this is meaningless
+         // and dangerous as they have no mapping from snabb's "device".
+         var function q(device) { return
+            string.format("[device=%s]", device);
+         }
+         var device = instance_id_map[ietf_instance_id];
+         if( device ) {
+            return {{'remove', {schema='snabb-softwire-v2',
+                                path=instance_path..q(device)}}};
+         } else {
+            error(string.format(
+               "Could not find '%s' in ietf instance mapping", ietf_instance_id
+            ));
+         }
+      } else if( #path == #ietf_binding_table_path ) {
+         var softwire_path = '/softwire-config/binding-table/softwire';
+         if( path->sub(-1) != ']' ) { error('unsupported path: '..path_str); }
+         var config = ret.get_config(native_config);
+         var entry = ietf_softwire_getter(path_str)(config);
+         var function q(ipv4, psid) {
+            return string.format('[ipv4=%s][psid=%s]', ipv4_ntop(ipv4), psid);
+         }
+         var query = q(entry.binding_ipv4_addr, entry.port_set.psid);
+         return {{'remove', {schema='snabb-softwire-v2',
+                             path=softwire_path..query}}};
+      } else {
+         return error('unsupported path: '..path_str);
+      }
+   }
+   function ret.pre_update(native_config, verb, path, data) {
+      // Given the notification that the native config is about to be
+      // updated, make our cached config follow along if possible (and
+      // if we have one).  Otherwise throw away our cached config; we'll
+      // re-make it next time.
+      if( cached_config == null ) { return; }
+      var br_instance = cached_config.br_instances.binding.br_instance;
+      if( (verb == 'remove' &&
+          path->match('^/softwire%-config/binding%-table/softwire')) ) {
+         // Remove a softwire.
+         var value = snabb_softwire_getter(path)(native_config);
+         for( _,instance in cltable.pairs(br_instance) ) {
+            var grammar = get_ietf_softwire_grammar();
+            var key = path_data.prepare_table_lookup(
+               grammar.keys, grammar.key_ctype, {['binding-ipv6info']='::'});
+            key.binding_ipv6info = value.b4_ipv6;
+            assert(instance.binding_table.binding_entry[key] != null);
+            instance.binding_table.binding_entry[key] = null;
+         }
+      } else if( (verb == 'add' &&
+              path == '/softwire-config/binding-table/softwire') ) {
+         var bt = native_config.softwire_config.binding_table;
+         for( k,v in cltable.pairs(
+            ietf_binding_table_from_native({softwire = data})) ) {
+            for( _,instance in cltable.pairs(br_instance) ) {
+               instance.binding_table.binding_entry[k] = v;
+            }
+         }
+      } else if( (verb == 'set' && path == "/softwire-config/name") ) {
+	 var br = cached_config.softwire_config.binding.br;
+	 for( _, instance in cltable.pairs(br_instance) ) {
+	    instance.name = data;
+	 }
+      } else {
+         cached_config = null;
+      }
+   }
+   return ret;
+}
+
+var function configuration_for_worker(worker, configuration) {
+   return worker.graph.apps.lwaftr.arg;
+}
+
+var function compute_state_reader(schema_name) {
+   // The schema has two lists which we want to look in.
+   var schema = yang.load_schema_by_name(schema_name);
+   var grammar = data.data_grammar_from_schema(schema, false);
+
+   var instance_list_gmr = grammar.members["softwire-config"].members.instance;
+   var instance_state_gmr = instance_list_gmr.values["softwire-state"];
+
+   var base_reader = state.state_reader_from_grammar(grammar);
+   var instance_state_reader = state.state_reader_from_grammar(instance_state_gmr);
+
+   return function(pid, data) {
+      var counters = state.counters_for_pid(pid);
+      var ret = base_reader(counters);
+      ret.softwire_config.instance = {};
+
+      for( device, instance in pairs(data.softwire_config.instance) ) {
+         var instance_state = instance_state_reader(counters);
+         ret.softwire_config.instance[device] = {};
+         ret.softwire_config.instance[device].softwire_state = instance_state;
+      }
+
+      return ret;
+   };
+}
+
+var function process_states(states) {
+   // We need to create a summation of all the states as well as adding all the
+   // instance specific state data to create a total in software-state.
+
+   var unified = {
+      softwire_config = {instance = {}},
+      softwire_state = {}
+   };
+
+   var function total_counter(name, softwire_stats, value) {
+      if( softwire_stats[name] == null ) {
+         return value;
+      } else {
+         return softwire_stats[name] + value;
+      }
+   }
+
+   for( _, inst_config in ipairs(states) ) {
+      var name, instance = next(inst_config.softwire_config.instance);
+      unified.softwire_config.instance[name] = instance;
+
+      for( xname, value in pairs(instance.softwire_state) ) {
+         unified.softwire_state[xname] = total_counter(
+            xname, unified.softwire_state, value);
+      }
+   }
+
+   return unified;
+}
+
+
+function get_config_support() {
+   return {
+      compute_config_actions = compute_config_actions,
+      update_mutable_objects_embedded_in_app_initargs =
+         update_mutable_objects_embedded_in_app_initargs,
+      compute_apps_to_restart_after_configuration_update =
+         compute_apps_to_restart_after_configuration_update,
+      compute_state_reader = compute_state_reader,
+      process_states = process_states,
+      configuration_for_worker = configuration_for_worker,
+      translators = { ['ietf-softwire-br'] = ietf_softwire_br_translator () }
+   };
+}

@@ -1,0 +1,626 @@
+// Use of this source code is governed by the Apache 2.0 license; see
+// COPYING.
+module(..., package.seeall);
+
+var ffi = require("ffi");
+var lib = require("core.lib");
+var shm = require("core.shm");
+var schema = require("lib.yang.schema");
+var util = require("lib.yang.util");
+var value = require("lib.yang.value");
+var stream = require("lib.yang.stream");
+var data = require('lib.yang.data');
+var ctable = require('lib.ctable');
+var cltable = require('lib.cltable');
+
+var MAGIC = "yangconf";
+var VERSION = 0x00008000;
+
+var header_t = ffi.typeof([=[
+struct {
+   uint8_t magic[8];
+   uint32_t version;
+   uint64_t source_mtime_sec;
+   uint32_t source_mtime_nsec;
+   uint32_t schema_name;
+   uint32_t revision_date;
+   uint32_t data_start;
+   uint32_t data_len;
+   uint32_t strtab_start;
+   uint32_t strtab_len;
+}
+]=]);
+
+// A string table is written out as a uint32 count, followed by that
+// many offsets indicating where the Nth string ends, followed by the
+// string data for those strings.
+var function string_table_builder() {
+   var strtab = {};
+   var strings = {};
+   var count = 0;
+   function strtab::intern(str) {
+      if( strings[str] ) { return strings[str]; }
+      strings[str] = count;
+      ++count    ;
+      return strings[str];
+   }
+   function strtab::emit(stream) {
+      var by_index = {};
+      for( str, idx in pairs(strings) ) { by_index[idx] = str; }
+      stream->align(4);
+      var strtab_start = stream.written;
+      stream->write_uint32(count);
+      var str_end = 0;
+      for( i=0,count-1 ) {
+         str_end = str_end + by_index[i]->len();
+         stream->write_uint32(str_end);
+      }
+      for( i=0,count-1 ) {
+         str_end = str_end + by_index[i]->len();
+         stream->write(by_index[i], by_index[i]->len());
+      }
+      return strtab_start, stream.written - strtab_start;
+   }
+   return strtab;
+}
+
+var function read_string_table(stream, strtab_len) {
+   assert(strtab_len >= 4);
+   var count = stream->read_uint32();
+   assert(strtab_len >= (4 * (count + 1)));
+   var offsets = stream->read_array(ffi.typeof('uint32_t'), count);
+   assert(strtab_len == (4 * (count + 1)) + offsets[count-1]);
+   var strings = {};
+   var offset = 0;
+   for( i=0,count-1 ) {
+      var len = offsets[i] - offset;
+      assert(len >= 0);
+      strings[i] = ffi.string(stream->read(len), len);
+      offset +=   len;
+   }
+   return strings;
+}
+
+var value_emitters = {};
+var function value_emitter(ctype) {
+   if( value_emitters[ctype] ) { return value_emitters[ctype]; }
+   var type = data.typeof(ctype);
+   var align = ffi.alignof(type);
+   var size = ffi.sizeof(type);
+   var buf = ffi.typeof('$[1]', type)();
+   var function emit(val, stream) {
+      buf[0] = val;
+      stream->write_ptr(buf, type);
+   }
+   value_emitters[ctype] = emit;
+   return emit;
+}
+
+var function table_size(tab) {
+   var size = 0;
+   for( k,v in pairs(tab) ) { ++size    ; }
+   return size;
+}
+
+var SPARSE_ARRAY_END = 0xffffffff;
+
+var function data_emitter(production) {
+   var handlers = {};
+   var translators = {};
+   var function visit1(production) {
+      return assert(handlers[production.type])(production);
+   }
+   var function expand(production) {
+      if( production.type != "struct" ) { return production; }
+      var expanded = {};
+      for( keyword,prod in pairs(production.members) ) {
+         if( translators[prod.type] != null ) {
+            translators[prod.type](expanded, keyword, prod);
+         } else {
+            expanded[keyword] = prod;
+         }
+      }
+      return {type="struct", members=expanded};
+   }
+   var function visitn(productions) {
+      var ret = {};
+      var expanded_production = productions;
+      for( keyword, production in pairs(productions) ) {
+         expanded_production[keyword] = expand(production);
+      }
+      for( keyword,production in pairs(expanded_production) ) {
+         ret[keyword] = visit1(production);
+      }
+      return ret;
+   }
+   function translators.choice(productions, keyword, production) {
+      // Now bring the choice statements up to the same level replacing it.
+      for( case, block in pairs(production.choices) ) {
+         for( name, body in pairs(block) ) { productions[name] = body; }
+      }
+   }
+   function handlers.struct(production) {
+      var member_names = {};
+      for( k,_ in pairs(production.members) ) { table.insert(member_names, k); }
+      table.sort(member_names);
+      if( production.ctype ) {
+         var typeof = data.typeof;
+         return function(data, stream) {
+            stream->write_stringref('cdata');
+            stream->write_stringref(production.ctype);
+            stream->write_ptr(data, typeof(production.ctype));
+         };
+      } else {
+         var emit_member = visitn(production.members);
+         var normalize_id = data.normalize_id;
+         return function(data, stream) {
+            stream->write_stringref('lstruct');
+            var out = {};
+            for( _,k in ipairs(member_names) ) {
+               var id = normalize_id(k);
+               if( data[id] != null ) {
+                  table.insert(out, {id, emit_member[k], data[id]});
+               }
+            }
+            stream->write_uint32(#out);
+            for( _,elt in ipairs(out) ) {
+               var id, emit, xdata = unpack(elt);
+               stream->write_stringref(id);
+               emit(xdata, stream);
+            }
+         };
+      }
+   }
+   function handlers.array(production) {
+      if( production.ctype ) {
+         var typeof = data.typeof;
+         return function(data, stream) {
+            stream->write_stringref('carray');
+            stream->write_stringref(production.ctype);
+            stream->write_uint32(#data);
+            stream->write_array(data.ptr, typeof(production.ctype), #data);
+         };
+      } else {
+         var emit_tagged_value = visit1(
+            {type='scalar', argument_type=production.element_type});
+         return function(data, stream) {
+            stream->write_stringref('larray');
+            stream->write_uint32(#data);
+            for( i=1,#data ) { emit_tagged_value(data[i], stream); }
+         };
+      }
+   }
+   function handlers.table(production) {
+      if( production.key_ctype && production.value_ctype ) {
+         return function(data, stream) {
+            stream->write_stringref('ctable');
+            stream->write_stringref(production.key_ctype);
+            stream->write_stringref(production.value_ctype);
+            data->save(stream);
+         };
+      } else if( production.string_key ) {
+         var emit_value = visit1({type='struct', members=production.values,
+                                    ctype=production.value_ctype});
+         // FIXME: sctable if production.value_ctype?
+         return function(data, stream) {
+            // A string-keyed table is the same as a tagged struct.
+            stream->write_stringref('lstruct');
+            stream->write_uint32(table_size(data));
+            for( k,v in pairs(data) ) {
+               stream->write_stringref(k);
+               emit_value(v, stream);
+            }
+         };
+      } else if( production.key_ctype ) {
+         var emit_keys = visit1({type='table', key_ctype=production.key_ctype,
+                                   value_ctype='uint32_t'});
+         var emit_value = visit1({type='struct', members=production.values});
+         return function(data, stream) {
+            stream->write_stringref('cltable');
+            emit_keys(data.keys, stream);
+            for( i, value in pairs(data.values) ) {
+               stream->write_uint32(i);
+               emit_value(value, stream);
+            }
+            stream->write_uint32(SPARSE_ARRAY_END);
+         };
+      } else {
+         var emit_key = visit1({type='struct', members=production.keys,
+                                  ctype=production.key_ctype});
+         var emit_value = visit1({type='struct', members=production.values,
+                                    ctype=production.value_ctype});
+         // FIXME: lctable if production.value_ctype?
+         return function(data, stream) {
+            stream->write_stringref('lltable');
+            stream->write_uint32(table_size(data));
+            for( k,v in pairs(data) ) {
+               emit_key(k, stream);
+               emit_value(v, stream);
+            }
+         };
+      }
+   }
+   var native_types = lib.set('enumeration', 'identityref', 'string');
+   function handlers.scalar(production) {
+      var primitive_type = production.argument_type.primitive_type;
+      var type = assert(value.types[primitive_type], "unsupported type: "..primitive_type);
+      // FIXME: needs a case for unions
+      if( native_types[primitive_type] ) {
+         return function(data, stream) {
+            stream->write_stringref('stringref');
+            stream->write_stringref(data);
+         };
+      } else if( primitive_type == 'empty' ) {
+         return function (data, stream) {
+            stream->write_stringref('flag');
+            stream->write_uint32(data && 1 || 0);
+         };
+      } else if( type.ctype ) {
+         var ctype = type.ctype;
+         var emit_value = value_emitter(ctype);
+         return function(data, stream) {
+            stream->write_stringref('cdata');
+            stream->write_stringref(ctype);
+            emit_value(data, stream);
+         };
+      } else {
+         error("unimplemented: "..primitive_type);
+      }
+   }
+
+   return visit1(production);
+}
+
+function data_compiler_from_grammar(emit_data, schema_name, schema_revision) {
+   return function(data, filename, source_mtime) {
+      source_mtime = source_mtime || {sec=0, nsec=0};
+      var stream = stream.open_temporary_output_byte_stream(filename);
+      var strtab = string_table_builder();
+      var header = header_t(
+         MAGIC, VERSION, source_mtime.sec, source_mtime.nsec,
+         strtab->intern(schema_name), strtab->intern(schema_revision || ''));
+      // Write with empty data_len etc, fix it later.
+      stream->write_ptr(header, header_t);
+      header.data_start = stream.written;
+      var u32buf = ffi.new('uint32_t[1]');
+      function stream::write_uint32(val) {
+         u32buf[0] = val;
+         return this->write_ptr(u32buf, 'uint32_t');
+      }
+      function stream::write_stringref(str) {
+         return this->write_uint32(strtab->intern(str));
+      }
+      emit_data(data, stream);
+      header.data_len = stream.written - header.data_start;
+      header.strtab_start, header.strtab_len = strtab->emit(stream);
+      stream->rewind();
+      // Fix up header.
+      stream->write_ptr(header, header_t);
+      stream->close_and_rename();
+   };
+}
+
+function data_compiler_from_schema(schema, is_config) {
+   var grammar = data.data_grammar_from_schema(schema, is_config);
+   return data_compiler_from_grammar(data_emitter(grammar),
+                                     schema.id, schema.revision_date);
+}
+
+function config_compiler_from_schema(schema) {
+   return data_compiler_from_schema(schema, true);
+}
+
+function state_compiler_from_schema(schema) {
+   return data_compiler_from_schema(schema, false);
+}
+
+function compile_config_for_schema(schema, data, filename, source_mtime) {
+   return config_compiler_from_schema(schema)(data, filename, source_mtime);
+}
+
+function compile_config_for_schema_by_name(schema_name, data, filename, source_mtime) {
+   return compile_config_for_schema(schema.load_schema_by_name(schema_name),
+                                    data, filename, source_mtime);
+}
+
+// Hackily re-use the YANG serializer for Lua data consisting of tables,
+// ffi data, numbers, and strings.  Truly a hack; to be removed in the
+// all-singing YANG future that we deserve where all data has an
+// associated schema.
+var function ad_hoc_grammar_from_data(data) {
+   if( type(data) == 'table' ) {
+      var members = {};
+      for( k,v in pairs(data) ) {
+         assert(type(k) == 'string');
+         members[k] = ad_hoc_grammar_from_data(v);
+      }
+      return {type='struct', members=members};
+   } else if( type(data) == 'cdata' ) {
+      // Hackety hack.
+      var ctype = tostring(ffi.typeof(data))->match('^ctype<(.*)>$');
+      var primitive_types = {
+         ['unsigned char [4]']     = 'legacy-ipv4-address',
+         ['unsigned char (&)[4]']  = 'legacy-ipv4-address',
+         ['unsigned char [6]']     = 'mac-address',
+         ['unsigned char (&)[6]']  = 'mac-address',
+         ['unsigned char [16]']    = 'ipv6-address',
+         ['unsigned char (&)[16]'] = 'ipv6-address',
+         ['uint8_t']  = 'uint8',  ['int8_t']  = 'int8',
+         ['uint16_t'] = 'uint16', ['int16_t'] = 'int16',
+         ['uint32_t'] = 'uint32', ['int32_t'] = 'int32',
+         ['uint64_t'] = 'uint64', ['int64_t'] = 'int64',
+         ['double'] = 'decimal64' // ['float'] = 'decimal64',
+      };
+      var prim = primitive_types[ctype];
+      if( ! prim ) { error('unhandled ffi ctype: '..ctype); }
+      return {type='scalar', argument_type={primitive_type=prim}};
+   } else if( type(data) == 'number' ) {
+      return {type='scalar', argument_type={primitive_type='decimal64'}};
+   } else if( type(data) == 'string' ) {
+      return {type='scalar', argument_type={primitive_type='string'}};
+   } else if( type(data) == 'boolean' ) {
+      return {type='scalar', argument_type={primitive_type='boolean'}};
+   } else {
+      error('unhandled data type: '..type(data));
+   }
+}
+
+function compile_ad_hoc_lua_data_to_file(file_name, data) {
+   var grammar = ad_hoc_grammar_from_data(data);
+   var emitter = data_emitter(grammar);
+   // Empty string as schema name; a hack.
+   var compiler = data_compiler_from_grammar(emitter, '');
+   return compiler(data, file_name);
+}
+
+var function read_compiled_data(stream, strtab) {
+   var function read_string() {
+      return assert(strtab[stream->read_uint32()]);
+   }
+   var ctypes = {};
+   var function scalar_type(ctype) {
+      if( ! ctypes[ctype] ) { ctypes[ctype] = data.typeof(ctype); }
+      return ctypes[ctype];
+   }
+
+   var readers = {};
+   var function read1() {
+      var tag = read_string();
+      return assert(readers[tag], tag)();
+   }
+   function readers.lstruct() {
+      var ret = {};
+      for( i=1,stream->read_uint32() ) {
+         var k = read_string();
+         ret[k] = read1();
+      }
+      return ret;
+   }
+   function readers.carray() {
+      var ctype = scalar_type(read_string());
+      var count = stream->read_uint32();
+      return util.ffi_array(stream->read_array(ctype, count), ctype, count);
+   }
+   function readers.larray() {
+      var ret = {};
+      for( i=1,stream->read_uint32() ) { table.insert(ret, read1()); }
+      return ret;
+   }
+   function readers.ctable() {
+      var key_ctype = read_string();
+      var value_ctype = read_string();
+      var key_t, value_t = data.typeof(key_ctype), data.typeof(value_ctype);
+      return ctable.load(stream, {key_type=key_t, value_type=value_t});
+   }
+   function readers.cltable() {
+      var keys = read1();
+      var values = {};
+      while( true ) {
+         var i = stream->read_uint32();
+         if( i == SPARSE_ARRAY_END ) { break; }
+         values[i] = read1();
+      }
+      return cltable.build(keys, values);
+   }
+   function readers.lltable() {
+      var ret = {};
+      for( i=1,stream->read_uint32() ) {
+         var k = read1();
+         ret[k] = read1();
+      }
+      return ret;
+   }
+   function readers.stringref() {
+      return read_string();
+   }
+   function readers.cdata() {
+      var ctype = scalar_type(read_string());
+      return stream->read_ptr(ctype)[0];
+   }
+   function readers.flag() {
+      if( stream->read_uint32() != 0 ) { return true; }
+      return null;
+   }
+   return read1();
+}
+
+function has_magic(stream) {
+   var success, header = pcall(stream.read_ptr, stream, header_t);
+   stream->seek(0);
+   return success && ffi.string(header.magic, ffi.sizeof(header.magic)) == MAGIC;
+}
+
+function load_compiled_data(stream) {
+   var uint32_t = ffi.typeof('uint32_t');
+   function stream::read_uint32() {
+      return stream->read_ptr(uint32_t)[0];
+   }
+   var header = stream->read_ptr(header_t);
+   assert(ffi.string(header.magic, ffi.sizeof(header.magic)) == MAGIC,
+          "expected file to begin with "..MAGIC);
+   assert(header.version == VERSION,
+          "incompatible version: "..header.version);
+   stream->seek(header.strtab_start);
+   var strtab = read_string_table(stream, header.strtab_len);
+   var ret = {};
+   ret.schema_name = strtab[header.schema_name];
+   ret.revision_date = strtab[header.revision_date];
+   ret.source_mtime = {sec=header.source_mtime_sec,
+                       nsec=header.source_mtime_nsec};
+   stream->seek(header.data_start);
+   ret.data = read_compiled_data(stream, strtab);
+   assert(stream->seek() == header.data_start + header.data_len);
+   return ret;
+}
+
+function load_compiled_data_file(filename) {
+   return load_compiled_data(stream.open_input_byte_stream(filename));
+}
+
+function data_copier_from_grammar(production) {
+   var compile = data_compiler_from_grammar(data_emitter(production), '');
+   return function(data) {
+      var basename = 'copy-'..lib.random_printable_string(160);
+      var tmp = shm.root..'/'..shm.resolve(basename);
+      compile(data, tmp);
+      return function() { return load_compiled_data_file(tmp).data; };
+   };
+}
+
+function data_copier_for_schema(schema, is_config) {
+   var grammar = data.data_grammar_from_schema(schema, is_config);
+   return data_copier_from_grammar(grammar);
+}
+
+function config_copier_for_schema(schema) {
+   return data_copier_for_schema(schema, true);
+}
+
+function state_copier_for_schema(schema) {
+   return data_copier_for_schema(schema, false);
+}
+
+function config_copier_for_schema_by_name(schema_name) {
+   return config_copier_for_schema(schema.load_schema_by_name(schema_name));
+}
+
+function copy_config_for_schema(schema, data) {
+   return config_copier_for_schema(schema)(data)();
+}
+
+function copy_config_for_schema_by_name(schema_name, data) {
+   return config_copier_for_schema_by_name(schema_name)(data)();
+}
+
+function selftest() {
+   print('selfcheck: lib.yang.binary');
+   var test_schema = schema.load_schema([=[module snabb-simple-router {
+      namespace snabb:simple-router;
+      prefix simple-router;
+
+      import ietf-inet-types {prefix inet;}
+      import ietf-yang-types { prefix yang; }
+
+      leaf is-active { type boolean; default true; }
+
+      leaf-list integers { type uint32; }
+      leaf-list addrs { type inet:ipv4-address; }
+
+      typedef severity  {
+         type enumeration {
+            enum indeterminate;
+            enum minor {
+               value 3;
+            }
+            enum warning {
+               value 4;
+            }
+         }
+      }
+
+      container routes {
+         list route {
+            key addr;
+            leaf addr { type inet:ipv4-address; mandatory true; }
+            leaf port { type uint8 { range 0..11; } mandatory true; }
+         }
+         leaf severity {
+            type severity;
+         }
+      }
+
+      container next-hop {
+         choice address {
+            case mac {
+               leaf mac { type yang:mac-address; }
+            }
+            case ipv4 {
+               leaf ipv4 { type inet:ipv4-address; }
+            }
+            case ipv6 {
+               leaf ipv6 { type inet:ipv6-address; }
+            }
+         }
+      }
+
+      container foo {
+         leaf enable-qos {
+            type empty;
+         }
+      }
+   }]=]);
+   var data = data.load_config_for_schema(test_schema, [=[
+      is-active true;
+      integers 1;
+      integers 2;
+      integers 0xffffffff;
+      addrs 4.3.2.1;
+      addrs 5.4.3.2;
+      routes {
+        route { addr 1.2.3.4; port 1; }
+        route { addr 2.3.4.5; port 10; }
+        route { addr 3.4.5.6; port 2; }
+        severity minor;
+      }
+      next-hop {
+         ipv4 5.6.7.8;
+      }
+      foo {
+         enable-qos;
+      }
+   ]=]);
+
+   var ipv4 = require('lib.protocol.ipv4');
+
+   for( i=1,3 ) {
+      assert(data.is_active == true);
+      assert(#data.integers == 3);
+      assert(data.integers[1] == 1);
+      assert(data.integers[2] == 2);
+      assert(data.integers[3] == 0xffffffff);
+      assert(#data.addrs == 2);
+      assert(data.addrs[1]==util.ipv4_pton('4.3.2.1'));
+      assert(data.addrs[2]==util.ipv4_pton('5.4.3.2'));
+      var routing_table = data.routes.route;
+      var key = ffi.new('struct { uint32_t addr; }');
+      key.addr = util.ipv4_pton('1.2.3.4');
+      assert(routing_table->lookup_ptr(key).value.port == 1);
+      key.addr = util.ipv4_pton('2.3.4.5');
+      assert(routing_table->lookup_ptr(key).value.port == 10);
+      key.addr = util.ipv4_pton('3.4.5.6');
+      assert(routing_table->lookup_ptr(key).value.port == 2);
+      assert(
+         data.next_hop.ipv4 == util.ipv4_pton('5.6.7.8'),
+         "Choice type test failed (round: "..i..")"
+      );
+
+      var tmp = os.tmpname();
+      compile_config_for_schema(test_schema, data, tmp);
+      var data2 = load_compiled_data_file(tmp);
+      assert(data2.schema_name == 'snabb-simple-router');
+      assert(data2.revision_date == '');
+      data = copy_config_for_schema(test_schema, data2.data);
+      os.remove(tmp);
+   }
+   print('selfcheck: ok');
+}

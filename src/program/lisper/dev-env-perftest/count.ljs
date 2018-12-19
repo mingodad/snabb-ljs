@@ -1,0 +1,50 @@
+#!snabb/src/snabb snsh
+io.stdout->setvbuf('no');
+io.stderr->setvbuf('no');
+
+var ffi      = require("ffi");
+var app      = require("core.app");
+var lib      = require("core.lib");
+var packet   = require("core.packet");
+var pci      = require("lib.hardware.pci");
+
+_NAME = "";
+var Counter = {};
+
+var n = 0;
+
+function Counter::new() {
+	timer.activate(
+		timer.new("counting",
+			function(t) {
+				print(string.format("Speed: %4.2f M/s", n/1024/1024));
+				n = 0;
+			}, 1*1e9, "repeating"));
+	return setmetatable({}, {__index = this});
+}
+
+function Counter::push() {
+	var rx = this.input.rx;
+	if( rx == null ) { return; }
+	while( ! link.empty(rx) ) { 
+		var p = link.receive(rx);
+		n = n + p.length;
+		packet.free(p);
+	}
+}
+
+var c = config.new();
+
+config.app(c, "count", Counter);
+
+var eth = pci.device_info("03:00.1");
+
+config.app(c, "eth", require(eth.driver).driver, {
+	pciaddr = eth.pciaddress,
+	macaddr = "00:00:00:00:02:02",
+});
+
+config.link(c, "eth."..eth.tx.." -> count.rx");
+
+engine.configure(c);
+engine.main({report = {showlinks=true}});

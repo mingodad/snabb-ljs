@@ -1,0 +1,73 @@
+module(..., package.seeall);
+
+var ffi = require("ffi");
+var ctable = require("lib.ctable");
+
+function build(keys, values) {
+   return setmetatable({ keys = keys, values = values },
+                       {__index=get, __newindex=set});
+}
+
+function new(params) {
+   var ctable_params = {};
+   for( k,v in _G.pairs(params) ) { ctable_params[k] = v; }
+   assert(! ctable_params.value_type);
+   ctable_params.value_type = ffi.typeof('uint32_t');
+   return build(ctable.new(ctable_params), {});
+}
+
+function get(cltable, key) {
+   var entry = cltable.keys->lookup_ptr(key);
+   if( ! entry ) { return null; }
+   return cltable.values[entry.value];
+}
+
+function set(cltable, key, value) {
+   var entry = cltable.keys->lookup_ptr(key);
+   if( entry ) {
+      cltable.values[entry.value] = value;
+      if( value == null ) { cltable.keys->remove_ptr(entry); }
+   } else if( value != null ) {
+      var idx = #cltable.values + 1;
+      cltable.values[idx] = value;
+      cltable.keys->add(key, idx);
+   }
+}
+
+function pairs(cltable) {
+   var ctable_next, ctable_max, ctable_entry = cltable.keys->iterate();
+   return function() {
+      ctable_entry = ctable_next(ctable_max, ctable_entry);
+      if( ! ctable_entry ) { return; }
+      return ctable_entry.key, cltable.values[ctable_entry.value];
+   };
+}
+
+function selftest() {
+   print("selftest: cltable");
+
+   var ipv4 = require('lib.protocol.ipv4');
+   var params = { key_type = ffi.typeof('uint8_t[4]') };
+   var cltab = new(params);
+
+   for( i=0,255 ) {
+      var addr = ipv4->pton('1.2.3.'..i);
+      cltab[addr] = 'hello, '..i;
+   }
+
+   for( i=0,255 ) {
+      var addr = ipv4->pton('1.2.3.'..i);
+      assert(cltab[addr] == 'hello, '..i);
+   }
+
+   for( i=0,255 ) {
+      // Remove value that is present.
+      cltab[ipv4->pton('1.2.3.'..i)] = null;
+      // Remove value that is not present.
+      cltab[ipv4->pton('2.3.4.'..i)] = null;
+   }
+
+   for( k,v in pairs(cltab) ) { error('not reachable'); }
+
+   print("selftest: ok");
+}

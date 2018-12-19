@@ -1,0 +1,672 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+module(..., package.seeall);
+var maxpc = require("lib.maxpc");
+var match, capture, combine = maxpc.import();
+
+// ASCII only implementation of regular expressions as defined in Appendix G of
+// "W3C XML Schema Definition Language (XSD) 1.1 Part 2: Datatypes", see:
+//
+//    https://www.w3.org/TR/xmlschema11-2/#regexs
+//
+// The main entry function `regexp.compile' accepts a regular expression
+// string, and returns a predicate function that tests whether a string is part
+// of the language defined by the expression.
+//
+// Example:
+//    local is_identifier = regexp.compile("[a-zA-Z][a-zA-Z0-9]*")
+//    is_identifier("Foo3") -> true
+//    is_identifier("7up") -> false
+//
+// It uses a combinatory parsing library (MaxPC) to parse a regular expression
+// in the format defined by the specification referenced above, and compiles
+// the denoted regular language to a MaxPC grammar.
+//
+// NYI: Block escapes, Unicode handling.
+
+function compile (expr) {
+   var ast = parse(expr);
+   var parser = compile_branches(ast.branches, 'toplevel');
+   return function (str) {
+      var _, success, eof = maxpc.parse(str, parser);
+      return success && eof;
+   };
+}
+
+var regExp_parser; // forward definition
+
+function parse (expr) {
+   var result, success, is_eof = maxpc.parse(expr, regExp_parser);
+   if( ! (success && is_eof) ) {
+      error("Unable to parse regular expression: " .. expr);
+   } else {
+      return result;
+   }
+}
+
+
+// Parser rules: string -> AST
+
+function capture.regExp () {
+   return capture.unpack(
+      capture.seq(capture.branch(), combine.any(capture.otherBranch())),
+      function (branch, otherBranches) {
+         var branches = {branch};
+         for( _, xbranch in ipairs(otherBranches || {}) ) {
+            table.insert(branches, xbranch);
+         }
+         return {branches=branches};
+      }
+   );
+}
+
+function capture.branch () {
+   return capture.transform(combine.any(capture.piece()),
+                            function (pieces) { return {pieces=pieces}; });
+}
+
+function capture.otherBranch () {
+   return capture.unpack(
+      capture.seq(match.equal("|"), capture.branch()),
+      function (_, branch) { return branch; }
+   );
+}
+
+function capture.piece () {
+   return capture.unpack(
+      capture.seq(capture.atom(), combine.maybe(capture.quantifier())),
+      function (atom, quantifier) {
+         return {atom=atom, quantifier=quantifier || null};
+      }
+   );
+}
+
+function capture.quantifier () {
+   return combine._or(
+      capture.subseq(match.equal("?")),
+      capture.subseq(match.equal("*")),
+      capture.subseq(match.equal("+")),
+      capture.unpack(
+         capture.seq(match.equal("{"), capture.quantity(), match.equal("}")),
+         function (_, quantity, _) { return quantity; }
+      )
+   );
+}
+
+function capture.quantity () {
+   return combine._or(
+      capture.quantRange(),
+      capture.quantMin(),
+      capture.transform(capture.quantExact(),
+                        function (n) { return {exactly=n}; })
+   );
+}
+
+function capture.quantRange () {
+   return capture.unpack(
+      capture.seq(capture.quantExact(),
+                  match.equal(","),
+                  capture.quantExact()),
+      function (min, _, max) { return {min=min, max=max}; }
+   );
+}
+
+function capture.quantMin () {
+   return capture.unpack(
+      capture.seq(capture.quantExact(), match.equal(",")),
+      function (min, _) { return {min=min}; }
+   );
+}
+
+function capture.quantExact () {
+   return capture.transform(
+      capture.subseq(combine.some(match.digit())),
+      tonumber
+   );
+}
+
+function capture.atom () {
+   return combine._or(
+      capture.NormalChar(),
+      capture.charClass(),
+      capture.subExp()
+   );
+}
+
+var function regExp_binding (s) { return regExp_parser(s); }
+
+function capture.subExp () {
+   return capture.unpack(
+      capture.seq(match.equal('('), regExp_binding, match.equal(')')),
+      function (_, expression, _) { return expression; }
+   );
+}
+
+function match.MetaChar () {
+   return match.satisfies(function (s) { return member(s, ".\\?*+{}()|[]"); });
+}
+
+function match.NormalChar (s) {
+   return match._not(match.MetaChar());
+}
+
+function capture.NormalChar () {
+   return capture.subseq(match.NormalChar());
+}
+
+function capture.charClass () {
+   return combine._or(
+      capture.SingleCharEsc(),
+      capture.charClassEsc(),
+      capture.charClassExpr(),
+      capture.WildcardEsc()
+   );
+}
+
+function capture.charClassExpr () {
+   return capture.unpack(
+      capture.seq(match.equal("["), capture.charGroup(), match.equal("]")),
+      function (_, charGroup, _) { return charGroup; }
+   );
+}
+
+function capture.charGroup () {
+   return capture.unpack(
+      capture.seq(
+         combine._or(capture.negCharGroup(), capture.posCharGroup()),
+         combine.maybe(capture.charClassSubtraction())
+      ),
+      function (group, subtract) {
+         return {group=group, subtract=subtract || null};
+      }
+   );
+}
+
+var charClassExpr_parser; // forward declaration
+var function charClassExpr_binding (s) {
+   return charClassExpr_parser(s);
+}
+
+function capture.charClassSubtraction () {
+   return capture.unpack(
+      capture.seq(match.equal("-"), charClassExpr_binding),
+      function (_, charClassExpr, _) { return charClassExpr; }
+   );
+}
+
+function capture.posCharGroup () {
+   return capture.transform(
+      combine.some(capture.charGroupPart()),
+      function (parts) { return {include=parts}; }
+   );
+}
+
+function capture.negCharGroup () {
+   return capture.unpack(
+      capture.seq(match.equal("^"), capture.posCharGroup()),
+      function (_, group) { return {exclude=group.include}; }
+   );
+}
+
+function capture.charGroupPart () {
+   return combine._or(
+      capture.charClassEsc(),
+      capture.charRange(),
+      capture.singleChar()
+   );
+}
+
+function capture.singleChar () {
+   return combine._or(capture.SingleCharEsc(), capture.singleCharNoEsc());
+}
+
+function capture.charRange () {
+   var rangeChar = combine.diff(capture.singleChar(), match.equal("-"));
+   return capture.unpack(
+      capture.seq(rangeChar, match.equal("-"), rangeChar),
+      function (from, _, to) { return {range={from,to}}; }
+   );
+}
+
+function capture.singleCharNoEsc () {
+   var function is_singleCharNoEsc (s) {
+      return ! member(s, "[]");
+   }
+   return combine.diff(
+      capture.subseq(match.satisfies(is_singleCharNoEsc)),
+      // don’t match the "-" leading a character class subtraction
+      match.seq(match.equal("-"), match.equal("["))
+   );
+}
+
+function capture.charClassEsc () {
+   return combine._or(
+      capture.MultiCharEsc(), capture.catEsc(), capture.complEsc()
+   );
+}
+
+function capture.SingleCharEsc () {
+   var function is_SingleCharEsc (s) {
+      return member(s, "nrt\\|.?*+(){}-[]^");
+   }
+   return capture.unpack(
+      capture.seq(
+         match.equal("\\"),
+         capture.subseq(match.satisfies(is_SingleCharEsc))
+      ),
+      function (_, char) { return {escape=char}; }
+   );
+}
+
+function capture.catEsc () {
+   return capture.unpack(
+      capture.seq(match.equal("\\"), match.equal("p"), match.equal("{"),
+                  capture.charProp(),
+                  match.equal("}")),
+      function (_, _, _, charProp, _) { return {property=charProp}; }
+   );
+}
+
+function capture.complEsc () {
+   return capture.unpack(
+      capture.seq(match.equal("\\"), match.equal("P"), match.equal("{"),
+                  capture.charProp(),
+                  match.equal("}")),
+      function (_, _, _, charProp, _) { return {complement=charProp}; }
+   );
+}
+
+function capture.charProp () {
+   var nameChars = "-0123456789abcdefghijklmnopqrstiuvwxyzABCDEFGHIJKLMNOPQRSTIUVWXYZ";
+   var function is_name (s) { return member(s, nameChars); }
+   return capture.subseq(combine.some(match.satisfies(is_name)));
+}
+
+function capture.MultiCharEsc () {
+   var function is_multiCharEsc (s) {
+      return member(s, "sSiIcCdDwW");
+   }
+   return capture.unpack(
+      capture.seq(
+         match.equal("\\"),
+         capture.subseq(match.satisfies(is_multiCharEsc))
+      ),
+      function (_, char) { return {escape=char}; }
+   );
+}
+
+function capture.WildcardEsc () {
+   return capture.transform(
+      match.equal("."),
+      function (_) { return {escape="."}; }
+   );
+}
+
+regExp_parser = capture.regExp();
+charClassExpr_parser = capture.charClassExpr();
+
+
+// Compiler rules: AST -> MaxPC parser
+
+function compile_branches (branches, is_toplevel) {
+   var parsers = {};
+   for( _, branch in ipairs(branches) ) {
+      if( branch.pieces ) {
+         var parser = compile_pieces(branch.pieces);
+         if( is_toplevel ) {
+            parser = match.path(parser, match.eof());
+         }
+         table.insert(parsers, parser);
+      }
+   }
+   if(     #parsers == 0 ) { return match.eof();
+   } else if( #parsers == 1 ) { return parsers[1];
+   } else if( #parsers  > 1 ) { return match.either(unpack(parsers)); }
+}
+
+function compile_pieces (pieces) {
+   var parsers = {};
+   for( _, piece in ipairs(pieces) ) {
+      var atom_parser = compile_atom(piece.atom);
+      if( piece.quantifier ) {
+         var quanitify = compile_quantifier(piece.quantifier);
+         table.insert(parsers, quanitify(atom_parser));
+      } else {
+         table.insert(parsers, atom_parser);
+      }
+   }
+   return match.path(unpack(parsers));
+}
+
+function compile_quantifier (quantifier) {
+   if(     quantifier == "?" ) { return match.optional;
+   } else if( quantifier == "*" ) { return match.all;
+   } else if( quantifier == "+" ) { return match.one_or_more;
+   } else if( quantifier.min || quantifier.max ) {
+      return function (parser) {
+         return match.range(parser, quantifier.min, quantifier.max);
+      };
+   } else if( quantifier.exactly ) {
+      return function (parser) {
+         return match.exactly_n(parser, quantifier.exactly);
+      };
+   } else {
+      error("Invalid quantifier");
+   }
+}
+
+function match.one_or_more (parser) {
+   return match.path(parser, match.all(parser));
+}
+
+function match.exactly_n (parser, n) {
+   var ps = {};
+   for( i = 1, n ) { table.insert(ps, parser); }
+   return match.seq(unpack(ps));
+}
+
+function match.upto_n (parser, n) {
+   var p = match.seq();
+   for( i = 1, n ) { p = match.optional(match.plus(parser, p)); }
+   return p;
+}
+
+function match.range (parser, min, max) {
+   if( min && max ) {
+      assert(min <= max, "Invalid quanitity: "..min.."-"..max);
+      return match.path(match.exactly_n(parser, min),
+                        match.upto_n(parser, max - min));
+   } else if( min ) {
+      return match.path(match.exactly_n(parser, min), match.all(parser));
+   } else if( max ) {
+      return match.upto_n(parser, max);
+   } else {
+      return match.all(parser);
+   }
+}
+
+function compile_atom (atom) {
+   var function is_special_escape (s) {
+      return member(s, "\\|.-^?*+{}()[]");
+   }
+   var function match_wildcard (s) {
+      return ! member(s, "\n\r");
+   }
+   var function is_space (s) {
+      return member(s, " \t\n\r");
+   }
+   var function is_NameStartChar (s) {
+      return GC.L(s->byte()) || member(s, ":_");
+   }
+   var function is_NameChar (s) {
+      return is_NameStartChar(s) || GC.Nd(s->byte()) || member(s, "-.");
+   }
+   var function is_digit (s) {
+      return GC.Nd(s->byte());
+   }
+   var function is_word (s) {
+      return ! (GC.P(s->byte()) || GC.Z(s->byte()) || GC.C(s->byte()));
+   }
+   if( type(atom) == 'string' ) { return match.equal(atom);
+   } else if( atom.escape == "n" ) { return match.equal("\n");
+   } else if( atom.escape == "r" ) { return match.equal("\r");
+   } else if( atom.escape == "t" ) { return match.equal("\t");
+   } else if( atom.escape && is_special_escape(atom.escape) ) {
+      return match.equal(atom.escape);
+   } else if( atom.escape == "." ) {
+      return match.satisfies(match_wildcard);
+   } else if( atom.escape == "s" ) {
+      return match.satisfies(is_space);
+   } else if( atom.escape == "S" ) {
+      return match._not(match.satisfies(is_space));
+   } else if( atom.escape == "i" ) {
+      return match.satisfies(is_NameStartChar);
+   } else if( atom.escape == "I" ) {
+      return match._not(match.satisfies(is_NameStartChar));
+   } else if( atom.escape == "c" ) {
+      return match.satisfies(is_NameChar);
+   } else if( atom.escape == "C" ) {
+      return match._not(match.satisfies(is_NameChar));
+   } else if( atom.escape == "d" ) {
+      return match.satisfies(is_digit);
+   } else if( atom.escape == "D" ) {
+      return match._not(match.satisfies(is_digit));
+   } else if( atom.escape == "w" ) {
+      return match.satisfies(is_word);
+   } else if( atom.escape == "W" ) {
+      return match._not(match.satisfies(is_word));
+   } else if( atom.group ) {
+      return compile_class(atom.group, atom.subtract);
+   } else if( atom.range ) {
+      return compile_range(unpack(atom.range));
+   } else if( atom.property ) {
+      return compile_category(atom.property);
+   } else if( atom.complement ) {
+      return match._not(compile_category(atom.complement));
+   } else if( atom.branches ) {
+      return compile_branches(atom.branches);
+   } else {
+      error("Invalid atom");
+   }
+}
+
+function compile_class (group, subtract) {
+   if( ! subtract ) {
+      return compile_group(group);
+   } else {
+      return combine.diff(
+         compile_group(group),
+         compile_class(subtract.group, subtract.subtract)
+      );
+   }
+}
+
+function compile_group (group) {
+   var function compile_group_atoms (atoms) {
+      var parsers = {};
+      for( _, atom in ipairs(atoms) ) {
+         table.insert(parsers, compile_atom(atom));
+      }
+      return match.either(unpack(parsers));
+   }
+   if( group.include ) {
+      return compile_group_atoms(group.include);
+   } else if( group.exclude ) {
+      return match._not(compile_group_atoms(group.exclude));
+   } else {
+      error("Invalid group");
+   }
+}
+
+function compile_range (start, stop) {
+   start, stop = start->byte(), stop->byte();
+   var function in_range (s) {
+      return start <= s->byte() && s->byte() <= stop;
+   }
+   return match.satisfies(in_range);
+}
+
+function compile_category (name) {
+   var predicate = assert(GC[name], "Invalid category: "..name);
+   return match.satisfies(function (s) { return predicate(s->byte()); });
+}
+
+
+// General category predicates for ASCII
+
+var function empty_category (c) { return false; }
+
+GC = {};
+GC.Lu = function (c) { return 65 <= c && c <= 90; };
+GC.Ll = function (c) { return 97 <= c && c <= 122; };
+GC.Lt = empty_category;
+GC.Lm = empty_category;
+GC.Lo = empty_category;
+GC.L  = function (c) { return GC.Lu(c) || GC.Ll(c); };
+GC.Mn = empty_category;
+GC.Mc = empty_category;
+GC.Me = empty_category;
+GC.M  = empty_category;
+GC.Nd = function (c) { return 48 <= c && c <= 57; };
+GC.Nl = empty_category;
+GC.No = empty_category;
+GC.N  = GC.Nd;
+GC.Pc = function (c) { return c == 95; };
+GC.Pd = function (c) { return c == 45; };
+GC.Ps = function (c) { return c == 40 || c == 91 || c == 123; };
+GC.Pe = function (c) { return c == 41 || c == 93 || c == 125; };
+GC.Pi = empty_category;
+GC.Pf = empty_category;
+GC.Po = function (c) { return (33 <= c && c <= 35)
+                         || (37 <= c && c <= 39)
+                         || c == 42
+                         || c == 44
+                         || (46 <= c && c <= 47)
+                         || (58 <= c && c <= 59)
+                         || (63 <= c && c <= 64)
+                         || c == 92; };
+GC.P  = function (c) { return GC.Pc(c)
+                         || GC.Pd(c)
+                         || GC.Ps(c)
+                         || GC.Pe(c)
+                         || GC.Po(c); };
+GC.Sm = function (c) { return c == 43
+                         || (60 <= c && c <= 62)
+                         || c == 124
+                         || c == 126; };
+GC.Sc = function (c) { return c == 36; };
+GC.Sk = function (c) { return c == 94 || c == 96; };
+GC.So = empty_category;
+GC.S  = function (c) { return GC.Sm(c) || GC.Sc(c); };
+GC.Zs = function (c) { return c == 32; };
+GC.Zl = empty_category;
+GC.Zp = empty_category;
+GC.Z  = GC.Zs;
+GC.Cc = function (c) { return 0 <= c && c <= 31; };
+GC.Cf = empty_category;
+GC.Cs = empty_category;
+GC.Co = empty_category;
+GC.Cn = empty_category;
+GC.C  = GC.Cc;
+
+
+// Utilities
+
+function member (element, set) {
+   return set->find(element, 1, true);
+}
+
+
+// Tests
+
+var function test (o) {
+   var match = compile(o.regexp);
+   for( _, input in ipairs(o.accept) ) {
+      assert(match(input), o.regexp .. " should match " .. input);
+   }
+   for( _, input in ipairs(o.reject) ) {
+      assert(! match(input), o.regexp .. " should not match " .. input);
+   }
+}
+
+function selftest () {
+   test ({regexp="[a-zA-Z][a-zA-Z0-9]*",
+         accept={"Foo3", "baz"},
+         reject={"7Up", "123", "äöü", ""}});
+
+   test ({regexp="",
+         accept={""},
+         reject={"foo"}});
+
+   test ({regexp="abc",
+         accept={"abc"},
+         reject={"abcd", "0abc", ""}});
+
+   test ({regexp="a[bc]",
+         accept={"ab", "ac"},
+         reject={"abcd", "0abc", "aa", ""}});
+
+   test ({regexp="\\n+",
+         accept={"\n", "\n\n\n"},
+         reject={"", "\n\n\t", "\naa"}});
+
+   test ({regexp="(foo|bar)?",
+         accept={"foo", "bar", ""},
+         reject={"foobar"}});
+
+   test ({regexp="foo|bar|baz",
+         accept={"foo", "bar", "baz"},
+         reject={"", "fo"}});
+
+   test ({regexp="\\]",
+         accept={"]"},
+         reject={"", "\\]"}});
+
+   test ({regexp="\\d{3,}",
+         accept={"123", "45678910"},
+         reject={"", "12", "foo"}});
+
+   test ({regexp="[^\\d]{3,5}",
+         accept={"foo", "....", ".-.-."},
+         reject={"", "foobar", "123", "4567", "45678"}});
+
+   test ({regexp="[abc-[ab]]{3}",
+         accept={"ccc"},
+         reject={"", "abc"}});
+
+   test ({regexp="[\\p{L}]",
+         accept={"A", "b", "y", "Z"},
+         reject={"0", "-", " "}});
+
+   test ({regexp="[\\P{L}]",
+         accept={"0", "-", " "},
+         reject={"A", "b", "y", "Z"}});
+
+   test ({regexp="\\P{Ps}",
+         accept={"}", "]", ")", "A", "b", "y", "Z", "0", "-", " "},
+         reject={"(", "[", "{"}});
+
+   test ({regexp="\\P{Ps}",
+         accept={"}", "]", ")", "A", "b", "y", "Z", "0", "-", " "},
+         reject={"(", "[", "{"}});
+
+   test ({regexp="\\w",
+         accept={"F", "0", "a", "~"},
+         reject={"-", " ", ".", "\t"}});
+
+   test ({regexp="\\i",
+         accept={"a", "B", "_", ":"},
+         reject={"-", "1", " ", "."}});
+
+   test ({regexp="\\C",
+         accept={"~", " ", "\t", "\n"},
+         reject={"a", "B", "1", ".", "_", ":"}});
+
+   test ({regexp="a|aa",
+         accept={"a", "aa"},
+         reject={"ab", ""}});
+
+   test({regexp="([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])",
+        accept={"0","12", "123", "192","168","178",},
+        reject={"a.a.a.", ""}});
+
+   test({regexp="(aa|aaa|bb)*",
+        accept={"", "aa", "aaa", "aaaa", "aabb", "aaabb", "bb"},
+        reject={"a", "b", "bbb", "aaaab"}});
+
+   var ipv4_address =
+      "(([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])\\.){3}"
+   ..  "([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])"
+   .. "(%[\\p{N}\\p{L}]+)?";
+   test ({regexp=ipv4_address,
+         accept={"192.168.0.1", "8.8.8.8%eth0"},
+         reject={"1.256.8.8", "1.2.3%foo", "1.1.1.1%~"}});
+
+   var domain_name =
+      "((([a-zA-Z0-9_]([a-zA-Z0-9\\-_]){0,61})?[a-zA-Z0-9]\\.)*"
+   ..  "([a-zA-Z0-9_]([a-zA-Z0-9\\-_]){0,61})?[a-zA-Z0-9]\\.?)"
+   .. "|\\.";
+   test ({regexp=domain_name,
+         accept={"hello", "foo-z.bar.de", "123.com", "."},
+         reject={"___.com", "foo-.baz.de", ".."}});
+}

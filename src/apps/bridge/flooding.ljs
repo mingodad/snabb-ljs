@@ -1,0 +1,41 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+// This class derives from lib.bridge.base and implements the simplest
+// possible bridge, which floods a packet arriving on a port to all
+// destination ports within its scope according to the split-horizon
+// topology.
+
+module(..., package.seeall);
+
+var bridge_base = require("apps.bridge.base").bridge;
+var packet = require("core.packet");
+var link = require("core.link");
+var empty, receive, transmit = link.empty, link.receive, link.transmit;
+var clone = packet.clone;
+
+bridge = subClass(bridge_base);
+bridge._name = "flooding bridge";
+
+function bridge::new (arg) {
+   return bridge->superClass().new(this, arg);
+}
+
+function bridge::push() {
+   var ports = this._ports;
+   var dst_ports = this._dst_ports;
+   var i = 1;
+   while( ports[i] ) {
+      var l_in = ports[i].l_in;
+      while( ! empty(l_in) ) {
+         var dst = dst_ports[i];
+         var p = receive(l_in);
+         transmit(ports[dst[1]].l_out, p);
+         var j = 2;
+         while( dst[j] ) {
+            transmit(ports[dst[j]].l_out, clone(p));
+            ++j    ;
+         }
+      }
+      ++i    ;
+   }
+}

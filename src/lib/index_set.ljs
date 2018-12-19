@@ -1,0 +1,104 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+//- index set object: keeps a set of indexed values
+var NDX_mt = {};
+NDX_mt.__index = NDX_mt;
+
+// trivial constructor
+function NDX_mt::new (max, name) {
+   return setmetatable({
+      __nxt = 0,
+      __max = max,
+      __name = name,
+   }, this);
+}
+
+
+// search a specific index
+function NDX_mt::search(ndx) {
+   if( type(ndx) != 'number' || math.floor(ndx) != ndx ) {
+      return null;
+   }
+   for( k, v in pairs(this) ) {
+      if( v == ndx && k != '__nxt' && k != '__max' ) {
+         return k;
+      }
+   }
+   return null;
+}
+
+// add a value to the set
+// if new, returns a new index and true
+// if it already existed, returns given index and false
+function NDX_mt::add (v) {
+   if( this[v] ) {
+      return this[v], false;
+   }
+   assert(this.__nxt < this.__max, this.__name.." overflow");
+   this[v] = this.__nxt;
+   while( this->search(this.__nxt) != null ) {
+      this.__nxt = this.__nxt + 1;
+   }
+   return this[v],true;
+}
+
+
+// remove a key from the set
+// return the value
+function NDX_mt::pop(k) {
+   var v = this[k];
+   this[k] = null;
+   if( v != null ) {
+      this.__nxt = math.min(this.__nxt, v);
+   }
+   return v;
+}
+
+
+//-- tests
+
+var function tests() {
+   // #1: straight fill
+   {
+      var set1 = NDX_mt->new(4, 't#1');
+      for( i = 0, 3 ) {
+         var ndx, nw = set1->add(('t1-s%d')->format(i));
+         assert (ndx == i && nw == true, ('should get straight in order new values (%d %s, %s)')->format(i, ndx, nw));
+      }
+      var ok, ndx, nw = pcall(set1.add, set1, 'should fail');
+      assert (! ok && ndx->match('t#1 overflow$'), ('didn\'t fail? (%s, %q)')->format(ok, ndx));
+   }
+
+   // remove last
+   {
+      var set1 = NDX_mt->new(4, 't#2');
+      for( i = 0, 3 ) {
+         var ndx, nw = set1->add(('t2-s%d')->format(i));
+      }
+      var v = set1->pop('t2-s3');
+      assert (v == 3, 'wrong value popped');
+      var ndx, nw = set1->add('t2-z400');
+      assert (ndx == 3 && nw, 'wrong reinserted value');
+   }
+
+   // remove at middle
+   {
+      var set1 = NDX_mt->new(4, 't#3');
+      for( i = 0, 2 ) {
+         var ndx, nw = set1->add(('t3-s%d')->format(i));
+      }
+      var v = set1->pop('t3-s1');
+      assert (v == 1, 'wrong value popped');
+      var ndx, nw = set1->add('t2-z400');
+      assert (ndx == 1 && nw, ('wrong first reinserted value (%s, %s)')->format(ndx, nw));
+      ndx, nw = set1->add('t2-z500');
+      assert (ndx == 3 && nw, ('wrong last reinserted value (%s, %s)')->format(ndx, nw));
+   }
+   print ('ok');
+}
+
+if( (...) == '-t' ) { tests(); }
+
+
+
+return NDX_mt;

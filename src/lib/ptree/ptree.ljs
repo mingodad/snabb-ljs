@@ -1,0 +1,806 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+module(...,package.seeall);
+
+var S = require("syscall");
+var ffi = require("ffi");
+var C = ffi.C;
+var app_graph = require("core.config");
+var lib = require("core.lib");
+var shm = require("core.shm");
+var timer = require("core.timer");
+var worker = require("core.worker");
+var cltable = require("lib.cltable");
+var cpuset = require("lib.cpuset");
+var scheduling = require("lib.scheduling");
+var yang = require("lib.yang.yang");
+var util = require("lib.yang.util");
+var schema = require("lib.yang.schema");
+var rpc = require("lib.yang.rpc");
+var state = require("lib.yang.state");
+var path_mod = require("lib.yang.path");
+var path_data = require("lib.yang.path_data");
+var action_codec = require("lib.ptree.action_codec");
+var alarm_codec = require("lib.ptree.alarm_codec");
+var support = require("lib.ptree.support");
+var channel = require("lib.ptree.channel");
+var trace = require("lib.ptree.trace");
+var alarms = require("lib.yang.alarms");
+
+var Manager = {};
+
+var log_levels = { DEBUG=1, INFO=2, WARN=3 };
+var default_log_level = "WARN";
+if( os.getenv('SNABB_MANAGER_VERBOSE') ) { default_log_level = "DEBUG"; }
+
+var manager_config_spec = {
+   name = {},
+   socket_file_name = {default='config-leader-socket'},
+   setup_fn = {required=true},
+   // Could relax this requirement.
+   initial_configuration = {required=true},
+   schema_name = {required=true},
+   worker_default_scheduling = {default={}},
+   default_schema = {},
+   log_level = {default=default_log_level},
+   rpc_trace_file = {},
+   cpuset = {default=cpuset.global_cpuset()},
+   Hz = {default=100},
+};
+
+var function open_socket (file) {
+   S.signal('pipe', 'ign');
+   var socket = assert(S.socket("unix", "stream, nonblock"));
+   S.unlink(file); //unlink to avoid EINVAL on bind()
+   var sa = S.t.sockaddr_un(file);
+   assert(socket->bind(sa));
+   assert(socket->listen());
+   return socket;
+}
+
+function new_manager (conf) {
+   conf = lib.parse(conf, manager_config_spec);
+
+   var ret = setmetatable({}, {__index=Manager});
+   ret.name = conf.name;
+   ret.log_level = assert(log_levels[conf.log_level]);
+   ret.cpuset = conf.cpuset;
+   ret.socket_file_name = conf.socket_file_name;
+   if( ! ret.socket_file_name->match('^/') ) {
+      var instance_dir = shm.root..'/'..tostring(S.getpid());
+      ret.socket_file_name = instance_dir..'/'..ret.socket_file_name;
+   }
+   ret.schema_name = conf.schema_name;
+   ret.default_schema = conf.default_schema || conf.schema_name;
+   ret.support = support.load_schema_config_support(conf.schema_name);
+   ret.peers = {};
+   ret.setup_fn = conf.setup_fn;
+   ret.period = 1/conf.Hz;
+   ret.worker_default_scheduling = conf.worker_default_scheduling;
+   ret.workers = {};
+   ret.state_change_listeners = {};
+
+   if( conf.rpc_trace_file ) {
+      ret->info("Logging RPCs to %s", conf.rpc_trace_file);
+      ret.trace = trace.new({file=conf.rpc_trace_file});
+
+      // Start trace with initial configuration.
+      var p = path_data.printer_for_schema_by_name(
+         ret.schema_name, "/", true, "yang", false);
+      var conf_str = p(conf.initial_configuration, yang.string_io_file());
+      ret.trace->record('set-config', {schema=ret.schema_name, config=conf_str});
+   }
+
+   ret.rpc_callee = rpc.prepare_callee('snabb-config-leader-v1');
+   ret.rpc_handler = rpc.dispatch_handler(ret, 'rpc_', ret.trace);
+
+   ret->set_initial_configuration(conf.initial_configuration);
+
+   ret->start();
+
+   return ret;
+}
+
+function Manager::log (level, fmt, ...) {
+   if( log_levels[level] < this.log_level ) { return; }
+   var prefix = os.date("%F %H:%M:%S")..": "..level..': ';
+   io.stderr->write(prefix..fmt->format(...)..'\n');
+   io.stderr->flush();
+}
+
+function Manager::debug(fmt, ...) { this->log("DEBUG", fmt, ...); }
+function Manager::info(fmt, ...) { this->log("INFO", fmt, ...); }
+function Manager::warn(fmt, ...) { this->log("WARN", fmt, ...); }
+
+function Manager::add_state_change_listener(listener) {
+   table.insert(this.state_change_listeners, listener);
+   for( id, worker in pairs(this.workers) ) {
+      listener->worker_starting(id);
+      if( worker.channel ) { listener->worker_started(id, worker.pid); }
+      if( worker.shutting_down ) { listener->worker_stopping(id); }
+   }
+}
+
+function Manager::remove_state_change_listener(listener) {
+   for( i, x in ipairs(this.state_change_listeners) ) {
+      if( x == listener ) {
+         table.remove(this.state_change_listeners, i);
+         return;
+      }
+   }
+   error("listener not found");
+}
+
+function Manager::state_change_event(event, ...) {
+   for( _,listener in ipairs(this.state_change_listeners) ) {
+      listener[event](listener, ...);
+   }
+}
+
+function Manager::set_initial_configuration (configuration) {
+   this.current_configuration = configuration;
+   this.current_in_place_dependencies = {};
+
+   // Start the workers and configure them.
+   var worker_app_graphs = this.setup_fn(configuration);
+
+   // Calculate the dependences
+   this.current_in_place_dependencies =
+      this.support.update_mutable_objects_embedded_in_app_initargs (
+	    {}, worker_app_graphs, this.schema_name, 'load',
+            '/', this.current_configuration);
+
+   // Iterate over workers starting the workers and queuing up actions.
+   for( id, worker_app_graph in pairs(worker_app_graphs) ) {
+      this->start_worker_for_graph(id, worker_app_graph);
+   }
+}
+
+function Manager::start () {
+   if( this.name ) { engine.claim_name(this.name); }
+   this.cpuset->bind_to_numa_node();
+   this.socket = open_socket(this.socket_file_name);
+}
+
+function Manager::start_worker(sched_opts) {
+   var code = {
+      scheduling.stage(sched_opts),
+      "require('lib.ptree.worker').main()"
+   };
+   return worker.start("worker", table.concat(code, "\n"));
+}
+
+function Manager::stop_worker(id) {
+   this->info('Asking worker %s to shut down.', id);
+   var stop_actions = {{'shutdown', {}}, {'commit', {}}};
+   this->state_change_event('worker_stopping', id);
+   this->enqueue_config_actions_for_worker(id, stop_actions);
+   this->send_messages_to_workers();
+   this.workers[id].shutting_down = true;
+}
+
+function Manager::remove_stale_workers() {
+   var stale = {};
+   for( id, worker in pairs(this.workers) ) {
+      if( worker.shutting_down ) {
+	 if( S.waitpid(worker.pid, S.c.W["NOHANG"]) != 0 ) {
+	    stale[#stale + 1] = id;
+	 }
+      }
+   }
+   for( _, id in ipairs(stale) ) {
+      this->state_change_event('worker_stopped', id);
+      if( this.workers[id].scheduling.cpu ) {
+	 this.cpuset->release(this.workers[id].scheduling.cpu);
+      }
+      this.workers[id] = null;
+
+   }
+}
+
+function Manager::acquire_cpu_for_worker(id, app_graph) {
+   var pci_addresses = {};
+   // Grovel through app initargs for keys named "pciaddr".  Hacky!
+   for( name, init in pairs(app_graph.apps) ) {
+      if( type(init.arg) == 'table' ) {
+         for( k, v in pairs(init.arg) ) {
+            if( k == 'pciaddr' ) { table.insert(pci_addresses, v); }
+         }
+      }
+   }
+   return this.cpuset->acquire_for_pci_addresses(pci_addresses);
+}
+
+function Manager::compute_scheduling_for_worker(id, app_graph) {
+   var ret = {};
+   for( k, v in pairs(this.worker_default_scheduling) ) { ret[k] = v; }
+   ret.cpu = this->acquire_cpu_for_worker(id, app_graph);
+   return ret;
+}
+
+function Manager::start_worker_for_graph(id, graph) {
+   var scheduling = this->compute_scheduling_for_worker(id, graph);
+   this->info('Starting worker %s.', id);
+   this.workers[id] = { scheduling=scheduling,
+                        pid=this->start_worker(scheduling),
+                        queue={}, graph=graph };
+   this->state_change_event('worker_starting', id);
+   this->debug('Worker %s has PID %s.', id, this.workers[id].pid);
+   var actions = this.support.compute_config_actions(
+      app_graph.new(), this.workers[id].graph, {}, 'load');
+   this->enqueue_config_actions_for_worker(id, actions);
+   return this.workers[id];
+}
+
+function Manager::take_worker_message_queue () {
+   var actions = this.config_action_queue;
+   this.config_action_queue = null;
+   return actions;
+}
+
+function Manager::enqueue_config_actions_for_worker(id, actions) {
+   for( _,action in ipairs(actions) ) {
+      this->debug('encode %s for worker %s', action[1], id);
+      var buf, len = action_codec.encode(action);
+      table.insert(this.workers[id].queue, { buf=buf, len=len });
+   }
+}
+
+function Manager::enqueue_config_actions (actions) {
+   for( id,_ in pairs(this.workers) ) {
+      this.enqueue_config_actions_for_worker(id, actions);
+   }
+}
+
+function Manager::rpc_describe (args) {
+   var alternate_schemas = {};
+   for( schema_name, translator in pairs(this.support.translators) ) {
+      table.insert(alternate_schemas, schema_name);
+   }
+   return { native_schema = this.schema_name,
+	    default_schema = this.default_schema,
+            alternate_schema = alternate_schemas,
+            capability = schema.get_default_capabilities() };
+}
+
+function Manager::rpc_get_schema (args) {
+   var function getter() {
+      return { source = schema.load_schema_source_by_name(
+                  args.schema, args.revision) };
+   }
+   var success, response = pcall(getter);
+   if( success ) { return response; } else { return {status=1, error=response}; }
+}
+
+function Manager::rpc_get_config (args) {
+   var function getter() {
+      if( args.schema != this.schema_name ) {
+         return this->foreign_rpc_get_config(
+            args.schema, args.path, args.format, args.print_default);
+      }
+      var printer = path_data.printer_for_schema_by_name(
+         args.schema, args.path, true, args.format, args.print_default);
+      var config = printer(this.current_configuration, yang.string_io_file());
+      return { config = config };
+   }
+   var success, response = pcall(getter);
+   if( success ) { return response; } else { return {status=1, error=response}; }
+}
+
+function Manager::rpc_set_alarm_operator_state (args) {
+   var function getter() {
+      if( args.schema != this.schema_name ) {
+         error(("Set-operator-state operation not supported in '%s' schema")->format(args.schema));
+      }
+      var key = {resource=args.resource, alarm_type_id=args.alarm_type_id,
+                   alarm_type_qualifier=args.alarm_type_qualifier};
+      var params = {state=args.state, text=args.text};
+      return { success = alarms.set_operator_state(key, params) };
+   }
+   var success, response = pcall(getter);
+   if( success ) { return response; } else { return {status=1, error=response}; }
+}
+
+function Manager::rpc_purge_alarms (args) {
+   var function purge() {
+      if( args.schema != this.schema_name ) {
+         error(("Purge-alarms operation not supported in '%s' schema")->format(args.schema));
+      }
+      return { purged_alarms = alarms.purge_alarms(args) };
+   }
+   var success, response = pcall(purge);
+   if( success ) { return response; } else { return {status=1, error=response}; }
+}
+
+function Manager::rpc_compress_alarms (args) {
+   var function compress() {
+      if( args.schema != this.schema_name ) {
+         error(("Compress-alarms operation not supported in '%s' schema")->format(args.schema));
+      }
+      return { compressed_alarms = alarms.compress_alarms(args) };
+   }
+   var success, response = pcall(compress);
+   if( success ) { return response; } else { return {status=1, error=response}; }
+}
+
+function Manager::notify_pre_update (config, verb, path, ...) {
+   for( _,translator in pairs(this.support.translators) ) {
+      translator.pre_update(config, verb, path, ...);
+   }
+}
+
+function Manager::update_configuration (update_fn, verb, path, ...) {
+   this->notify_pre_update(this.current_configuration, verb, path, ...);
+   var to_restart =
+      this.support.compute_apps_to_restart_after_configuration_update (
+         this.schema_name, this.current_configuration, verb, path,
+         this.current_in_place_dependencies, ...);
+   var new_config = update_fn(this.current_configuration, ...);
+   var new_graphs = this.setup_fn(new_config, ...);
+   for( id, graph in pairs(new_graphs) ) {
+      if( this.workers[id] == null ) {
+	 this->start_worker_for_graph(id, graph);
+      }
+   }
+
+   for( id, worker in pairs(this.workers) ) {
+      if( new_graphs[id] == null ) {
+         this->stop_worker(id);
+      } else {
+	 var actions = this.support.compute_config_actions(
+	    worker.graph, new_graphs[id], to_restart, verb, path, ...);
+	 this->enqueue_config_actions_for_worker(id, actions);
+	 worker.graph = new_graphs[id];
+      }
+   }
+   this.current_configuration = new_config;
+   this.current_in_place_dependencies =
+      this.support.update_mutable_objects_embedded_in_app_initargs (
+         this.current_in_place_dependencies, new_graphs, verb, path, ...);
+}
+
+function Manager::handle_rpc_update_config (args, verb, compute_update_fn) {
+   var path = path_mod.normalize_path(args.path);
+   var parser = path_data.parser_for_schema_by_name(args.schema, path);
+   this->update_configuration(compute_update_fn(args.schema, path),
+                             verb, path, parser(args.config));
+   return {};
+}
+
+function Manager::get_native_state () {
+   var states = {};
+   var state_reader = this.support.compute_state_reader(this.schema_name);
+   for( _, worker in pairs(this.workers) ) {
+      var worker_config = this.support.configuration_for_worker(
+         worker, this.current_configuration);
+      table.insert(states, state_reader(worker.pid, worker_config));
+   }
+   return this.support.process_states(states);
+}
+
+function Manager::get_translator (schema_name) {
+   var translator = this.support.translators[schema_name];
+   if( translator ) { return translator; }
+   error('unsupported schema: '..schema_name);
+}
+function Manager::apply_translated_rpc_updates (updates) {
+   for( _,update in ipairs(updates) ) {
+      var verb, args = unpack(update);
+      var method = assert(this['rpc_'..verb..'_config']);
+      method(this, args);
+   }
+   return {};
+}
+function Manager::foreign_rpc_get_config (schema_name, path, format,
+                                        print_default) {
+   path = path_mod.normalize_path(path);
+   var translate = this->get_translator(schema_name);
+   var foreign_config = translate.get_config(this.current_configuration);
+   var printer = path_data.printer_for_schema_by_name(
+      schema_name, path, true, format, print_default);
+   var config = printer(foreign_config, yang.string_io_file());
+   return { config = config };
+}
+function Manager::foreign_rpc_get_state (schema_name, path, format,
+                                       print_default) {
+   path = path_mod.normalize_path(path);
+   var translate = this->get_translator(schema_name);
+   var foreign_state = translate.get_state(this->get_native_state());
+   var printer = path_data.printer_for_schema_by_name(
+      schema_name, path, false, format, print_default);
+   var state = printer(foreign_state, yang.string_io_file());
+   return { state = state };
+}
+function Manager::foreign_rpc_set_config (schema_name, path, config_str) {
+   path = path_mod.normalize_path(path);
+   var translate = this->get_translator(schema_name);
+   var parser = path_data.parser_for_schema_by_name(schema_name, path);
+   var updates = translate.set_config(this.current_configuration, path,
+                                        parser(config_str));
+   return this->apply_translated_rpc_updates(updates);
+}
+function Manager::foreign_rpc_add_config (schema_name, path, config_str) {
+   path = path_mod.normalize_path(path);
+   var translate = this->get_translator(schema_name);
+   var parser = path_data.parser_for_schema_by_name(schema_name, path);
+   var updates = translate.add_config(this.current_configuration, path,
+                                        parser(config_str));
+   return this->apply_translated_rpc_updates(updates);
+}
+function Manager::foreign_rpc_remove_config (schema_name, path) {
+   path = path_mod.normalize_path(path);
+   var translate = this->get_translator(schema_name);
+   var updates = translate.remove_config(this.current_configuration, path);
+   return this->apply_translated_rpc_updates(updates);
+}
+
+function Manager::rpc_set_config (args) {
+   var function setter() {
+      if( this.listen_peer != null && this.listen_peer != this.rpc_peer ) {
+         error('Attempt to modify configuration while listener attached');
+      }
+      if( args.schema != this.schema_name ) {
+         return this->foreign_rpc_set_config(args.schema, args.path, args.config);
+      }
+      return this->handle_rpc_update_config(
+         args, 'set', path_data.setter_for_schema_by_name);
+   }
+   var success, response = pcall(setter);
+   if( success ) { return response; } else { return {status=1, error=response}; }
+}
+
+function Manager::rpc_add_config (args) {
+   var function adder() {
+      if( this.listen_peer != null && this.listen_peer != this.rpc_peer ) {
+         error('Attempt to modify configuration while listener attached');
+      }
+      if( args.schema != this.schema_name ) {
+         return this->foreign_rpc_add_config(args.schema, args.path, args.config);
+      }
+      return this->handle_rpc_update_config(
+         args, 'add', path_data.adder_for_schema_by_name);
+   }
+   var success, response = pcall(adder);
+   if( success ) { return response; } else { return {status=1, error=response}; }
+}
+
+function Manager::rpc_remove_config (args) {
+   var function remover() {
+      if( this.listen_peer != null && this.listen_peer != this.rpc_peer ) {
+         error('Attempt to modify configuration while listener attached');
+      }
+      if( args.schema != this.schema_name ) {
+         return this->foreign_rpc_remove_config(args.schema, args.path);
+      }
+      var path = path_mod.normalize_path(args.path);
+      this->update_configuration(
+         path_data.remover_for_schema_by_name(args.schema, path), 'remove', path);
+      return {};
+   }
+   var success, response = pcall(remover);
+   if( success ) { return response; } else { return {status=1, error=response}; }
+}
+
+function Manager::rpc_attach_listener (args) {
+   var function attacher() {
+      if( this.listen_peer != null ) { error('Listener already attached'); }
+      this.listen_peer = this.rpc_peer;
+      return {};
+   }
+   var success, response = pcall(attacher);
+   if( success ) { return response; } else { return {status=1, error=response}; }
+}
+
+function Manager::rpc_get_state (args) {
+   var function getter() {
+      if( args.schema != this.schema_name ) {
+         return this->foreign_rpc_get_state(args.schema, args.path,
+                                           args.format, args.print_default);
+      }
+      var state = this->get_native_state();
+      var printer = path_data.printer_for_schema_by_name(
+         this.schema_name, args.path, false, args.format, args.print_default);
+      return { state = printer(state, yang.string_io_file()) };
+   }
+   var success, response = pcall(getter);
+   if( success ) { return response; } else { return {status=1, error=response}; }
+}
+
+function Manager::rpc_get_alarms_state (args) {
+   var function getter() {
+      assert(args.schema == "ietf-alarms");
+      var printer = path_data.printer_for_schema_by_name(
+         args.schema, args.path, false, args.format, args.print_default);
+      var state = {
+         alarms = alarms.get_state()
+      };
+      state = printer(state, yang.string_io_file());
+      return { state = state };
+   }
+   var success, response = pcall(getter);
+   if( success ) { return response; } else { return {status=1, error=response}; }
+}
+
+function Manager::handle (payload) {
+   return rpc.handle_calls(this.rpc_callee, payload, this.rpc_handler);
+}
+
+var dummy_unix_sockaddr = S.t.sockaddr_un();
+
+function Manager::handle_calls_from_peers() {
+   var peers = this.peers;
+   while( true ) {
+      var fd, err = this.socket->accept(dummy_unix_sockaddr);
+      if( ! fd ) {
+         if( err.AGAIN ) { break; }
+         assert(null, err);
+      }
+      fd->nonblock();
+      table.insert(peers, { state='length', len=0, fd=fd });
+   }
+   var i = 1;
+   while( i <= #peers ) {
+      var peer = peers[i];
+      var visit_peer_again = false;
+      while( peer.state == 'length' ) {
+         var ch, err = peer.fd->read(null, 1);
+         if( ! ch ) {
+            if( err.AGAIN ) { break; }
+            peer.state = 'error';
+            peer.msg = tostring(err);
+         } else if( ch == '\n' ) {
+            peer.pos = 0;
+            peer.buf = ffi.new('uint8_t[?]', peer.len);
+            peer.state = 'payload';
+         } else if( tonumber(ch) ) {
+            peer.len = peer.len * 10 + tonumber(ch);
+            if( peer.len > 1e8 ) {
+               peer.state = 'error';
+               peer.msg = 'length too long: '..peer.len;
+            }
+         } else if( ch == '' ) {
+            if( peer.len == 0 ) {
+               peer.state = 'done';
+            } else {
+               peer.state = 'error';
+               peer.msg = 'unexpected EOF';
+            }
+         } else {
+            peer.state = 'error';
+            peer.msg = 'unexpected character: '..ch;
+         }
+      }
+      while( peer.state == 'payload' ) {
+         if( peer.pos == peer.len ) {
+            peer.state = 'ready';
+            peer.payload = ffi.string(peer.buf, peer.len);
+            peer.buf, peer.len = null, null;
+         } else {
+            var count, err = peer.fd->read(peer.buf + peer.pos,
+                                            peer.len - peer.pos);
+            if( ! count ) {
+               if( err.AGAIN ) { break; }
+               peer.state = 'error';
+               peer.msg = tostring(err);
+            } else if( count == 0 ) {
+               peer.state = 'error';
+               peer.msg = 'short read';
+            } else {
+               peer.pos = peer.pos + count;
+               assert(peer.pos <= peer.len);
+            }
+         }
+      }
+      while( peer.state == 'ready' ) {
+         // Uncomment to get backtraces.
+         this.rpc_peer = peer;
+         // local success, reply = true, self:handle(peer.payload)
+         var success, reply = pcall(this.handle, this, peer.payload);
+         this.rpc_peer = null;
+         peer.payload = null;
+         if( success ) {
+            assert(type(reply) == 'string');
+            reply = #reply..'\n'..reply;
+            peer.state = 'reply';
+            peer.buf = ffi.new('uint8_t[?]', #reply+1, reply);
+            peer.pos = 0;
+            peer.len = #reply;
+         } else {
+            peer.state = 'error';
+            peer.msg = reply;
+         }
+      }
+      while( peer.state == 'reply' ) {
+         if( peer.pos == peer.len ) {
+            visit_peer_again = true;
+            peer.state = 'length';
+            peer.buf, peer.pos = null, null;
+            peer.len = 0;
+         } else {
+            var count, err = peer.fd->write(peer.buf + peer.pos,
+                                             peer.len - peer.pos);
+            if( ! count ) {
+               if( err.AGAIN ) { break; }
+               peer.state = 'error';
+               peer.msg = tostring(err);
+            } else if( count == 0 ) {
+               peer.state = 'error';
+               peer.msg = 'short write';
+            } else {
+               peer.pos = peer.pos + count;
+               assert(peer.pos <= peer.len);
+            }
+         }
+      }
+      if( peer.state == 'done' || peer.state == 'error' ) {
+         if( peer.state == 'error' ) { this->warn('%s', peer.msg); }
+         peer.fd->close();
+         table.remove(peers, i);
+         if( this.listen_peer == peer ) { this.listen_peer = null; }
+      } else if( ! visit_peer_again ) {
+         ++i    ;
+      }
+   }
+}
+
+function Manager::send_messages_to_workers() {
+   for( id,worker in pairs(this.workers) ) {
+      if( ! worker.channel ) {
+         var name = '/'..tostring(worker.pid)..'/config-worker-channel';
+         var success, channel = pcall(channel.open, name);
+         if( success ) {
+            worker.channel = channel;
+            this->state_change_event('worker_started', id, worker.pid);
+            this->info("Worker %s has started (PID %s).", id, worker.pid);
+         }
+      }
+      var channel = worker.channel;
+      if( channel ) {
+         var queue = worker.queue;
+         worker.queue = {};
+         var requeue = false;
+         for( _,msg in ipairs(queue) ) {
+            if( ! requeue ) {
+               requeue = ! channel->put_message(msg.buf, msg.len);
+            }
+            if( requeue ) { table.insert(worker.queue, msg); }
+         }
+      }
+   }
+}
+
+function Manager::receive_alarms_from_workers () {
+   for( _,worker in pairs(this.workers) ) {
+      this->receive_alarms_from_worker(worker);
+   }
+}
+
+function Manager::receive_alarms_from_worker (worker) {
+   if( ! worker.alarms_channel ) {
+      var name = '/'..tostring(worker.pid)..'/alarms-worker-channel';
+      var success, channel = pcall(channel.open, name);
+      if( ! success ) { return; }
+      worker.alarms_channel = channel;
+   }
+   var channel = worker.alarms_channel;
+   while( true ) {
+      var buf, len = channel->peek_message();
+      if( ! buf ) { break; }
+      var alarm = alarm_codec.decode(buf, len);
+      this->handle_alarm(worker, alarm);
+      channel->discard_message(len);
+   }
+}
+
+function Manager::handle_alarm (worker, alarm) {
+   var fn, args = unpack(alarm);
+   var key;
+   if( fn == 'raise_alarm' ) {
+      key, args = alarm_codec.to_alarm(args);
+      alarms.raise_alarm(key, args);
+   }
+   if( fn == 'clear_alarm' ) {
+      key = alarm_codec.to_alarm(args);
+      alarms.clear_alarm(key);
+   }
+   if( fn == 'add_to_inventory' ) {
+      key, args = alarm_codec.to_alarm_type(args);
+      alarms.do_add_to_inventory(key, args);
+   }
+   if( fn == 'declare_alarm' ) {
+      key, args = alarm_codec.to_alarm(args);
+      alarms.do_declare_alarm(key, args);
+   }
+}
+
+function Manager::stop () {
+   for( _,peer in ipairs(this.peers) ) { peer.fd->close(); }
+   this.peers = {};
+   this.socket->close();
+   S.unlink(this.socket_file_name);
+
+   for( id, worker in pairs(this.workers) ) {
+      if( ! worker.shutting_down ) { this->stop_worker(id); }
+   }
+   // Wait 250ms for workers to shut down nicely, polling every 5ms.
+   var start = C.get_monotonic_time();
+   var wait = 0.25;
+   while( C.get_monotonic_time() < start + wait ) {
+      this->remove_stale_workers();
+      if( ! next(this.workers) ) { break; }
+      C.usleep(5000);
+   }
+   // If that didn't work, send SIGKILL and wait indefinitely.
+   for( id, worker in pairs(this.workers) ) {
+      this->warn('Forcing worker %s to shut down.', id);
+      S.kill(worker.pid, "KILL");
+   }
+   while( next(this.workers) ) {
+      this->remove_stale_workers();
+      C.usleep(5000);
+   }
+   if( this.name ) { engine.unclaim_name(this.name); }
+   this->info('Shutdown complete.');
+}
+
+function Manager::main (duration) {
+   var now = C.get_monotonic_time();
+   var stop = now + (duration || 1/0);
+   while( now < stop ) {
+      next_time = now + this.period;
+      if( timer.ticks ) { timer.run_to_time(now * 1e9); }
+      this->remove_stale_workers();
+      this->handle_calls_from_peers();
+      this->send_messages_to_workers();
+      this->receive_alarms_from_workers();
+      now = C.get_monotonic_time();
+      if( now < next_time ) {
+         C.usleep(math.floor((next_time - now) * 1e6));
+         now = C.get_monotonic_time();
+      }
+   }
+}
+
+function main (opts, duration) {
+   var m = new_manager(opts);
+   m->main(duration);
+   m->stop();
+}
+
+function selftest () {
+   print('selftest: lib.ptree.ptree');
+   var function setup_fn(cfg) {
+      var graph = app_graph.new();
+      var basic_apps = require('apps.basic.basic_apps');
+      app_graph.app(graph, "source", basic_apps.Source, {});
+      app_graph.app(graph, "sink", basic_apps.Sink, {});
+      app_graph.link(graph, "source.foo -> sink.bar");
+      return {graph};
+   }
+   var m = new_manager({setup_fn=setup_fn,
+                          // Use a schema with no data nodes, just for
+                          // testing.
+                          schema_name='ietf-inet-types',
+                          initial_configuration={},
+                          log_level="DEBUG"});
+   var l = {log={}};
+   function l::worker_starting(...) { table.insert(this.log,{'starting',...}); }
+   function l::worker_started(...) {  table.insert(this.log,{'started',...});  }
+   function l::worker_stopping(...) { table.insert(this.log,{'stopping',...}); }
+   function l::worker_stopped(...) {  table.insert(this.log,{'stopped',...});  }
+   m->add_state_change_listener(l);
+   assert(m.workers[1]);
+   var pid = m.workers[1].pid;
+   assert(m.workers[1].graph.links);
+   assert(m.workers[1].graph.links["source.foo -> sink.bar"]);
+   // Worker will be started once main loop starts to run.
+   assert(! m.workers[1].channel);
+   // Wait for worker to start.
+   while( ! m.workers[1].channel ) { m->main(0.005); }
+   m->stop();
+   assert(m.workers[1] == null);
+   assert(lib.equal(l.log,
+                    { {'starting', 1}, {'started', 1, pid}, {'stopping', 1},
+                      {'stopped', 1} }));
+   print('selftest: ok');
+}

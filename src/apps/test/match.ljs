@@ -1,0 +1,98 @@
+module(...,package.seeall);
+
+var ffi = require("ffi");
+var C = ffi.C;
+var lib = require("core.lib");
+
+var function dump (p) {
+   return lib.hexdump(ffi.string(p.data, p.length));
+}
+
+Match = {
+   config = {
+      fuzzy = {}, modest = {}
+   }
+};
+
+function Match::new (conf) {
+   return setmetatable({ fuzzy = conf.fuzzy,
+                         modest = conf.modest,
+                         seen = 0,
+                         errs = { } },
+                       { __index=Match });
+}
+
+function Match::push () {
+   while( ! link.empty(this.input.rx) ) {
+      var p = link.receive(this.input.rx);
+      var cmp = link.front(this.input.comparator);
+      if( ! cmp ) {
+      } else if( cmp.length != p.length
+         || C.memcmp(cmp.data, p.data, cmp.length) != 0 ) {
+         if( ! this.fuzzy ) {
+            table.insert(this.errs, "Mismatch:\n"..dump(cmp).."\n"..dump(p));
+         }
+      } else {
+         this.seen = this.seen + 1;
+         packet.free(link.receive(this.input.comparator));
+      }
+      packet.free(p);
+   }
+}
+
+function Match::report () {
+   for( _, error in ipairs(this->errors()) ) {
+      print(error);
+   }
+}
+
+function Match::errors () {
+   if( ! (this.modest && this.seen > 0) ) {
+      while( ! link.empty(this.input.comparator) ) {
+         var p = link.receive(this.input.comparator);
+         table.insert(this.errs, "Not matched:\n"..dump(p));
+         packet.free(p);
+      }
+   }
+   return this.errs;
+}
+
+function selftest() {
+   var basic_apps = require("apps.basic.basic_apps");
+   var c = config.new();
+
+   config.app(c, "sink", Match, {modest=true});
+   config.app(c, "comparator", basic_apps.Source, 8);
+   config.link(c, "comparator.output -> sink.comparator");
+   engine.configure(c);
+   engine.app_table.sink.input.rx = link.new("null");
+   engine.app_table.sink.seen = 1;
+   engine.main({duration=0.0001});
+   assert(#engine.app_table.sink->errors() == 0);
+
+   engine.configure(config.new());
+   config.app(c, "sink", Match);
+   config.app(c, "src", basic_apps.Source, 8);
+   config.link(c, "src.output -> sink.rx");
+   engine.configure(c);
+   engine.main({duration=0.0001});
+   assert(#engine.app_table.sink->errors() == 0);
+
+   engine.configure(config.new());
+   config.app(c, "comparator", basic_apps.Source, 12);
+   engine.configure(c);
+   engine.main({duration=0.0001});
+   assert(#engine.app_table.sink->errors() > 0);
+
+   engine.configure(config.new());
+   config.app(c, "sink", Match, {fuzzy=true});
+   config.app(c, "comparator", basic_apps.Source, 8);
+   config.app(c, "garbage", basic_apps.Source, 12);
+   config.app(c, "join", basic_apps.Join);
+   config.link(c, "src.output -> join.src");
+   config.link(c, "garbage.output -> join.garbage");
+   config.link(c, "join.output -> sink.rx");
+   engine.configure(c);
+   engine.main({duration=0.0001});
+   assert(#engine.app_table.sink->errors() == 0);
+}

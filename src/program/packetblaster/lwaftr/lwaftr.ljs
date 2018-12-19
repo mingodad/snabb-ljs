@@ -1,0 +1,248 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+module(..., package.seeall);
+
+var engine    = require("core.app");
+var config    = require("core.config");
+var timer     = require("core.timer");
+var pci       = require("lib.hardware.pci");
+var main      = require("core.main");
+var S         = require("syscall");
+var Lwaftrgen = require("program.packetblaster.lwaftr.lib").Lwaftrgen;
+var Tap       = require("apps.tap.tap").Tap;
+var raw       = require("apps.socket.raw");
+var pcap      = require("apps.pcap.pcap");
+var VhostUser = require("apps.vhost.vhost_user").VhostUser;
+var lib       = require("core.lib");
+
+var usage = require("program.packetblaster.lwaftr.README_inc");
+
+var long_opts = {
+   pci          = "p",    // PCI address
+   tap          = "t",    // tap interface
+   int          = "i",    // Linux network interface, e.g. eth0
+   sock         = "k",    // socket name for virtio
+   duration     = "D",    // terminate after n seconds
+   verbose      = "V",    // verbose, display stats
+   help         = "h",    // display help text
+   size         = "S",    // frame size list (defaults to IMIX)
+   src_mac      = "s",    // source ethernet address
+   dst_mac      = "d",    // destination ethernet address
+   vlan         = "v",    // VLAN id
+   b4           = "b",    // B4 start IPv6_address,IPv4_address,port
+   aftr         = "a",    // fix AFTR public IPv6_address
+   ipv4         = "I",    // fix public IPv4 address
+   count        = "c",    // how many b4 clients to simulate
+   rate         = "r",    // rate in MPPS (0 => listen only)
+   v4only       = "4",    // generate only public IPv4 traffic
+   v6only       = "6",    // generate only public IPv6 encapsulated traffic
+   pcap         = "o"     // output packet to the pcap file
+};
+
+var function dir_exists(path) {
+  var stat = S.stat(path);
+  return stat && stat.isdir;
+}
+
+function run (args) {
+   var opt = {};
+   var duration;
+   var c = config.new();
+
+   function opt.D (arg) {
+      duration = assert(tonumber(arg), "duration is not a number!");
+   }
+
+   var verbose;
+   function opt.V (arg) {
+      verbose = true;
+   }
+
+   function opt.h (arg) {
+      print(usage);
+      main.exit(0);
+   }
+
+   var sizes = { 64, 64, 64, 64, 64, 64, 64, 594, 594, 594, 1500 };
+   function opt.S (arg) {
+      sizes = {};
+      for( size in string.gmatch(arg, "%d+") ) {
+         sizes[#sizes + 1] = assert(tonumber(size), "size not a number: "..size);
+      }
+   }
+
+   var src_mac = "00:00:00:00:00:00";
+   function opt.s (arg) { src_mac = arg; }
+
+   var dst_mac = "00:00:00:00:00:00";
+   function opt.d (arg) { dst_mac = arg; }
+
+   var b4_ipv6, b4_ipv4, b4_port = "2001:db8::", "10.0.0.0", 1024;
+   function opt.b (arg) { 
+      for( s in string.gmatch(arg, "[%w.:]+") ) {
+         if( string.find(s, ":") ) {
+            b4_ipv6 = s;
+         } else if( string.find(s, '.',1,true) ) {
+            b4_ipv4 = s;
+         } else {
+            b4_port = assert(tonumber(s), string.format("UDP port %s is not a number!", s));
+         }
+      }
+   }
+
+   var public_ipv4 = "8.8.8.8";
+   function opt.I (arg) { public_ipv4 = arg; }
+
+   var aftr_ipv6 = "2001:db8:ffff::100";
+   function opt.a (arg) { aftr_ipv6 = arg; }
+
+   var count = 1;
+   function opt.c (arg) { 
+      count = assert(tonumber(arg), "count is not a number!");
+   }
+
+   var rate = 1;
+   function opt.r (arg) { 
+      rate = assert(tonumber(arg), "rate is not a number!");
+   }
+
+   var target; 
+   var pciaddr;
+   function opt.p (arg) { 
+      pciaddr = arg;
+      target = pciaddr;
+   }
+
+   var tap_interface;
+   function opt.t (arg) { 
+      tap_interface = arg;
+      target = tap_interface;
+   }
+
+   var int_interface;
+   function opt.i (arg) { 
+      int_interface = arg;
+      target = int_interface;
+   }
+
+   var sock_interface;
+   function opt.k (arg) { 
+      sock_interface = arg;
+      target = sock_interface;
+   }
+
+   var ipv4_only = false;
+   function opt.v4 () { ipv4_only = true; }
+   opt["4"] = opt.v4;
+
+   var ipv6_only = false;
+   function opt.v6 () { ipv6_only = true; }
+   opt["6"] = opt.v6;
+
+   var vlan = null;
+   function opt.v (arg) { 
+      vlan = assert(tonumber(arg), "duration is not a number!");
+   }
+
+   var pcap_file, single_pass;
+   function opt.o (arg) { 
+      pcap_file = arg;
+      target = pcap_file;
+      single_pass = true;
+   }
+
+   args = lib.dogetopt(args, opt, "VD:hS:s:a:d:b:iI:c:r:46p:v:o:t:i:k:", long_opts);
+
+   for( _,s in ipairs(sizes) ) {
+      if( s < 18 + (vlan && 4 || 0) + 20 + 8 ) {
+         error("Minimum frame size is 46 bytes (18 ethernet+CRC, 20 IPv4, and 8 UDP)");
+      }
+   }
+
+   if( ! target ) {
+      print("either --pci, --tap, --sock, --int or --pcap are required parameters");
+      main.exit(1);
+   }
+
+   print(string.format("packetblaster lwaftr: Sending %d clients at %.3f MPPS to %s", count, rate, target));
+   print();
+
+   if( ! ipv4_only ) {
+      print(string.format("IPv6: %s > %s: %s:%d > %s:12345", b4_ipv6, aftr_ipv6, b4_ipv4, b4_port, public_ipv4));
+      print("      source IPv6 and source IPv4/Port adjusted per client");
+      var sizes_ipv6 = {};
+      for( i,size in ipairs(sizes) ) { sizes_ipv6[i] = size + 40; }
+      print("IPv6 frame sizes: " .. table.concat(sizes_ipv6,","));
+   }
+
+   if( ! ipv6_only ) {
+      print();
+      print(string.format("IPv4: %s:12345 > %s:%d", public_ipv4, b4_ipv4, b4_port));
+      print("      destination IPv4 and Port adjusted per client");
+      print("IPv4 frame sizes: " .. table.concat(sizes,","));
+   }
+
+   if( ipv4_only && ipv6_only ) {
+      print("Remove options v4only and v6only to generate both");
+      main.exit(1);
+   }
+
+   config.app(c, "generator", Lwaftrgen, { 
+      sizes = sizes, count = count, aftr_ipv6 = aftr_ipv6, rate = rate,
+      src_mac = src_mac, dst_mac = dst_mac, vlan = vlan,
+      b4_ipv6 = b4_ipv6, b4_ipv4 = b4_ipv4, b4_port = b4_port,
+      public_ipv4 = public_ipv4, single_pass = single_pass,
+      ipv4_only = ipv4_only, ipv6_only = ipv6_only });
+
+   var input, output;
+
+   if( tap_interface ) {
+      if( dir_exists(("/sys/devices/virtual/net/%s")->format(tap_interface)) ) {
+         config.app(c, "tap", Tap, tap_interface);
+         input, output = "tap.input", "tap.output";
+      } else {
+         print(string.format("tap interface %s doesn't exist", tap_interface));
+         main.exit(1);
+      }
+   } else if( pciaddr ) {
+      var device_info = pci.device_info(pciaddr);
+      if( vlan ) {
+         print(string.format("vlan set to %d", vlan));
+      }
+      if( device_info ) {
+         config.app(c, "nic", require(device_info.driver).driver,
+         {pciaddr = pciaddr, vmdq = true, macaddr = src_mac, mtu = 9500});
+         input, output = "nic."..device_info.rx, "nic."..device_info.tx;
+      } else {
+         fatal(("Couldn't find device info for PCI or tap device %s")->format(pciaddr));
+      }
+   } else if( int_interface ) {
+      config.app(c, "int", raw.RawSocket, int_interface);
+      input, output = "int.rx", "int.tx";
+   } else if( sock_interface ) {
+      config.app(c, "virtio", VhostUser, { socket_path=sock_interface } );
+      input, output = "virtio.rx", "virtio.tx";
+   } else {
+      config.app(c, "pcap", pcap.PcapWriter, pcap_file);
+      input, output = "pcap.input", "pcap.output";
+   }
+
+   config.link(c, output .. " -> generator.input");
+   config.link(c, "generator.output -> " .. input);
+
+   engine.busywait = true;
+   engine.configure(c);
+
+   if( verbose ) {
+      print ("enabling verbose");
+      var fn = function () {
+         print("Transmissions (last 1 sec):");
+         engine.report_apps();
+      };
+      var t = timer.new("report", fn, 1e9, 'repeating');
+      timer.activate(t);
+   }
+
+   if( duration ) { engine.main({duration=duration});
+   } else {             engine.main(); }
+}

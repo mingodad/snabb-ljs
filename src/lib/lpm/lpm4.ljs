@@ -1,0 +1,280 @@
+module(..., package.seeall);
+
+var ffi = require("ffi");
+var C = ffi.C;
+var rand = require("lib.lpm.random").u32;
+var bit = require("bit");
+var lib = require("core.lib");
+var lpm = require("lib.lpm.lpm").LPM;
+var ip4 = require("lib.lpm.ip4");
+
+LPM4 = setmetatable({}, { __index = lpm });
+
+entry = ffi.typeof([=[
+struct {
+   uint32_t ip;
+   int32_t key;
+   int32_t length;
+}
+]=]);
+var verify_ip_count = 2000000;
+
+function LPM4::print_entry (e) {
+   print(string.format("%s/%d %d", ip4.tostring(e.ip), e.length, e.key));
+}
+function LPM4::print_entries () {
+   for( e in this->entries() ) {
+      this->print_entry(e);
+   }
+}
+function LPM4::search_bytes (bytes) {
+   var ip = ffi.cast("uint32_t*", bytes)[0];
+   return this->search(lib.ntohl(ip));
+}
+function LPM4::search_entry (ip) {
+   error("Must be implemented in a subclass");
+}
+function LPM4::search_entry_exact (ip, len) {
+   error("Must be implemented in a subclass");
+}
+function LPM4::search_entry_string (ip) {
+   return this->search_entry(ip4.parse(ip));
+}
+function LPM4::search (ip) {
+   return this->search_entry(ip).key;
+}
+function LPM4::search_string (str) {
+   return this->search(ip4.parse(str));
+}
+function LPM4::search_cidr (cidr) {
+   return this->search_entry_exact(ip4.parse_cidr(cidr));
+}
+function LPM4::add (ip, len, key) {
+   error("Must be implemented in a subclass");
+}
+function LPM4::add_string (cidr, key) {
+   var net, len = ip4.parse_cidr(cidr);
+   this->add(net, len, key);
+}
+function LPM4::add_from_file (pfxfile) {
+   for( line in io.lines(pfxfile) ) {
+      var cidr, key = string.match(line, "(%g*)%s*(%g*)");
+      this->add_string(cidr, tonumber(key));
+   }
+   return this;
+}
+function LPM4::remove (ip, len) {
+   error("Must be implemented in a subclass");
+}
+function LPM4::remove_string (cidr) {
+   var net, len = ip4.parse_cidr(cidr);
+   this->remove(net, len);
+}
+function LPM4::build () {
+   return this;
+}
+
+function LPM4::benchmark (million) {
+   million = million || 100000000;
+   var pmu = require("lib.pmu");
+   var ip;
+
+   this->build();
+
+   var funcs = {
+      ["data dependency"] = function() {
+         for( i = 1, million ) { ip = rand(ip) + this->search(ip); }
+      },
+      ["no lookup"] = function() {
+         for( i = 1, million ) { ip = rand(ip) + 1; }
+      },
+      ["no dependency"] = function() {
+         for( i = 1, million ) {
+            ip = rand(ip) + 1;
+            this->search(ip);
+         }
+      }
+   };
+   for( n,f in pairs(funcs) ) {
+      print(n);
+      ip = rand(314159);
+      pmu.profile(
+      f,
+      {
+         "mem_load_uops_retired.llc_hit",
+         "mem_load_uops_retired.llc_miss",
+         "mem_load_uops_retired.l2_miss",
+         "mem_load_uops_retired.l2_hit"
+      },
+      { lookup = million }
+      );
+      print();
+   }
+}
+
+function LPM4::verify (trusted) {
+   var ip = rand(271828);
+   for( i = 0,verify_ip_count ) {
+      var ipstr = ip4.tostring(ip);
+      var expected = trusted->search(ip);
+      var key = this->search(ip);
+      assert(expected == key, string.format("%s got %d expected %d", ipstr, key, expected));
+      ip = rand(ip);
+   }
+}
+
+function LPM4::verify_against_fixtures (pfxfile, verifyfile) {
+   this->add_from_file(pfxfile);
+   this->build();
+   var count = 0;
+   for( line in io.lines(verifyfile) ) {
+      var ip, tcidr, key = string.match(line, "(%g*) (%g*) (%g*)");
+      var found = this->search_entry_string(ip);
+      assert(found.key == tonumber(key),
+      string.format("Search %d for %s found (%s/%d) %s expected (%s) %d ", count, ip, ip4.tostring(found.ip), found.length, found.key, tcidr, key));
+      ++count    ;
+   }
+}
+function LPM4::build_verify_fixtures (pfxfile, ipfile) {
+   var f = LPM4->new();
+   var out = assert(io.open(pfxfile, "w",
+   "unable to open " .. pfxfile .. " for writing"));
+   f.add = function (this,ip,len,key) {
+      out->write(string.format("%s/%d %d\n", ip4.tostring(ip), len, key));
+   };
+   f->add_random_entries();
+
+   out = assert(io.open(ipfile, "w",
+   "unable to open " .. pfxfile .. " for writing"));
+   var ip = rand(271828);
+   for( i = 0, verify_ip_count ) {
+      out->write(ip4.tostring(ip) .. "\n");
+      ip = rand(ip);
+   }
+}
+function LPM4::remove_random_entries () {
+   var count = this.entry_count - 1;
+   var ents = this.lpm4_ents;
+   var removen = math.floor(count * 0.1);
+   // Set a random seed so that remove_random_entries
+   // removes the same entries if run across different objects
+   math.randomseed(9847261856);
+   for( i = 1,removen ) {
+      var remove = math.random(1, count);
+      ents[remove].ip, ents[count].ip = ents[count].ip, ents[remove].ip;
+      ents[remove].length, ents[count].length = ents[count].length, ents[remove].length;
+      ents[remove].key, ents[count].key = ents[count].key, ents[remove].key;
+      this->remove(ents[count].ip, ents[count].length);
+      --count    ;
+   }
+   this.entry_count = count;
+}
+function LPM4::verify_entries_method () {
+   var against = {};
+   print("Verifying " .. tostring(this.entry_count) .. " entries");
+   for( e in this->entries() ) {
+      var cidr = ip4.tostring(e.ip) .. "/" .. e.length;
+      against[cidr] = e.key;
+   }
+   for( i = 0, this.entry_count - 1 ) {
+      var cidr = ip4.tostring(this.lpm4_ents[i].ip) .. "/" .. this.lpm4_ents[i].length;
+      assert(against[cidr] && against[cidr] == this.lpm4_ents[i].key, cidr .. " not found");
+   }
+}
+function LPM4::add_random_entries (tab) {
+   tab = tab || {
+      [0] = 1,
+      [10] = 50, [11] = 100, [12] = 250,
+      [13] = 500, [14] = 1000, [15] = 1750,
+      [16] = 12000, [17] = 8000, [18] = 13500,
+      [19] = 26250, [20] = 40000, [21] = 43000,
+      [22] = 75000, [23] = 65000, [24] = 350000,
+      [25] = 1250, [26] = 1000, [27] = 500,
+      [28] = 500, [29] = 1250, [30] = 150,
+      [31] = 50, [32] = 1500
+   };
+
+   var count = 0;
+   for( k,v in pairs(tab) ) { count +=   v; }
+
+   this->alloc("lpm4_ents", entry, count);
+   var ents = this.lpm4_ents;
+   var r = rand(314159);
+   var eoff = 0;
+   var addrs = {};
+
+   for( k,v in pairs(tab) ) {
+      var mask = bit.bnot(2**(32-k)-1);
+      var i = 0;
+      while( i < v ) {
+         r = rand(r);
+         var ip = bit.band(r, mask);
+         r = rand(r);
+         ents[eoff].ip = ip;
+         ents[eoff].length = k;
+         ents[eoff].key = bit.band(r,0x7fff);
+
+         if( ! addrs[ip * 64 + k] && ents[eoff].key != 0 ) {
+            ++eoff    ;
+            ++i    ;
+         }
+         addrs[ip * 64 + k] = true;
+      }
+   }
+   print("Adding " .. tostring(count) .. " random entries");
+   this.entry_count = count;
+   for( i=0, count-1 ) {
+      this->add(ents[i].ip, ents[i].length, ents[i].key);
+   }
+   return this;
+}
+function selftest () {
+   var s = require("lib.lpm.lpm4_trie").LPM4_trie->new();
+   s->add_string("10.0.0.0/24", 10);
+   s->add_string("0.0.0.10/32", 11);
+   assert(10 == s->search_bytes(ffi.new("uint8_t[4]", {10,0,0,0})));
+   assert(11 == s->search_bytes(ffi.new("uint8_t[4]", {0,0,0,10})));
+}
+function LPM4::selftest (cfg, millions) {
+   assert(this, "selftest must be called with : ");
+
+   if( ! os.getenv("SNABB_LPM4_TEST_INTENSIVE") ) {
+      print("Skipping LPM4:selfest (very specific / excessive runtime)");
+      print("In case you are hacking on lib.lpm you might want to enable");
+      print("these tests by setting SNABB_LPM4_TEST_INTENSIVE in your");
+      print("environment.");
+      return;
+   }
+
+   var trusted = require("lib.lpm.lpm4_trie").LPM4_trie->new();
+   trusted->add_random_entries();
+
+   var f = this->new(cfg);
+   f->add_random_entries();
+   for( i = 1,5 ) {
+      f->build()->verify(trusted->build());
+      f->verify_entries_method();
+      f->remove_random_entries();
+      trusted->remove_random_entries();
+   }
+
+   var ptr = C.malloc(256*1024*1024);
+   f = this->new(cfg);
+   var g = this->new(cfg);
+   f->add_random_entries();
+   f->build();
+   f->alloc_store(ptr);
+   g->alloc_load(ptr);
+   g->verify(f);
+   C.free(ptr);
+
+   var avail, err = require('lib.pmu').is_available();
+   if( ! avail ) {
+      print("PMU not available:");
+      print("  "..err);
+      print("Skipping benchmark.");
+   } else {
+      this->new(cfg)->add_random_entries()->benchmark(millions);
+   }
+   print("selftest complete");
+}

@@ -1,0 +1,60 @@
+module(..., package.seeall);
+
+var counter = require("core.counter");
+var lib = require("core.lib");
+var data = require("lib.yang.data");
+var state = require("lib.yang.state");
+var lwutil = require("apps.lwaftr.lwutil");
+
+var write_to_file = lwutil.write_to_file;
+
+function load_requested_counters(counters) {
+   var result = dofile(counters);
+   assert(type(result) == "table", "Not a valid counters file: "..counters);
+   return result;
+}
+
+function diff_counters(final, initial) {
+   var results = {};
+   for( name, ref in pairs(initial) ) {
+      var cur = final[name];
+      if( cur != ref ) {
+         results[name] = tonumber(cur - ref);
+      }
+   }
+   return results;
+}
+
+function validate_diff(actual, expected) {
+   if( ! lib.equal(actual, expected) ) {
+      var msg;
+      print('--- Expected (actual values in brackets, if any)');
+      for( k, v in pairs(expected) ) {
+         msg = k..' = '..v;
+         if( actual[k] != null ) {
+            msg = msg..' ('..actual[k]..')';
+         }
+         print(msg);
+      }
+      print('--- actual (expected values in brackets, if any)');
+      for( k, v in pairs(actual) ) {
+         msg = k..' = '..v;
+         if( expected[k] != null ) {
+            msg = msg..' ('..expected[k]..')';
+         }
+         print(msg);
+      }
+      error('counters did not match');
+   }
+}
+
+function regen_counters(counters, outfile) {
+   var cnames = lwutil.keys(counters);
+   table.sort(cnames);
+   var out_val = {'return {'};
+   for( _,k in ipairs(cnames) ) {
+      table.insert(out_val, string.format('   ["%s"] = %s,', k, counters[k]));
+   }
+   table.insert(out_val, '}\n');
+   write_to_file(outfile, (table.concat(out_val, '\n')));
+}

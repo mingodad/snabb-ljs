@@ -1,0 +1,142 @@
+module(..., package.seeall);
+
+var engine = require("core.app");
+var counter = require("core.counter");
+var lib = require("core.lib");
+var shm = require("core.shm");
+var data = require("lib.yang.data");
+var schema = require("lib.yang.schema");
+var state = require("lib.yang.state");
+var counters = require("program.lwaftr.counters");
+var lwutil = require("apps.lwaftr.lwutil");
+var top = require("program.top.top");
+var ps = require("program.ps.ps");
+
+var keys, fatal = lwutil.keys, lwutil.fatal;
+
+function show_usage (code) {
+   print(require("program.lwaftr.query.README_inc"));
+   main.exit(code);
+}
+
+var function sort (t) {
+   table.sort(t);
+   return t;
+}
+
+function parse_args (raw_args) {
+   var handlers = {};
+   var opts = {};
+   var name;
+   function handlers.h() { show_usage(0); }
+   function handlers.l () {
+      for( _, name in ipairs(sort(keys(counters.counter_names()))) ) {
+         print(name);
+      }
+      main.exit(0);
+   }
+   function handlers.n (arg) {
+      opts.name = assert(arg);
+   }
+   var args = lib.dogetopt(raw_args, handlers, "hln:",
+                             { help="h", ["list-all"]="l", name="n" });
+   if( #args > 2 ) { show_usage(1); }
+   return opts, unpack(args);
+}
+
+var function max_key_width (counters) {
+   var max_width = 0;
+   for( name, value in pairs(counters) ) {
+      if( value != 0 ) {
+         if( #name > max_width ) { max_width = #name; }
+      }
+   }
+   return max_width;
+}
+
+// Filters often contain '-', which is a special character for match.
+// Escape it.
+var function skip_counter (name, filter) {
+   var escaped_filter = filter;
+   if( escaped_filter ) { escaped_filter = filter->gsub("-", "%%-"); }
+   return filter && ! name->match(escaped_filter);
+}
+
+var function print_counter (name, value, max_width) {
+   var nspaces = max_width - #name;
+   print(("%s: %s%s")->format(name, (" ")->rep(nspaces), lib.comma_value(value)));
+}
+
+var function print_counters (pid, filter) {
+   print("lwAFTR operational counters (non-zero)");
+   // Open, read and print whatever counters are in that directory.
+   var counters = counters.read_counters(pid);
+   var max_width = max_key_width(counters);
+   for( _, name in ipairs(sort(keys(counters))) ) {
+      if( ! skip_counter(name, filter) ) {
+         var value = counters[name];
+         if( value != 0 ) {
+            print_counter(name, value, max_width);
+         }
+      }
+   }
+}
+
+// Return the pid that was specified, unless it was a manager process,
+// in which case, return the worker pid that actually has useful
+// counters.
+var function pid_to_parent(pid) {
+   // It's meaningless to get the parent of a nil 'pid'.
+   if( ! pid ) { return pid; }
+   pid = tonumber(pid);
+   for( _, name in ipairs(shm.children("/")) ) {
+      var p = tonumber(name);
+      if( p && ps.is_worker(p) ) {
+         var manager_pid = tonumber(ps.get_manager_pid(p));
+         // If the precomputed by-name pid is the manager pid, set the
+         // pid to be the worker's pid instead to get meaningful
+         // counters.
+         if( manager_pid == pid ) { pid = p; }
+      }
+   }
+   return pid;
+}
+
+function run (raw_args) {
+   var opts, arg1, arg2 = parse_args(raw_args);
+   var pid, counter_name;
+   if( ! opts.name ) {
+      if( arg1 ) { pid = pid_to_parent(arg1); }
+      counter_name = arg2; // This may be nil
+   } else { // by-name: arguments are shifted by 1 and no pid is specified
+      counter_name = arg1;
+      // Start by assuming it was run without --reconfigurable
+      var programs = engine.enumerate_named_programs(opts.name);
+      pid = programs[opts.name];
+      if( ! pid ) {
+         fatal(("Couldn't find process with name '%s'")->format(opts.name));
+      }
+
+      // Check if it was run with --reconfigurable If it was, find the
+      // children, then find the pid of their parent.  Note that this
+      // approach will break as soon as there can be multiple workers
+      // which need to have their statistics aggregated, as it will only
+      // print the statistics for one child, not for all of them.
+      for( _, name in ipairs(shm.children("/")) ) {
+         var p = tonumber(name);
+         if( p && ps.is_worker(p) ) {
+            var manager_pid = tonumber(ps.get_manager_pid(p));
+            // If the precomputed by-name pid is the manager pid, set
+            // the pid to be the worker's pid instead to get meaningful
+            // counters.
+            if( manager_pid == pid ) { pid = p; }
+         }
+      }
+   }
+   if( ! pid ) {
+      top.select_snabb_instance(pid);
+      // The following is not reached when there are multiple instances.
+      fatal("Please manually specify a pid, or a name with -n name");
+   }
+   print_counters(pid, counter_name);
+}

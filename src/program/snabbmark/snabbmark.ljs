@@ -1,0 +1,573 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+module(..., package.seeall);
+
+var usage = require("program.snabbmark.README_inc");
+
+var basic_apps = require("apps.basic.basic_apps");
+var pci           = require("lib.hardware.pci");
+var ethernet      = require("lib.protocol.ethernet");
+var lib = require("core.lib");
+var ffi = require("ffi");
+var C = ffi.C;
+
+function run (args) {
+   var command = table.remove(args, 1);
+   if( command == 'basic1' && #args == 1 ) {
+      basic1(unpack(args));
+   } else if( command == 'nfvconfig' && #args == 3 ) {
+      nfvconfig(unpack(args));
+   } else if( command == 'solarflare' && #args >= 2 && #args <= 3 ) {
+      solarflare(unpack(args));
+   } else if( command == 'intel1g' && #args >= 2 && #args <= 3 ) {
+      intel1g(unpack(args));
+   } else if( command == 'esp' && #args >= 2 ) {
+      esp(unpack(args));
+   } else if( command == 'hash' && #args <= 1 ) {
+      hash(unpack(args));
+   } else if( command == 'ctable' && #args == 0 ) {
+      ctable(unpack(args));
+   } else {
+      print(usage); 
+      main.exit(1);
+   }
+}
+
+function gbits (bps) {
+   return (bps * 8) / (1024**3);
+}
+
+function basic1 (npackets) {
+   npackets = tonumber(npackets) || error("Invalid number of packets: " .. npackets);
+   var c = config.new();
+   // Simple topology:
+   //               .------.
+   // Source ---> Tee      Sink
+   //               `------'
+   // Source generates packets, Tee duplicates them, Sink receives
+   // both duplicates.
+   config.app(c, "Source", basic_apps.Source);
+   config.app(c, "Tee", basic_apps.Tee);
+   config.app(c, "Sink", basic_apps.Sink);
+   config.link(c, "Source.tx -> Tee.rx");
+   config.link(c, "Tee.tx1 -> Sink.rx1");
+   config.link(c, "Tee.tx2 -> Sink.rx2");
+   engine.configure(c);
+   var start = C.get_monotonic_time();
+   timer.activate(timer.new("null", function () { }, 1e6, 'repeating'));
+   while( link.stats(engine.app_table.Source.output.tx).txpackets < npackets ) {
+      engine.main({duration = 0.01, no_report = true});
+   }
+   var finish = C.get_monotonic_time();
+   var runtime = finish - start;
+   var packets = link.stats(engine.app_table.Source.output.tx).txpackets;
+   engine.report();
+   print();
+   print(("Processed %.1f million packets in %.2f seconds (rate: %.1f Mpps).")->format(packets / 1e6, runtime, packets / runtime / 1e6));
+}
+
+function nfvconfig (confpath_x, confpath_y, nloads) {
+   var nfvconfig = require("program.snabbnfv.nfvconfig");
+   nloads = tonumber(nloads)
+      || error("Invalid number of iterations: " .. nloads);
+
+   var pciaddr = lib.getenv("SNABB_PCI0");
+   if( ! pciaddr ) {
+      print("SNABB_PCI0 not set.");
+      os.exit(engine.test_skipped_code);
+   }
+
+   var load_times, apply_times = {}, {};
+
+   for( i=1, nloads ) {
+      // Load and apply confpath_x.
+      engine.configure(nfvconfig.load(confpath_x, pciaddr, "/dev/null"));
+
+      // Measure loading y.
+      var start_load = C.get_monotonic_time();
+      var c = nfvconfig.load(confpath_y, pciaddr, "/dev/null");
+      var end_load = C.get_monotonic_time();
+
+      // Measure apply x -> y.
+      var start_apply = C.get_monotonic_time();
+      engine.configure(c);
+      var end_apply = C.get_monotonic_time();
+
+      // Push results.
+      table.insert(load_times, end_load - start_load);
+      table.insert(apply_times, end_apply - start_apply);
+   }
+
+   engine.report();
+   print();
+
+   // Print results.
+   var load_mean, load_max = sumf(unpack(load_times))/#load_times, math.max(unpack(load_times));
+   print("load_mean:", ("%.4fs")->format(load_mean));
+   print("load_max:", ("%.4fs")->format(load_max));
+
+   var apply_mean, apply_max = sumf(unpack(apply_times))/#apply_times, math.max(unpack(apply_times));
+   print("apply_mean:", ("%.4fs")->format(apply_mean));
+   print("apply_max:", ("%.4fs")->format(apply_max));
+
+   // Overall score is load_mean+apply_mean per second.
+   print("score: ", ("%.2f")->format(1/(apply_mean + load_mean)));
+}
+
+function sumf(a, ...) { return a && a + sumf(...) || 0; }
+
+Source = {};
+
+function Source::new(size) {
+   return setmetatable({}, {__index=Source});
+}
+
+function Source::pull() {
+   for( _, o in ipairs(this.output) ) {
+      for( i = 1, engine.pull_npackets ) {
+         var p = packet.allocate();
+         ffi.copy(p.data, this.to_mac_address, 6);
+         ffi.copy(p.data + 6, this.from_mac_address, 6);
+         p.length = this.size;
+         link.transmit(o, p);
+      }
+   }
+}
+
+function Source::set_packet_addresses(from_mac_address, to_mac_address) {
+   this.from_mac_address, this.to_mac_address = from_mac_address, to_mac_address;
+   print(string.format("Sending from %02x:%02x:%02x:%02x:%02x:%02x to %02x:%02x:%02x:%02x:%02x:%02x",
+                       this.from_mac_address[0],
+                       this.from_mac_address[1],
+                       this.from_mac_address[2],
+                       this.from_mac_address[3],
+                       this.from_mac_address[4],
+                       this.from_mac_address[5],
+                       this.to_mac_address[0],
+                       this.to_mac_address[1],
+                       this.to_mac_address[2],
+                       this.to_mac_address[3],
+                       this.to_mac_address[4],
+                       this.to_mac_address[5]));
+}
+
+function Source::set_packet_size(size) {
+   this.size = size;
+}
+
+function solarflare (npackets, packet_size, timeout) {
+   npackets = tonumber(npackets) || error("Invalid number of packets: " .. npackets);
+   packet_size = tonumber(packet_size) || error("Invalid packet size: " .. packet_size);
+   if( timeout ) {
+      timeout = tonumber(timeout) || error("Invalid timeout: " .. timeout);
+   }
+
+   var function load_driver () {
+      return require("apps.solarflare.solarflare").SolarFlareNic;
+   }
+
+   var status, SolarFlareNic = pcall(load_driver);
+   if( ! status ) {
+      print(SolarFlareNic);
+      os.exit(engine.test_skipped_code);
+   }
+
+   var pciaddr0 = lib.getenv("SNABB_PCI_SOLARFLARE0") || lib.getenv("SNABB_PCI0");
+   var pciaddr1 = lib.getenv("SNABB_PCI_SOLARFLARE1") || lib.getenv("SNABB_PCI1");
+   var send_device = pciaddr0 && pci.device_info(pciaddr0);
+   var receive_device = pciaddr1 && pci.device_info(pciaddr1);
+   if( ! send_device
+      || send_device.driver != 'apps.solarflare.solarflare'
+      || ! receive_device
+      || receive_device.driver != 'apps.solarflare.solarflare'
+   ) {
+      print("SNABB_PCI_SOLARFLARE[0|1]/SNABB_PCI[0|1] not set or not suitable.");
+      os.exit(engine.test_skipped_code);
+   }
+
+   print(string.format("Sending through %s (%s), receiving through %s (%s)",
+                       send_device.interface, send_device.pciaddress,
+                       receive_device.interface, receive_device.pciaddress));
+
+   var c = config.new();
+
+   // Topology:
+   // Source -> Solarflare NIC#1 => Solarflare NIC#2 -> Sink
+
+   config.app(c, "source", Source);
+   config.app(c, send_device.interface, SolarFlareNic, {ifname=send_device.interface, mac_address = ethernet->pton("02:00:00:00:00:01")});
+   config.app(c, receive_device.interface, SolarFlareNic, {ifname=receive_device.interface, mac_address = ethernet->pton("02:00:00:00:00:02")});
+   config.app(c, "sink", basic_apps.Sink);
+
+   config.link(c, "source.tx -> " .. send_device.interface .. ".rx");
+   config.link(c, receive_device.interface .. ".tx -> sink.rx");
+
+   engine.configure(c);
+
+   engine.app_table.source->set_packet_addresses(engine.app_table[send_device.interface].mac_address,
+                                                engine.app_table[receive_device.interface].mac_address);
+   engine.app_table.source->set_packet_size(packet_size);
+
+   engine.Hz = false;
+
+   var start = C.get_monotonic_time();
+   timer.activate(timer.new("null", function () { }, 1e6, 'repeating'));
+   var n = 0;
+   var n_max;
+   if( timeout ) {
+      n_max = timeout * 100;
+   }
+   while( link.stats(engine.app_table.source.output.tx).txpackets < npackets
+      && (! timeout || n < n_max)
+   ) {
+      engine.main({duration = 0.01, no_report = true});
+      ++n    ;
+   }
+   var finish = C.get_monotonic_time();
+   var runtime = finish - start;
+   var packets = link.stats(engine.app_table.source.output.tx).txpackets;
+   engine.report();
+   engine.app_table[send_device.interface]->report();
+   engine.app_table[receive_device.interface]->report();
+   print();
+   print(("Processed %.1f million packets in %.2f seconds (rate: %.1f Mpps, %.2f Gbit/s).")->format(packets / 1e6,
+                                                                                                   runtime, packets / runtime / 1e6,
+                                                                                                   gbits(packets * packet_size / runtime)));
+   if( link.stats(engine.app_table.source.output.tx).txpackets < npackets ) {
+      print("Packets lost. Test failed!");
+      main.exit(1);
+   }
+}
+
+function intel1g (npackets, packet_size, timeout) {
+   npackets = tonumber(npackets) || error("Invalid number of packets: " .. npackets);
+   packet_size = tonumber(packet_size) || error("Invalid packet size: " .. packet_size);
+   if( timeout ) {
+      timeout = tonumber(timeout) || error("Invalid timeout: " .. timeout);
+   }
+
+   var function load_driver () {
+      return require("apps.intel.intel1g").Intel1g;
+   }
+
+   var status, Intel1gNic = pcall(load_driver);
+   if( ! status ) {
+      print(Intel1gNic);
+      os.exit(engine.test_skipped_code);
+   }
+
+   var pciaddr0 = lib.getenv("SNABB_PCI0");
+   var pciaddr1 = lib.getenv("SNABB_PCI1");
+   var send_device = pciaddr0 && pci.device_info(pciaddr0);
+   var receive_device = pciaddr1 && pci.device_info(pciaddr1);
+print("send_device= ", send_device, "  receive_device= ", receive_device);
+   if( ! send_device
+      || send_device.driver != 'apps.intel.intel1g'
+      || ! receive_device
+      || receive_device.driver != 'apps.intel.intel1g'
+   ) {
+      print("SNABB_PCI[0|1] not set, or not suitable Intel i210/i350 NIC.");
+      os.exit(engine.test_skipped_code);
+   }
+
+send_device.interface= "tx1GE";
+receive_device.interface= "rx1GE";
+
+   print(string.format("Sending through %s (%s), receiving through %s (%s)",
+                       send_device.interface, send_device.pciaddress,
+                       receive_device.interface, receive_device.pciaddress));
+
+   var c = config.new();
+
+   // Topology:
+   // Source -> Intel1g NIC#1 => Intel1g NIC#2 -> Sink
+
+   config.app(c, "source", Source);
+   //config.app(c, send_device.interface, Intel1gNic, {ifname=send_device.interface, mac_address = ethernet:pton("02:00:00:00:00:01")})
+   //config.app(c, receive_device.interface, Intel1gNic, {ifname=receive_device.interface, mac_address = ethernet:pton("02:00:00:00:00:02")})
+   config.app(c, send_device.interface, Intel1gNic, {pciaddr=pciaddr0});
+   config.app(c, receive_device.interface, Intel1gNic, {pciaddr=pciaddr1, rxburst=512});
+   config.app(c, "sink", basic_apps.Sink);
+
+   config.link(c, "source.tx -> " .. send_device.interface .. ".input");
+   config.link(c, receive_device.interface .. ".output -> sink.rx");
+
+   engine.configure(c);
+
+   //engine.app_table.source:set_packet_addresses(engine.app_table[send_device.interface].mac_address,
+   //                                             engine.app_table[receive_device.interface].mac_address)
+   engine.app_table.source->set_packet_addresses(ethernet->pton("02:00:00:00:00:01"),
+                                                ethernet->pton("02:00:00:00:00:02"));
+   engine.app_table.source->set_packet_size(packet_size);
+
+   engine.Hz = false;
+
+   var start = C.get_monotonic_time();
+   timer.activate(timer.new("null", function () { }, 1e6, 'repeating'));
+   var n = 0;
+   var n_max;
+   if( timeout ) {
+      n_max = timeout * 100;
+   }
+   while( link.stats(engine.app_table.source.output.tx).txpackets < npackets
+      && (! timeout || n < n_max)
+   ) {
+      engine.main({duration = 0.01, no_report = true});
+      ++n    ;
+   }
+   var finish = C.get_monotonic_time();
+   var runtime = finish - start;
+   var txpackets = link.stats(engine.app_table.source.output.tx).txpackets;
+   var rxpackets = link.stats(engine.app_table.sink.input.rx).rxpackets;
+   engine.report();
+   engine.app_table[send_device.interface]->report();
+   engine.app_table[receive_device.interface]->report();
+   print();
+   print(("Processed %.1f million packets in %.2f seconds (rate: %.1f Mpps, %.2f Gbit/s, %.2f %% packet loss).")->format(
+    txpackets / 1e6, runtime, 
+    txpackets / runtime / 1e6,
+    ((txpackets * packet_size * 8) / runtime) / (1024*1024*1024),
+    (txpackets - rxpackets) *100 / txpackets
+   ));
+   if( link.stats(engine.app_table.source.output.tx).txpackets < npackets ) {
+      print("Packets lost. Test failed!");
+      main.exit(1);
+   }
+}
+
+function esp (npackets, packet_size, mode, direction, profile) {
+   var esp = require("lib.ipsec.esp");
+   var ethernet = require("lib.protocol.ethernet");
+   var ipv6 = require("lib.protocol.ipv6");
+   var datagram = require("lib.protocol.datagram");
+   var profiler = profile && require("jit.p");
+
+   npackets = assert(tonumber(npackets), "Invalid number of packets: " .. npackets);
+   packet_size = assert(tonumber(packet_size), "Invalid packet size: " .. packet_size);
+   var payload_size = packet_size - ethernet->sizeof() - ipv6->sizeof();
+   var payload = ffi.new("uint8_t[?]", payload_size);
+   var d = datagram->new(packet.allocate());
+   var ip = ipv6->new({});
+   ip->payload_length(payload_size);
+   d->payload(payload, payload_size);
+   d->push(ip);
+   if( ! mode == "tunnel" ) {
+      var eth = ethernet->new({type=0x86dd});
+      d->push(eth);
+   }
+   var plain = d->packet();
+   var conf = { spi = 0x0,
+                  mode = "aes-gcm-128-12",
+                  key = "00112233445566778899AABBCCDDEEFF",
+                  salt = "00112233"};
+   var enc, dec = esp.encrypt->new(conf), esp.decrypt->new(conf);
+   var encap, decap;
+   if( mode == "tunnel" ) {
+      encap = function (p) { return enc->encapsulate_tunnel(p, 41); };
+      decap = function (p) { return dec->decapsulate_tunnel(p); };
+   } else {
+      encap = function (p) { return enc->encapsulate_transport6(p); };
+      decap = function (p) { return dec->decapsulate_transport6(p); };
+   }
+   if( direction == "encapsulate" ) {
+      if( profile ) { profiler.start(profile); }
+      var start = C.get_monotonic_time();
+      for( i = 1, npackets ) {
+         packet.free(encap(packet.clone(plain)));
+      }
+      var finish = C.get_monotonic_time();
+      if( profile ) { profiler.stop(); }
+      var bps = (packet_size * npackets) / (finish - start);
+      print(("Encapsulation (packet size = %d): %.2f Gbit/s")
+            ->format(packet_size, gbits(bps)));
+   } else {
+      var encapsulated = encap(packet.clone(plain));
+      if( profile ) { profiler.start(profile); }
+      var start = C.get_monotonic_time();
+      for( i = 1, npackets ) {
+         packet.free(decap(packet.clone(encapsulated)));
+         dec.seq.no = 0;
+         dec.window[0] = 0;
+      }
+      var finish = C.get_monotonic_time();
+      if( profile ) { profiler.stop(); }
+      var bps = (packet_size * npackets) / (finish - start);
+      print(("Decapsulation (packet size = %d): %.2f Gbit/s")
+            ->format(packet_size, gbits(bps)));
+   }
+}
+
+var pmu = require('lib.pmu');
+var has_pmu_counters, err = pmu.is_available();
+if( ! has_pmu_counters ) {
+   io.stderr->write('No PMU available: '..err..'\n');
+}
+
+if( has_pmu_counters ) { pmu.setup(); }
+
+var function measure(f, iterations) {
+   var set;
+   if( has_pmu_counters ) { set = pmu.new_counter_set(); }
+   var start = C.get_time_ns();
+   if( has_pmu_counters ) { pmu.switch_to(set); }
+   var res = f(iterations);
+   if( has_pmu_counters ) { pmu.switch_to(null); }
+   var stop = C.get_time_ns();
+   var ns = tonumber(stop-start);
+   var cycles = null;
+   if( has_pmu_counters ) { cycles = pmu.to_table(set).cycles; }
+   return cycles, ns, res;
+}
+
+var function test_perf(f, iterations, what) {
+   require('jit').flush();
+   io.write(tostring(what || f)..': ');
+   io.flush();
+   var cycles, ns, res = measure(f, iterations);
+   if( cycles ) {
+      cycles /= iterations;
+      io.write(('%.2f cycles, ')->format(cycles));
+   }
+   ns /= iterations;
+   io.write(('%.2f ns per iteration (result: %s)\n')->format(
+         ns, tostring(res)));
+   return res;
+}
+
+function hash (key_size) {
+   if( key_size ) {
+      key_size = assert(tonumber(key_size));
+   } else {
+      key_size = 4;
+   }
+   var value_t = ffi.typeof("uint8_t[$]", key_size);
+   var band = require('bit').band;
+   var fill = require('ffi').fill;
+
+   var function baseline_hash(ptr) { return ptr[0]; }
+   var murmur = require('lib.hash.murmur').MurmurHash3_x86_32->new();
+   var function murmur_hash(v) {
+      return murmur->hash(v, key_size, 0ULL).u32[0];      
+   }
+   var lib_siphash = require('lib.hash.siphash');
+   var sip_hash_1_2_opts = { size=key_size, c=1, d=2 };
+   var sip_hash_2_4_opts = { size=key_size, c=2, d=4 };
+
+   var function test_scalar_hash(iterations, hash) {
+      var value = ffi.new(ffi.typeof('uint8_t[$]', key_size));
+      var result;
+      for( i=1,iterations ) {
+	 fill(value, key_size, band(i, 255));
+	 result = hash(value);
+      }
+      return result;
+   }
+
+   var function test_parallel_hash(iterations, hash, width) {
+      var value = ffi.new('uint8_t[?]', key_size*width);
+      var result = ffi.new('uint32_t[?]', width);
+      for( i=1,iterations,width ) {
+	 fill(value, key_size*width, band(i+width-1, 255));
+	 hash(value, result);
+      }
+      return result[width-1];
+   }
+
+   var function hash_tester(hash) {
+      return function(iterations) {
+         return test_scalar_hash(iterations, hash);
+      };
+   }
+
+   var function sip_hash_tester(opts, width) {
+      opts = lib.deepcopy(opts);
+      opts.size = key_size;
+      if( width > 1 ) {
+         opts.width = width;
+         var hash = lib_siphash.make_multi_hash(opts);
+	 return function(iterations) {
+	    return test_parallel_hash(iterations, hash, width);
+	 };
+      } else {
+         return hash_tester(lib_siphash.make_hash(opts));
+      }
+   }
+
+   test_perf(hash_tester(baseline_hash), 1e8, 'baseline');
+   test_perf(hash_tester(murmur_hash), 1e8, 'murmur hash (32 bit)');
+   for( _, opts in ipairs({{c=1,d=2}, {c=2,d=4}}) ) {
+      for( _, width in ipairs({1,2,4,8}) ) {
+         test_perf(sip_hash_tester(opts, width), 1e8,
+                   string.format('sip hash c=%d,d=%d (x%d)',
+                                 opts.c, opts.d, width));
+      }
+   }
+}
+
+function ctable () {
+   var ctable = require('lib.ctable');
+   var bnot = require('bit').bnot;
+   var ctab = ctable.new(
+      { key_type = ffi.typeof('uint32_t[2]'),
+        value_type = ffi.typeof('int32_t[5]') });
+   var occupancy = 2e6;
+   ctab->resize(occupancy / 0.4 + 1);
+
+   var function test_insertion(count) {
+      var k = ffi.new('uint32_t[2]');
+      var v = ffi.new('int32_t[5]');
+      for( i = 1,count ) {
+         k[0], k[1] = i, i;
+         for( j=0,4 ) { v[j] = bnot(i); }
+         ctab->add(k, v);
+      }
+   }
+
+   var function test_lookup_ptr(count) {
+      var k = ffi.new('uint32_t[2]');
+      var result = ctab.entry_type();
+      for( i = 1, count ) {
+         k[0], k[1] = i, i;
+         result = ctab->lookup_ptr(k);
+      }
+      return result;
+   }
+
+   var function test_lookup_and_copy(count) {
+      var k = ffi.new('uint32_t[2]');
+      var result = ctab.entry_type();
+      for( i = 1, count ) {
+         k[0], k[1] = i, i;
+         ctab->lookup_and_copy(k, result);
+      }
+      return result;
+   }
+
+   test_perf(test_insertion, occupancy, 'insertion (40% occupancy)');
+   test_perf(test_lookup_ptr, occupancy, 'lookup_ptr (40% occupancy)');
+   test_perf(test_lookup_and_copy, occupancy, 'lookup_and_copy (40% occupancy)');
+
+   var stride = 1;
+   do {
+      var streamer = ctab->make_lookup_streamer(stride);
+      var function test_lookup_streamer(count) {
+         var result;
+         for( i = 1, count, stride ) {
+            var n = math.min(stride, count-i+1);
+            for( j = 0, n-1 ) {
+               streamer.entries[j].key[0] = i + j;
+               streamer.entries[j].key[1] = i + j;
+            }
+            streamer->stream();
+            result = streamer.entries[n-1].value[0];
+         }
+         return result;
+      }
+      // Note that "result" is part of the value, not an index into
+      // the table, and so we expect the results to be different from
+      // ctab:lookup().
+      test_perf(test_lookup_streamer, occupancy,
+                'streaming lookup, stride='..stride);
+      stride *=   2;
+   } while(!( stride > 256) );
+}

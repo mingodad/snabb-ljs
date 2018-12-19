@@ -1,0 +1,418 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+module(..., package.seeall);
+
+var packet   = require("core.packet");
+var lib      = require("core.lib");
+var counter  = require("core.counter");
+var siphash  = require("lib.hash.siphash");
+var metadata = require("apps.rss.metadata");
+var pf       = require("pf");
+var ffi      = require("ffi");
+
+var rshift = bit.rshift;
+var receive, transmit = link.receive, link.transmit;
+var nreadable = link.nreadable;
+var free, clone = packet.free, packet.clone;
+var mdadd, mdget, mdcopy = metadata.add, metadata.get, metadata.copy;
+
+var transport_proto_p = {
+   // TCP
+   [6] = true,
+   // UDP
+   [17] = true,
+   // SCTP
+   [132] = true
+};
+
+rss = {
+   config = {
+      default_class = { default = true },
+      classes = { default = {} },
+      remove_extension_headers = { default = true }
+   },
+   shm = {
+      rxpackets = { counter, 0},
+      rxdrops_filter = { counter, 0}
+   }
+};
+var class_config = {
+   name = { required = true },
+   filter = { required = true },
+   "continue" = { default = false }
+};
+
+var hash_info = {
+   // IPv4
+   [0x0800] = {
+      addr_offset = 12,
+      addr_size = 8
+   },
+   // IPv6
+   [0x86dd] = {
+      addr_offset = 8,
+      addr_size = 32
+   },
+};
+
+function rss::new (config) {
+   var o = { classes = {},
+               links_configured = {},
+               queue = link.new("queue"),
+               rxpackets = 0,
+               rxdrops_filter = 0,
+               sync_timer = lib.throttle(1),
+               rm_ext_headers = config.remove_extension_headers
+             };
+
+   for( _, info in pairs(hash_info) ) {
+      info.key_t = ffi.typeof([=[
+            struct {
+               uint8_t addrs[$];
+               uint32_t ports;
+               uint8_t proto;
+            } __attribute__((packed))
+         ]=], info.addr_size);
+      info.key = info.key_t();
+      info.hash_fn =
+         siphash.make_hash({ size = ffi.sizeof(info.key),
+                             key = siphash.random_sip_hash_key() });
+   }
+
+   var function add_class (name, match_fn, pcontinue) {
+      assert(name->match("%w+"), "Illegal class name: "..name);
+      table.insert(o.classes, {
+                      name = name,
+                      match_fn = match_fn,
+                      pcontinue = pcontinue,
+                      input = link.new(name),
+                      output = { n = 0 }
+      });
+   }
+
+   var classes = { default = true };
+   for( _, class in ipairs(config.classes) ) {
+      var xconfig = lib.parse(class, class_config); //DADBUG shadow?
+      assert(! classes[xconfig.name],
+             "Duplicate filter class: "..xconfig.name);
+      classes[xconfig.name] = true;
+      add_class(xconfig.name, pf.compile_filter(xconfig.filter),
+                config["continue"]);
+   }
+   if( config.default_class ) {
+      // Catch-all default filter
+      add_class("default", function () { return true; });
+   }
+
+   return setmetatable(o, { __index = this });
+}
+
+function rss::link () {
+   for( name, l in pairs(this.output) ) {
+      if( type(name) == "string" ) {
+         if( ! this.links_configured[name] ) {
+            this.links_configured[name] = true;
+            var match = false;
+            for( _, class in ipairs(this.classes) ) {
+               var instance = name->match("^"..class.name.."_(.*)");
+               if( instance ) {
+                  match = true;
+                  var weight = instance->match("^%w+_(%d+)$") || 1;
+                  for( _ = 1, weight ) {
+                     table.insert(class.output, l);
+                  }
+                  // Avoid calls to lj_tab_len() in distribute()
+                  class.output.n = #class.output;
+               }
+            }
+            if( ! match ) {
+               print("Ignoring link (does not match any filters): "..name);
+            }
+         }
+      }
+   }
+
+   this.classes_active = {};
+   for( _, class in ipairs(this.classes) ) {
+      if( #class.output > 0 ) {
+         table.insert(this.classes_active, class);
+      }
+   }
+
+   this.input_tagged = {};
+   for( name, link in pairs(this.input) ) {
+      if( type(name) == "string" ) {
+         var vlan = name->match("^vlan(%d+)$");
+         if( vlan ) {
+            vlan = tonumber(vlan);
+            assert(vlan > 0 && vlan < 4095, "Illegal VLAN id: "..vlan);
+         }
+         table.insert(this.input_tagged, { link = link, vlan = vlan });
+      }
+   }
+}
+
+var function hash (md) {
+   var info = hash_info[md.ethertype];
+   var hash = 0;
+   if( info ) {
+      ffi.copy(info.key.addrs, md.l3 + info.addr_offset, info.addr_size);
+      if( transport_proto_p[md.proto] ) {
+         info.key.ports = ffi.cast("uint32_t *", md.l4)[0];
+      } else {
+         info.key.ports = 0;
+      }
+      info.key.proto = md.proto;
+      // Our SipHash implementation produces only even numbers to satisfy some
+      // ctable internals.
+      hash = rshift(info.hash_fn(info.key), 1);
+   }
+   md.hash = hash;
+}
+
+var function distribute (p, links, hash) {
+   // This relies on the hash being a 16-bit value
+   var index = rshift(hash * links.n, 16) + 1;
+   transmit(links[index], p);
+}
+
+function rss::push () {
+   var queue = this.queue;
+
+   for( _, input in ipairs(this.input_tagged) ) {
+      var link, vlan = input.link, input.vlan;
+      var npackets = nreadable(link);
+      this.rxpackets = this.rxpackets + npackets;
+      for( _ = 1, npackets ) {
+         var p = receive(link);
+         hash(mdadd(p, this.rm_ext_headers, vlan));
+         transmit(queue, p);
+      }
+   }
+
+   for( _, class in ipairs(this.classes_active) ) {
+      // Apply the filter to all packets.  If a packet matches, it is
+      // put on the class' input queue.  If the class is of type
+      // "continue" or the packet doesn't match the filter, it is put
+      // back onto the main queue for inspection by the next class.
+      for( _ = 1, nreadable(queue) ) {
+         var p = receive(queue);
+         var md = mdget(p);
+         if( class.match_fn(md.filter_start, md.filter_length) ) {
+            md.ref = md.ref + 1;
+            transmit(class.input, p);
+            if( class["continue"] ) {
+               transmit(queue, p);
+            }
+         } else {
+            transmit(queue, p);
+         }
+      }
+   }
+
+   for( _ = 1, nreadable(queue) ) {
+      var p = receive(queue);
+      var md = mdget(p);
+      if( md.ref == 0 ) {
+         this.rxdrops_filter = this.rxdrops_filter + 1;
+         free(p);
+      }
+   }
+
+   for( _, class in ipairs(this.classes_active) ) {
+      for( _ = 1, nreadable(class.input) ) {
+         var p = receive(class.input);
+         var md  = mdget(p);
+         if( md.ref > 1 ) {
+            md.ref = md.ref - 1;
+            distribute(mdcopy(p), class.output, md.hash);
+         } else {
+            distribute(p, class.output, md.hash);
+         }
+      }
+   }
+
+   if( this.sync_timer() ) {
+      counter.set(this.shm.rxpackets, this.rxpackets);
+      counter.set(this.shm.rxdrops_filter, this.rxdrops_filter);
+   }
+}
+
+function selftest () {
+   var vlan_id = 123;
+   var addr_ip = ffi.new("uint8_t[4]");
+   var addr_ip6 = ffi.new("uint8_t[16]");
+   var function random_ip(addr) {
+      for( i = 0, ffi.sizeof(addr) - 1 ) {
+         addr[i] = math.random(255);
+      }
+      return addr;
+   }
+
+   var ext_hdr = ffi.new([=[
+     struct {
+        uint8_t next_header;
+        uint8_t length;
+        uint8_t data[14];
+     }  __attribute__((packed))
+   ]=]);
+   var function push_ext_hdr(dgram, next_header) {
+      var p = dgram->packet();
+      ext_hdr.next_header = next_header;
+      ext_hdr.length = 1;
+      var length = ffi.sizeof(ext_hdr);
+      p = packet.prepend(p, ext_hdr, length);
+      dgram->new(p);
+      return length;
+   }
+
+   var Source = {};
+
+   function Source::new() {
+      var o = {
+         eth = require("lib.protocol.ethernet")->new({}),
+         ip = require("lib.protocol.ipv4")->new({ protocol = 17 }),
+         ip6 = require("lib.protocol.ipv6")->new({ next_header = 17 }),
+         udp = require("lib.protocol.udp")->new({}),
+         dgram = require("lib.protocol.datagram")->new()
+      };
+      return setmetatable(o, {__index=Source});
+   }
+
+   function Source::random_packet() {
+      var p = packet.allocate();
+      var payload_size = math.random(9000);
+      p.length = payload_size;
+      this.dgram->new(p);
+      this.udp->src_port(math.random(2**16-1));
+      this.udp->dst_port(math.random(2**16-1));
+      this.dgram->push(this.udp);
+      if( math.random() > 0.5 ) {
+         this.ip->src(random_ip(addr_ip));
+         this.ip->dst(random_ip(addr_ip));
+         this.ip->total_length(this.ip->sizeof() + this.udp->sizeof()
+                                 + payload_size);
+         this.dgram->push(this.ip);
+         this.eth->type(0x0800);
+      } else {
+         var next_header = 17;
+         var ext_hdr_size = 0;
+         for( _ = 1, math.ceil(math.random(3)) ) {
+            ext_hdr_size = ext_hdr_size
+               + push_ext_hdr(this.dgram, next_header);
+            next_header = 0; // Hop-by-hop header
+         }
+         this.ip6->payload_length(ext_hdr_size + this.udp->sizeof()
+                                    + payload_size);
+         this.ip6->next_header(next_header);
+         this.ip6->src(random_ip(addr_ip6));
+         this.ip6->dst(random_ip(addr_ip6));
+         this.dgram->push(this.ip6);
+         this.eth->type(0x86dd);
+      }
+      this.dgram->push(this.eth);
+      return this.dgram->packet();
+   }
+
+   function Source::pull () {
+      for( _, o in ipairs(this.output) ) {
+         for( i = 1, engine.pull_npackets ) {
+            transmit(o, this->random_packet());
+         }
+      }
+   }
+
+   var Sink = {};
+
+   function Sink::new () {
+      return setmetatable({}, { __index = Sink });
+   }
+
+   function Sink::push () {
+      for( _, i in ipairs(this.input) ) {
+         for( _ = 1, link.nreadable(i) ) {
+            var p = receive(i);
+            var md = mdget(p);
+            assert(md.ethertype == 0x0800 || md.ethertype == 0x86dd,
+                   md.ethertype);
+            assert(md.vlan == 0 || md.vlan == vlan_id);
+            var offset = md.vlan == 0 && 0 || 4;
+            assert(md.filter_offset == offset, md.filter_offset);
+            assert(md.filter_start == p.data + offset);
+            assert(md.l3 == p.data + 14 + offset);
+            assert(md.total_length == p.length - 14 - offset);
+            assert(md.filter_length == p.length - offset);
+            if( md.ethertype == 0x0800 ) {
+               assert(md.l4 == md.l3 + 20);
+            } else {
+               assert(md.l4 == md.l3 + 40);
+            }
+            assert(md.proto == 17);
+            assert(md.frag_offset == 0);
+            assert(md.length_delta == 0, md.length_delta);
+            packet.free(p);
+         }
+      }
+   }
+
+   var graph = config.new();
+   config.app(graph, "rss", rss, { classes = {
+                                      { name = "ip",
+                                        filter = "ip",
+                                        "continue" = true },
+                                      { name = "ip6",
+                                        filter = "ip6",
+                                        "continue" = true } } });
+   config.app(graph, "source1", Source);
+   config.app(graph, "source2", Source);
+   config.app(graph, "vlan", require("apps.vlan.vlan").Tagger,
+              { tag = vlan_id });
+   config.link(graph, "source1.output -> rss.input_plain");
+   config.link(graph, "source2.output -> vlan.input");
+   config.link(graph, "vlan.output -> rss.input_vlan");
+
+   var sink_groups = {
+      { name = "default", n = 4},
+      { name = "ip", n = 4 },
+      { name = "ip6", n = 4 },
+   };
+   for( g, group in ipairs(sink_groups) ) {
+      for( i = 1, group.n ) {
+         var sink_name = "sink"..g..i;
+         config.app(graph, sink_name, Sink);
+         config.link(graph, "rss."..group.name.."_"..i
+                        .." -> "..sink_name..".input");
+      }
+   }
+
+   engine.configure(graph);
+   engine.main({ duration = 2, report = { showlinks = true } });
+
+   var function pkts(name, dir) {
+      var app = engine.app_table[name];
+      if( dir == "out" ) {
+         return tonumber(counter.read(app.output.output.stats.rxpackets));
+      } else {
+         return tonumber(counter.read(app.input.input.stats.rxpackets));
+      }
+   }
+
+   var npackets = pkts("source1", "out") + pkts("source2", "out");
+   for( g, group in ipairs(sink_groups) ) {
+      for( i = 1, group.n ) {
+         var share = npackets/group.n;
+         if( group.name != "default" ) {
+            share /= 2;
+         }
+         var sink_name = "sink"..g..i;
+         var xpkts = pkts(sink_name, "in"); //DADBUG redefinition
+         var threshold = 0.05;
+         var value = math.abs(1.0 - xpkts/share);
+         if( value >= threshold ) {
+            error(string.format("Unexpected traffic share on %s "
+                                   .."(expected %f, got %f)",
+                                sink_name, threshold, value));
+         }
+      }
+   }
+}

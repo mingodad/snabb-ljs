@@ -1,0 +1,63 @@
+var l2tpv3 = require("lib.protocol.keyed_ipv6_tunnel");
+var tobit = require("bit").tobit;
+
+var tunnel = subClass(null);
+tunnel.proto = 115;
+tunnel.class = l2tpv3;
+
+function tunnel::new (conf, use_cc, logger) {
+   var o = tunnel->superClass().new(this);
+   o.conf = conf;
+   // The spec for L2TPv3 over IPv6 recommends to set the session ID
+   // to 0xffffffff for the "static 1:1 mapping" scenario.
+   conf.local_session = conf.local_session || 0xffffffff;
+   conf.remote_session = conf.remote_session || 0xffffffff;
+   conf.local_cookie_baked = l2tpv3->new_cookie(conf.local_cookie);
+   conf.remote_cookie_baked = l2tpv3->new_cookie(conf.remote_cookie);
+   o.header = l2tpv3->new({ session_id = conf.remote_session,
+                           cookie = conf.remote_cookie_baked });
+   o.OutboundVcLabel = conf.local_session;
+   o.InboundVcLabel = conf.remote_session;
+   if( use_cc ) {
+      assert(conf.local_session != 0xFFFFFFFE &&
+             conf.remote_session != 0xFFFFFFFE,
+          "Session ID 0xFFFFFFFE is reserved for the control channel");
+      o.cc_header = l2tpv3->new({ session_id = 0xFFFFFFFE,
+                                 cookie = conf.remote_cookie_baked });
+   }
+   // Static protcol object used in decapsulate()
+   o._proto = l2tpv3->new();
+   o._proto_size = o._proto->sizeof();
+   o._logger = logger;
+   return o;
+}
+
+function tunnel::encapsulate () {
+}
+
+function tunnel::decapsulate (datagram) {
+   var code = 0;
+   var l2tpv3 = this._proto->new_from_mem(datagram->payload());
+   if( l2tpv3 ) {
+      var session_id = l2tpv3->session_id();
+      if( tobit(session_id) == tobit(0xFFFFFFFE) ) {
+         datagram->pop_raw(this._proto_size);
+         code = 1;
+      } else if( ! tobit(session_id) == tobit(this.conf.local_session) ) {
+         this._logger->log("session id mismatch: expected 0x"
+                          ..bit.tohex(this.conf.local_session)
+                       ..", received 0x"..bit.tohex(session_id));
+      } else if( l2tpv3->cookie() != this.conf.local_cookie_baked
+         && this._logger->can_log() ) {
+            this._logger->log("cookie mismatch, expected "
+                             ..tostring(this.conf.local_cookie_baked)
+                          ..", received "..tostring(l2tpv3->cookie()));
+      } else {
+         datagram->pop_raw(this._proto_size);
+         return true;
+      }
+   }
+   return false, code;
+}
+
+return tunnel;

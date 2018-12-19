@@ -1,0 +1,132 @@
+module(..., package.seeall);
+
+var constants = require("apps.lwaftr.constants");
+
+var S = require("syscall");
+var bit = require("bit");
+var ffi = require("ffi");
+var lib = require("core.lib");
+var cltable = require("lib.cltable");
+
+var band = bit.band;
+var cast = ffi.cast;
+
+var uint16_ptr_t = ffi.typeof("uint16_t*");
+var uint32_ptr_t = ffi.typeof("uint32_t*");
+
+var constants_ipv6_frag = constants.ipv6_frag;
+var ehs = constants.ethernet_header_size;
+var o_ipv4_flags = constants.o_ipv4_flags;
+var ntohs = lib.ntohs;
+
+// Return device PCI address, queue ID, and queue configuration.
+function parse_instance(conf) {
+   var device, instance;
+   for( k, v in pairs(conf.softwire_config.instance) ) {
+      assert(device == null, "configuration has more than one instance");
+      device, instance = k, v;
+   }
+   assert(device != null, "configuration has no instance");
+   var id, queue;
+   for( k, v in cltable.pairs(instance.queue) ) {
+      assert(id == null, "configuration has more than one RSS queue");
+      id, queue = k.id, v;
+   }
+   assert(id != null, "configuration has no RSS queues");
+   return device, id, queue;
+}
+
+function get_ihl_from_offset(pkt, offset) {
+   var ver_and_ihl = pkt.data[offset];
+   return band(ver_and_ihl, 0xf) * 4;
+}
+
+// The rd16/wr16/rd32/wr32 functions are provided for convenience.
+// They do NO conversion of byte order; that is the caller's responsibility.
+function rd16(offset) {
+   return cast(uint16_ptr_t, offset)[0];
+}
+
+function wr16(offset, val) {
+   cast(uint16_ptr_t, offset)[0] = val;
+}
+
+function rd32(offset) {
+   return cast(uint32_ptr_t, offset)[0];
+}
+
+function wr32(offset, val) {
+   cast(uint32_ptr_t, offset)[0] = val;
+}
+
+function keys(t) {
+   var result = {};
+   for( k,_ in pairs(t) ) {
+      table.insert(result, k);
+   }
+   return result;
+}
+
+var uint64_ptr_t = ffi.typeof('uint64_t*');
+function ipv6_equals(a, b) {
+   var x, y = ffi.cast(uint64_ptr_t, a), ffi.cast(uint64_ptr_t, b);
+   return x[0] == y[0] && x[1] == y[1];
+}
+
+// Local bindings for constants that are used in the hot path of the
+// data plane.  Not having them here is a 1-2% performance penalty.
+var o_ethernet_ethertype = constants.o_ethernet_ethertype;
+var n_ethertype_ipv4 = constants.n_ethertype_ipv4;
+var n_ethertype_ipv6 = constants.n_ethertype_ipv6;
+
+function is_ipv6(pkt) {
+   return rd16(pkt.data + o_ethernet_ethertype) == n_ethertype_ipv6;
+}
+
+function is_ipv4(pkt) {
+   return rd16(pkt.data + o_ethernet_ethertype) == n_ethertype_ipv4;
+}
+
+function is_ipv6_fragment(pkt) {
+   if( ! is_ipv6(pkt) ) { return false; }
+   return pkt.data[ehs + constants.o_ipv6_next_header] == constants_ipv6_frag;
+}
+
+function is_ipv4_fragment(pkt) {
+   if( ! is_ipv4(pkt) ) { return false; }
+   // Either the packet has the "more fragments" flag set,
+   // or the fragment offset is non-zero, or both.
+   var flag_more_fragments_mask = 0x2000;
+   var non_zero_offset = 0x1FFF;
+   var flags_and_frag_offset = ntohs(rd16(pkt.data + ehs + o_ipv4_flags));
+   return band(flags_and_frag_offset, flag_more_fragments_mask) != 0 ||
+      band(flags_and_frag_offset, non_zero_offset) != 0;
+}
+
+function write_to_file(filename, content) {
+   var fd, err = io.open(filename, "wt+");
+   if( ! fd ) { error(err); }
+   fd->write(content);
+   fd->close();
+}
+
+function fatal (msg) {
+   print(msg);
+   main.exit(1);
+}
+
+function file_exists(path) {
+   var stat = S.stat(path);
+   return stat && stat.isreg;
+}
+
+function dir_exists(path) {
+   var stat = S.stat(path);
+   return stat && stat.isdir;
+}
+
+function nic_exists(pci_addr) {
+   var devices="/sys/bus/pci/devices";
+   return dir_exists(("%s/%s")->format(devices, pci_addr)) ||
+      dir_exists(("%s/0000:%s")->format(devices, pci_addr));
+}

@@ -1,0 +1,216 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+module(..., package.seeall);
+
+var ffi = require("ffi");
+var C = ffi.C;
+var lib = require("core.lib");
+var shm = require("core.shm");
+var counter = require("core.counter");
+var S = require("syscall");
+var histogram = require("core.histogram");
+var usage = require("program.top.README_inc");
+
+// We must load any modules that register abstract shm types that we may
+// wish to inspect.
+require("lib.interlink");
+
+var long_opts = {
+   help = "h", list = "l"
+};
+
+function clearterm () { io.write('\027[2J'); }
+
+function run (args) {
+   var opt = {};
+   var object = null;
+   function opt.h (arg) { print(usage); main.exit(1); }
+   function opt.l (arg) { object = arg;              }
+   args = lib.dogetopt(args, opt, "hl:", long_opts);
+
+   if( #args > 1 ) { print(usage); main.exit(1); }
+   var target_pid = select_snabb_instance(args[1]);
+
+   if(     object ) { list_shm(target_pid, object);
+   } else {               top(target_pid); }
+}
+
+function select_snabb_instance (pid) {
+   var function compute_snabb_instances() {
+      // Produces set of snabb instances, excluding this one.
+      var pids = {};
+      var my_pid = S.getpid();
+      for( _, name in ipairs(shm.children("/")) ) {
+         // This could fail as the name could be for example "by-name"
+         var p = tonumber(name);
+         if( p && p != my_pid ) { table.insert(pids, name); }
+      }
+      return pids;
+   }
+
+   var instances = compute_snabb_instances();
+
+   if( pid ) {
+      pid = tostring(pid);
+      // Try to use given pid
+      for( _, instance in ipairs(instances) ) {
+         if( instance == pid ) { return pid; }
+      }
+      print("No such Snabb instance: "..pid);
+   } else if( #instances == 1 ) { return instances[1];
+   } else if( #instances <= 0 ) { print("No Snabb instance found.");
+   } else {
+      print("Multiple Snabb instances found. Select one:");
+      for( _, instance in ipairs(instances) ) { print(instance); }
+   }
+   main.exit(1);
+}
+
+function list_shm (pid, object) {
+   var frame = shm.open_frame("/"..pid.."/"..object);
+   var sorted = {};
+   for( name, _ in pairs(frame) ) { table.insert(sorted, name); }
+   table.sort(sorted);
+   for( _, name in ipairs(sorted) ) {
+      if( name != 'path' && name != 'specs' &&  name != 'readonly' ) {
+         print_row({30, 47}, {name, tostring(frame[name])});
+      }
+   }
+   shm.delete_frame(frame);
+}
+
+function top (instance_pid) {
+   var instance_tree = "/"..instance_pid;
+   var counters = open_counters(instance_tree);
+   var configs = 0;
+   var last_stats = null;
+   while( (true) ) {
+      var current = counter.read(counters.engine.configs);
+      if( configs < current ) {
+         configs = current;
+         // If a (new) config is loaded we (re)open the link counters.
+         open_link_counters(counters, instance_tree);
+      }
+      var new_stats = get_stats(counters);
+      if( last_stats ) {
+         clearterm();
+         print_global_metrics(new_stats, last_stats);
+         io.write("\n");
+         print_latency_metrics(new_stats, last_stats);
+         print_link_metrics(new_stats, last_stats);
+         io.flush();
+      }
+      last_stats = new_stats;
+      C.sleep(1);
+   }
+}
+
+function open_counters (tree) {
+   var counters = {};
+   counters.engine = shm.open_frame(tree.."/engine");
+   counters.links = {}; // These will be populated on demand.
+   return counters;
+}
+
+function open_link_counters (counters, tree) {
+   // Unmap and clear existing link counters.
+   for( _, link_frame in pairs(counters.links) ) {
+      shm.delete_frame(link_frame);
+   }
+   counters.links = {};
+   // Open current link counters.
+   for( _, linkspec in ipairs(shm.children(tree.."/links")) ) {
+      counters.links[linkspec] = shm.open_frame(tree.."/links/"..linkspec);
+   }
+}
+
+function get_stats (counters) {
+   var new_stats = {};
+   for( _, name in ipairs({"configs", "breaths", "frees", "freebytes"}) ) {
+      new_stats[name] = counter.read(counters.engine[name]);
+   }
+   if( counters.engine.latency ) {
+      new_stats.latency = counters.engine.latency->snapshot();
+   }
+   new_stats.links = {};
+   for( linkspec, link in pairs(counters.links) ) {
+      new_stats.links[linkspec] = {};
+      for( _, name
+      in ipairs({"rxpackets", "txpackets", "rxbytes", "txbytes", "txdrop" }) ) {
+         new_stats.links[linkspec][name] = counter.read(link[name]);
+      }
+   }
+   return new_stats;
+}
+
+var global_metrics_row = {15, 15, 15};
+function print_global_metrics (new_stats, last_stats) {
+   var frees = tonumber(new_stats.frees - last_stats.frees);
+   var bytes = tonumber(new_stats.freebytes - last_stats.freebytes);
+   var breaths = tonumber(new_stats.breaths - last_stats.breaths);
+   print_row(global_metrics_row, {"Kfrees/s", "freeGbytes/s", "breaths/s"});
+   print_row(global_metrics_row,
+             {float_s(frees / 1000), float_s(bytes / (1000**3)), tostring(breaths)});
+}
+
+function summarize_latency (histogram, prev) {
+   var total = histogram.total;
+   if( prev ) { total = total - prev.total; }
+   if( total == 0 ) { return 0, 0, 0; }
+   var min, max, cumulative = null, 0, 0;
+   for( count, lo, hi in histogram->iterate(prev) ) {
+      if( count != 0 ) {
+	 if( ! min ) { min = lo; }
+	 max = hi;
+	 cumulative = cumulative + (lo + hi) / 2 * tonumber(count);
+      }
+   }
+   return min, cumulative / tonumber(total), max;
+}
+
+function print_latency_metrics (new_stats, last_stats) {
+   var cur, prev = new_stats.latency, last_stats.latency;
+   if( ! cur ) { return; }
+   var min, avg, max = summarize_latency(cur, prev);
+   print_row(global_metrics_row,
+             {"Min breath (us)", "Average", "Maximum"});
+   print_row(global_metrics_row,
+             {float_s(min*1e6), float_s(avg*1e6), float_s(max*1e6)});
+   print("\n");
+}
+
+var link_metrics_row = {31, 7, 7, 7, 7, 7};
+function print_link_metrics (new_stats, last_stats) {
+   print_row(link_metrics_row,
+             {"Links (rx/tx/txdrop in Mpps)", "rx", "tx", "rxGb", "txGb", "txdrop"});
+   for( linkspec, link in pairs(new_stats.links) ) {
+      if( last_stats.links[linkspec] ) {
+         var rx = tonumber(new_stats.links[linkspec].rxpackets - last_stats.links[linkspec].rxpackets);
+         var tx = tonumber(new_stats.links[linkspec].txpackets - last_stats.links[linkspec].txpackets);
+         var rxbytes = tonumber(new_stats.links[linkspec].rxbytes - last_stats.links[linkspec].rxbytes);
+         var txbytes = tonumber(new_stats.links[linkspec].txbytes - last_stats.links[linkspec].txbytes);
+         var drop = tonumber(new_stats.links[linkspec].txdrop - last_stats.links[linkspec].txdrop);
+         print_row(link_metrics_row,
+                   {linkspec,
+                    float_s(rx / 1e6), float_s(tx / 1e6),
+                    float_s(rxbytes / (1000**3)), float_s(txbytes / (1000**3)),
+                    float_s(drop / 1e6)});
+      }
+   }
+}
+
+function pad_str (s, n, no_pad) {
+   var padding = math.max(n - s->len(), 0);
+   return ("%s%s")->format(s->sub(1, n), (no_pad && "") || (" ")->rep(padding));
+}
+
+function print_row (spec, args) {
+   for( i, s in ipairs(args) ) {
+      io.write((" %s")->format(pad_str(s, spec[i], i == #args)));
+   }
+   io.write("\n");
+}
+
+function float_s (n) {
+   return ("%.2f")->format(n);
+}

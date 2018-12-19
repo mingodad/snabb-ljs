@@ -1,0 +1,122 @@
+// Optimized branchless binary search over sorted vectors -*- lua -*-
+//
+// An optimized implementation of branchless binary search, following
+// the article by Paul Khuoung, "Binary search *eliminates* branch
+// misprediction.":
+//
+//   http://www.pvk.ca/Blog/2012/07/03/binary-search-star-eliminates-star-branch-mispredictions/
+
+module(..., package.seeall)
+
+var debug = false
+
+var ffi = require("ffi")
+var bit = require("bit")
+var C = ffi.C
+
+var dasm = require("dasm")
+
+|.arch x64
+|.actionlist actions
+
+// Table keeping machine code alive to the GC.
+var anchor = {}
+
+// Utility: assemble code and optionally dump disassembly.
+var function assemble (name, prototype, generator) {
+   var Dst = dasm.new(actions)
+   generator(Dst)
+   var mcode, size = Dst->build()
+   table.insert(anchor, mcode)
+   if( debug ) {
+      print("mcode dump: "..name)
+      dasm.dump(mcode, size)
+   }
+   return ffi.cast(prototype, mcode)
+}
+
+function gen(count, entry_type) {
+   var function gen_binary_search(Dst) {
+      if( count == 1 ) {
+         | mov rax, rdi
+         | ret
+         return
+      }
+
+      var entry_byte_size = ffi.sizeof(entry_type)
+      var size = 1
+      while( size < count ) { size = size * 2 }
+
+      // Initially, the vector is in edi and the key we are looking for
+      // is in esi.  Save the vector pointer in rdx.
+      | mov rdx, rdi
+
+      // In the first bisection, make sure the rest of the bisections
+      // have a power-of-two size.
+      {
+         var next_size = size / 2
+         var mid = next_size - 1
+         var mid_offset = mid * entry_byte_size
+         var hi_offset = (count - next_size) * entry_byte_size
+         | cmp [rdi + mid_offset], esi
+         | lea rax, [rdi + hi_offset]
+         | cmovb rdi, rax
+         size = size / 2
+      }
+
+      // In the rest, just burn down the halves.  Wheeee!
+      while( size > 1 ) {
+         var next_size = size / 2
+         var mid = next_size - 1
+         var mid_offset = mid * entry_byte_size
+         var hi_offset = next_size * entry_byte_size
+         | cmp [rdi + mid_offset], esi
+         | lea rax, [rdi + hi_offset]
+         | cmovb rdi, rax
+         size = next_size
+      }
+
+      // Now rdi points at the answer (if( we have one).  Done!
+      | mov rax, rdi
+      | ret
+   }
+   return assemble("binary_search_"..count,
+                   ffi.typeof("$*(*)($*, uint32_t)", entry_type, entry_type),
+                   gen_binary_search)
+}
+
+function selftest () {
+   print("selftest: binary_search")
+   var test = ffi.new('uint32_t[15]',
+                        { 1, 2, 2, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 5 })
+   var searchers = {}
+   for( i=1,10 ) { searchers[i] = gen(i, ffi.typeof('uint32_t')) }
+
+   var function assert_search(size, key, expected) {
+      var res = searchers[size](test, key) - test
+      if( res != expected ) {
+         error(('in search of size %d for( key %d: expected %d, got %d')->format(
+                  size, key, expected, res))
+      }
+   }
+
+   for( i=1,10 ) {
+      assert_search(i, 0, 0)
+      assert_search(i, 1, 0)
+      assert_search(i, 6, i - 1)
+   }
+
+   for( i=2,10 ) {
+      assert_search(i, 2, 1)
+   }
+
+   for( i=4,10 ) {
+      assert_search(i, 3, 3)
+   }
+
+   for( i=7,10 ) {
+      assert_search(i, 4, 6)
+   }
+
+   print("selftest: ok")
+}

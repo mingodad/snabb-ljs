@@ -1,0 +1,68 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+module(...,package.seeall);
+
+var ffi = require("ffi");
+var ethernet = require("lib.protocol.ethernet");
+var datagram = require("lib.protocol.datagram");
+var transmit, receive = link.transmit, link.receive;
+
+Synth = {
+   config = {
+      sizes = {default={64}},
+      src = {default='00:00:00:00:00:00'},
+      dst = {default='00:00:00:00:00:00'},
+   }
+};
+
+function Synth::new (conf) {
+   assert(#conf.sizes >= 1, "Needs at least one size.");
+   var packets = {};
+   for( i, size in ipairs(conf.sizes) ) {
+      var payload_size = size - ethernet->sizeof();
+      assert(payload_size >= 0 && payload_size <= 1536,
+             "Invalid payload size: "..payload_size);
+      var data = ffi.new("char[?]", payload_size);
+      var dgram = datagram->new(packet.from_pointer(data, payload_size));
+      var ether = ethernet->new({ src = ethernet->pton(conf.src),
+				   dst = ethernet->pton(conf.dst),
+                                   type = payload_size });
+      dgram->push(ether);
+      packets[i] = dgram->packet();
+   }
+   return setmetatable({packets=packets}, {__index=Synth});
+}
+
+function Synth::pull () {
+   for( _, o in ipairs(this.output) ) {
+      var n = 0;
+      while( n < engine.pull_npackets ) {
+         for( _, p in ipairs(this.packets) ) {
+	    transmit(o, packet.clone(p));
+            ++n    ;
+	 }
+      }
+   }
+}
+
+function Synth::stop () {
+   for( _, p in ipairs(this.packets) ) {
+      packet.free(p);
+   }
+}
+
+function selftest () {
+   var pcap = require("apps.pcap.pcap");
+   var Match = require("apps.test.match").Match;
+   var c = config.new();
+   config.app(c, "match", Match);
+   config.app(c, "reader", pcap.PcapReader, "apps/test/synth.pcap");
+   config.app(c, "synth", Synth, { sizes = {32, 64, 128},
+				   src = "11:11:11:11:11:11",
+				   dst = "22:22:22:22:22:22" });
+   config.link(c, "reader.output->match.comparator");
+   config.link(c, "synth.output->match.rx");
+   engine.configure(c);
+   engine.main({ duration = 0.0001, report = {showapps=true,showlinks=true}});
+   assert(#engine.app_table.match->errors() == 0);
+}

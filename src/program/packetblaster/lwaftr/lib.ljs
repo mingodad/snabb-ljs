@@ -1,0 +1,442 @@
+module(...,package.seeall);
+
+var lib = require("core.lib");
+var app = require("core.app");
+var packet = require("core.packet");
+var link = require("core.link");
+var ethernet = require("lib.protocol.ethernet");
+var ipv4 = require("lib.protocol.ipv4");
+var ipv6 = require("lib.protocol.ipv6");
+var ipsum = require("lib.checksum").ipsum;
+
+var ffi = require("ffi");
+var C = ffi.C;
+var cast = ffi.cast;
+var copy = ffi.copy;
+
+var PROTO_IPV4_ENCAPSULATION = 0x4;
+var PROTO_VLAN = C.htons(0x8100);
+var PROTO_IPV4 = C.htons(0x0800);
+var PROTO_IPV6 = C.htons(0x86DD);
+
+var DEFAULT_TTL = 255;
+var MAGIC = 0xaffeface;
+
+var ether_header_t = ffi.typeof([=[
+struct {
+   uint8_t  ether_dhost[6];
+   uint8_t  ether_shost[6];
+   uint16_t ether_type;
+} __attribute__((packed))
+]=]);
+var ether_header_ptr_type = ffi.typeof("$*", ether_header_t);
+var ethernet_header_size = ffi.sizeof(ether_header_t);
+var OFFSET_ETHERTYPE = 12;
+
+// The ethernet CRC field is not included in the packet as seen by
+// Snabb, but it is part of the frame and therefore a contributor to the
+// frame size.
+var ethernet_crc_size = 4;
+
+var ether_vlan_header_type = ffi.typeof([=[
+struct {
+   uint16_t tag;
+   uint16_t ether_type;
+}
+]=]);
+ether_vlan_header_ptr_type = ffi.typeof("$*", ether_vlan_header_type);
+ether_vlan_header_size = ffi.sizeof(ether_vlan_header_type);
+var OFFSET_ETHERTYPE_VLAN = OFFSET_ETHERTYPE + ether_vlan_header_size;
+
+var ipv4hdr_t = ffi.typeof([=[
+struct {
+   uint16_t ihl_v_tos; // ihl:4, version:4, tos(dscp:6 + ecn:2)
+   uint16_t total_length;
+   uint16_t id;
+   uint16_t frag_off; // flags:3, fragmen_offset:13
+   uint8_t  ttl;
+   uint8_t  protocol;
+   uint16_t checksum;
+   uint8_t  src_ip[4];
+   uint8_t  dst_ip[4];
+} __attribute__((packed))
+]=]);
+var ipv4_header_size = ffi.sizeof(ipv4hdr_t);
+var ipv4_header_ptr_type = ffi.typeof("$*", ipv4hdr_t);
+
+var ipv6_ptr_type = ffi.typeof([=[
+struct {
+   uint32_t v_tc_fl; // version, tc, flow_label
+   uint16_t payload_length;
+   uint8_t  next_header;
+   uint8_t  hop_limit;
+   uint8_t  src_ip[16];
+   uint8_t  dst_ip[16];
+} __attribute__((packed))
+]=]);
+var ipv6_header_ptr_type = ffi.typeof("$*", ipv6_ptr_type);
+var ipv6_header_size = ffi.sizeof(ipv6_ptr_type);
+
+var udp_header_t = ffi.typeof([=[
+struct {
+   uint16_t    src_port;
+   uint16_t    dst_port;
+   uint16_t    len;
+   uint16_t    checksum;
+} __attribute__((packed))
+]=]);
+var udp_header_ptr_type = ffi.typeof("$*", udp_header_t);
+var udp_header_size = ffi.sizeof(udp_header_ptr_type);
+
+var payload_t = ffi.typeof([=[
+struct {
+   uint32_t    magic;
+   uint32_t    number;
+} __attribute__((packed))
+]=]);
+var payload_ptr_type = ffi.typeof("$*", payload_t);
+var payload_size = ffi.sizeof(payload_t);
+
+var uint16_ptr_t = ffi.typeof("uint16_t*");
+var uint32_ptr_t = ffi.typeof("uint32_t*");
+
+var n_cache_src_ipv6 = ipv6->pton("::");
+
+var function rd32(offset) {
+   return cast(uint32_ptr_t, offset)[0];
+}
+
+var function wr32(offset, val) {
+   cast(uint32_ptr_t, offset)[0] = val;
+}
+
+var function inc_ipv6(ipv6) {
+   for( i=15,0,-1 ) {
+      if( ipv6[i] == 255 ) {
+         ipv6[i] = 0;
+      } else {
+         ipv6[i] = ipv6[i] + 1;
+         break;
+      }
+   }
+   return ipv6;
+}
+
+Lwaftrgen = {
+   config = {
+      sizes = {required=true},
+      dst_mac = {required=true},
+      src_mac = {required=true},
+      rate = {required=true},
+      vlan = {},
+      b4_ipv6 = {},
+      b4_ipv4 = {},
+      public_ipv4 = {},
+      aftr_ipv6 = {},
+      ipv6_only = {},
+      ipv4_only = {},
+      b4_port = {},
+      protocol = {},
+      count = {},
+      single_pass = {}
+   }
+};
+
+var receive, transmit = link.receive, link.transmit;
+
+function Lwaftrgen::new(conf) {
+   var dst_mac = ethernet->pton(conf.dst_mac);
+   var src_mac = ethernet->pton(conf.src_mac);
+   var vlan = conf.vlan;
+   var b4_ipv6 = conf.b4_ipv6 && ipv6->pton(conf.b4_ipv6);
+   var b4_ipv4 = conf.b4_ipv4 && ipv4->pton(conf.b4_ipv4);
+   var public_ipv4 = conf.public_ipv4 && ipv4->pton(conf.public_ipv4);
+   var aftr_ipv6 = conf.aftr_ipv6 && ipv6->pton(conf.aftr_ipv6);
+
+   var ipv4_pkt = packet.allocate();
+   ffi.fill(ipv4_pkt.data, packet.max_payload);
+   var eth_hdr = cast(ether_header_ptr_type, ipv4_pkt.data);
+   eth_hdr.ether_dhost, eth_hdr.ether_shost = dst_mac, src_mac;
+
+   var ipv4_hdr, udp_offset;
+   if( vlan ) {
+      udp_offset = 38;
+      eth_hdr.ether_type = PROTO_VLAN;
+      var vlan_hdr = cast(ether_vlan_header_ptr_type, ipv4_pkt.data + ethernet_header_size);
+      vlan_hdr.ether_type = PROTO_IPV4;
+      vlan_hdr.tag = C.htons(vlan);
+      ipv4_hdr = cast(ipv4_header_ptr_type, ipv4_pkt.data + ethernet_header_size + ether_vlan_header_size);
+   } else {
+      udp_offset = 34;
+      eth_hdr.ether_type = PROTO_IPV4;
+      ipv4_hdr = cast(ipv4_header_ptr_type, ipv4_pkt.data + ethernet_header_size);
+   }
+
+   ipv4_hdr.src_ip = public_ipv4;
+   ipv4_hdr.dst_ip = b4_ipv4;
+   ipv4_hdr.ttl = 15;
+   ipv4_hdr.ihl_v_tos = C.htons(0x4500); // v4
+   ipv4_hdr.id = 0;
+   ipv4_hdr.frag_off = 0;
+
+   var ipv4_udp_hdr, ipv4_payload;
+
+   ipv4_hdr.protocol = 17;  // UDP(17)
+   ipv4_udp_hdr = cast(udp_header_ptr_type, ipv4_pkt.data + udp_offset);
+   ipv4_udp_hdr.src_port = C.htons(12345);
+   ipv4_udp_hdr.checksum = 0;
+   ipv4_payload = cast(payload_ptr_type, ipv4_pkt.data + udp_offset + udp_header_size);
+   ipv4_payload.magic = MAGIC;
+   ipv4_payload.number = 0;
+
+   // IPv4 in IPv6 packet
+   copy(n_cache_src_ipv6, b4_ipv6, 16);
+   var ipv6_pkt = packet.allocate();
+   ffi.fill(ipv6_pkt.data, packet.max_payload);
+   eth_hdr = cast(ether_header_ptr_type, ipv6_pkt.data);
+   eth_hdr.ether_dhost, eth_hdr.ether_shost = dst_mac, src_mac;
+
+
+   var ipv6_hdr, ipv6_ipv4_hdr;
+   if( vlan ) {
+      eth_hdr.ether_type = PROTO_VLAN;
+      var vlan_hdr = cast(ether_vlan_header_ptr_type, ipv6_pkt.data + ethernet_header_size);
+      vlan_hdr.ether_type = PROTO_IPV6;
+      vlan_hdr.tag = C.htons(vlan);
+      ipv6_hdr = cast(ipv6_header_ptr_type, ipv6_pkt.data + ethernet_header_size + ether_vlan_header_size);
+      ipv6_ipv4_hdr = cast(ipv4_header_ptr_type, ipv6_pkt.data + ethernet_header_size + ether_vlan_header_size + ipv6_header_size);
+   } else {
+      eth_hdr.ether_type = PROTO_IPV6;
+      ipv6_hdr = cast(ipv6_header_ptr_type, ipv6_pkt.data + ethernet_header_size);
+      ipv6_ipv4_hdr = cast(ipv4_header_ptr_type, ipv6_pkt.data + ethernet_header_size + ipv6_header_size);
+   }
+
+   lib.bitfield(32, ipv6_hdr, 'v_tc_fl', 0, 4, 6); // IPv6 Version
+   lib.bitfield(32, ipv6_hdr, 'v_tc_fl', 4, 8, 1); // Traffic class
+   ipv6_hdr.next_header = PROTO_IPV4_ENCAPSULATION;
+   ipv6_hdr.hop_limit = DEFAULT_TTL;
+   ipv6_hdr.dst_ip = aftr_ipv6;
+
+   ipv6_ipv4_hdr.dst_ip = public_ipv4;
+   ipv6_ipv4_hdr.ttl = 15;
+   ipv6_ipv4_hdr.ihl_v_tos = C.htons(0x4500); // v4
+   ipv6_ipv4_hdr.id = 0;
+   ipv6_ipv4_hdr.frag_off = 0;
+
+   var ipv6_ipv4_udp_hdr, ipv6_payload;
+
+   var total_packet_count = 0;
+   for( _,size in ipairs(conf.sizes) ) {
+      // count for IPv4 and IPv6 packets (40 bytes IPv6 encap header)
+      if( conf.ipv4_only || conf.ipv6_only ) { 
+         ++total_packet_count    ;
+      } else {
+         total_packet_count +=   2;
+      }
+   }
+
+   ipv6_ipv4_hdr.protocol = 17;  // UDP(17)
+   ipv6_ipv4_udp_hdr = cast(udp_header_ptr_type, ipv6_pkt.data + udp_offset + ipv6_header_size);
+   ipv6_ipv4_udp_hdr.dst_port = C.htons(12345);
+   ipv6_ipv4_udp_hdr.checksum = 0;
+   ipv6_payload = cast(payload_ptr_type, ipv6_pkt.data + udp_offset + ipv6_header_size + udp_header_size);
+   ipv6_payload.magic = MAGIC;
+   ipv6_payload.number = 0;
+
+   var o = {
+      b4_ipv6 = b4_ipv6,
+      b4_ipv4 = b4_ipv4,
+      b4_port = conf.b4_port,
+      current_port = conf.b4_port,
+      b4_ipv4_offset = 0,
+      ipv6_address = n_cache_src_ipv6,
+      count = conf.count,
+      single_pass = conf.single_pass,
+      current_count = 0,
+      ipv4_pkt = ipv4_pkt,
+      ipv4_hdr = ipv4_hdr,
+      ipv4_payload = ipv4_payload,
+      ipv6_hdr = ipv6_hdr,
+      ipv6_pkt = ipv6_pkt,
+      ipv6_payload = ipv6_payload,
+      ipv6_ipv4_hdr = ipv6_ipv4_hdr,
+      ipv4_udp_hdr = ipv4_udp_hdr,
+      ipv6_ipv4_udp_hdr = ipv6_ipv4_udp_hdr,
+      ipv4_only = conf.ipv4_only,
+      ipv6_only = conf.ipv6_only,
+      vlan = vlan,
+      udp_offset = udp_offset,
+      protocol = conf.protocol,
+      rate = conf.rate,
+      sizes = conf.sizes,
+      total_packet_count = total_packet_count,
+      bucket_content = conf.rate * 1e6,
+      ipv4_packets = 0, ipv4_bytes = 0,
+      ipv6_packets = 0, ipv6_bytes = 0,
+      ipv4_packet_number = 0, ipv6_packet_number = 0,
+      last_rx_ipv4_packet_number = 0, last_rx_ipv6_packet_number = 0,
+      lost_packets = 0
+   };
+   return setmetatable(o, {__index=Lwaftrgen});
+}
+
+function Lwaftrgen::pull () {
+
+   var output = this.output.output;
+   var input = this.input.input;
+   var ipv6_packets = this.ipv6_packets;
+   var ipv6_bytes = this.ipv6_bytes;
+   var ipv4_packets = this.ipv4_packets;
+   var ipv4_bytes = this.ipv4_bytes;
+   var lost_packets = this.lost_packets;
+   var udp_offset = this.udp_offset;
+   var o_ethertype = this.vlan && OFFSET_ETHERTYPE_VLAN || OFFSET_ETHERTYPE;
+
+   if( this.current == 0 ) {
+      main.exit(0);
+   }
+
+   // count and trash incoming packets
+   for( _=1,link.nreadable(input) ) {
+      var pkt = receive(input);
+      if( cast(uint16_ptr_t, pkt.data + o_ethertype)[0] == PROTO_IPV6 ) {
+         ipv6_bytes = ipv6_bytes + pkt.length;
+         ++ipv6_packets    ;
+         var payload = cast(payload_ptr_type, pkt.data + udp_offset + ipv6_header_size + udp_header_size);
+         if( payload.magic == MAGIC ) {
+            if( this.last_rx_ipv6_packet_number > 0 ) {
+               lost_packets = lost_packets + payload.number - this.last_rx_ipv6_packet_number - 1;  
+            }
+            this.last_rx_ipv6_packet_number = payload.number;
+         }
+      } else {
+         ipv4_bytes = ipv4_bytes + pkt.length;
+         ++ipv4_packets    ;
+         var payload = cast(payload_ptr_type, pkt.data + udp_offset + udp_header_size);
+         if( payload.magic == MAGIC ) {
+            if( this.last_rx_ipv4_packet_number > 0 ) {
+               lost_packets = lost_packets + payload.number - this.last_rx_ipv4_packet_number - 1;  
+            }
+            this.last_rx_ipv4_packet_number = payload.number;
+         }
+      }
+      packet.free(pkt);
+   }
+
+   var cur_now = tonumber(app.now());
+   this.period_start = this.period_start || cur_now;
+   var elapsed = cur_now - this.period_start;
+   if( elapsed > 1 ) {
+      var ipv6_packet_rate = ipv6_packets / elapsed / 1e6;
+      var ipv4_packet_rate = ipv4_packets / elapsed / 1e6;
+      var ipv6_octet_rate = ipv6_bytes * 8 / 1e9 / elapsed;
+      var ipv4_octet_rate = ipv4_bytes * 8 / 1e9 / elapsed;
+      var lost_rate = math.abs(lost_packets / (ipv6_octet_rate + ipv4_octet_rate) / 10000);
+      print(string.format('v6+v4: %.3f+%.3f = %.6f MPPS, %.3f+%.3f = %.6f Gbps, lost %.3f%%',
+      ipv6_packet_rate, ipv4_packet_rate, ipv6_packet_rate + ipv4_packet_rate,
+      ipv6_octet_rate, ipv4_octet_rate, ipv6_octet_rate + ipv4_octet_rate, lost_rate));
+      this.period_start = cur_now;
+      this.ipv6_bytes, this.ipv6_packets = 0, 0;
+      this.ipv4_bytes, this.ipv4_packets = 0, 0;
+      this.lost_packets = 0;
+   } else {
+      this.ipv4_bytes, this.ipv4_packets = ipv4_bytes, ipv4_packets;
+      this.ipv6_bytes, this.ipv6_packets = ipv6_bytes, ipv6_packets;
+      this.lost_packets = lost_packets;
+   }
+
+   var ipv4_hdr = this.ipv4_hdr;
+   var ipv6_hdr = this.ipv6_hdr;
+   var ipv6_ipv4_hdr = this.ipv6_ipv4_hdr;
+   var ipv4_udp_hdr = this.ipv4_udp_hdr;
+   var ipv6_ipv4_udp_hdr = this.ipv6_ipv4_udp_hdr;
+
+   cur_now = tonumber(app.now());
+   var last_time = this.last_time || cur_now;
+   this.bucket_content = this.bucket_content + this.rate * 1e6 * (cur_now - last_time);
+   this.last_time = cur_now;
+
+   var limit = engine.pull_npackets;
+   while( limit > this.total_packet_count &&
+      this.total_packet_count <= this.bucket_content ) {
+      --limit    ;
+      this.bucket_content = this.bucket_content - this.total_packet_count;
+
+      ipv4_hdr.dst_ip = this.b4_ipv4;
+      ipv6_ipv4_hdr.src_ip = this.b4_ipv4;
+      ipv6_hdr.src_ip = this.b4_ipv6;
+      var ipdst = C.ntohl(rd32(ipv4_hdr.dst_ip));
+      ipdst = C.htonl(ipdst + this.b4_ipv4_offset);
+      wr32(ipv4_hdr.dst_ip, ipdst);
+      wr32(ipv6_ipv4_hdr.src_ip, ipdst);
+
+      ipv4_udp_hdr.dst_port = C.htons(this.current_port);
+      ipv6_ipv4_udp_hdr.src_port = C.htons(this.current_port);
+
+      // The sizes are frame sizes, including the 4-byte ethernet CRC
+      // that we don't see in Snabb.
+
+      var vlan_size = this.vlan && ether_vlan_header_size || 0;
+      var ethernet_total_size = ethernet_header_size + vlan_size;
+      var minimum_size = ethernet_total_size + ipv4_header_size +
+         udp_header_size + ethernet_crc_size;
+
+      for( _,size in ipairs(this.sizes) ) {
+         assert(size >= minimum_size);
+         var packet_len = size - ethernet_crc_size;
+         var ipv4_len =  packet_len - ethernet_total_size;
+         var udp_len = ipv4_len - ipv4_header_size;
+         if( ! this.ipv6_only ) {
+            ipv4_hdr.total_length = C.htons(ipv4_len);
+            ipv4_udp_hdr.len = C.htons(udp_len);
+            this.ipv4_pkt.length = packet_len;
+            ipv4_hdr.checksum =  0;
+            ipv4_hdr.checksum = C.htons(ipsum(this.ipv4_pkt.data + ethernet_total_size, 20, 0));
+            if( size >= minimum_size + payload_size ) {
+               this.ipv4_payload.number = this.ipv4_packet_number;
+               this.ipv4_packet_number = this.ipv4_packet_number + 1;
+            }
+            var ipv4_pkt = packet.clone(this.ipv4_pkt);
+            transmit(output, ipv4_pkt);
+         }
+
+         if( ! this.ipv4_only ) {
+            // Expectation from callers is to make packets that are SIZE
+            // bytes big, *plus* the IPv6 header.
+            ipv6_hdr.payload_length = C.htons(ipv4_len);
+            ipv6_ipv4_hdr.total_length = C.htons(ipv4_len);
+            ipv6_ipv4_udp_hdr.len = C.htons(udp_len);
+            this.ipv6_pkt.length = packet_len + ipv6_header_size;
+            if( size >= minimum_size + payload_size ) {
+               this.ipv6_payload.number = this.ipv6_packet_number;
+               this.ipv6_packet_number = this.ipv6_packet_number + 1;
+            }
+            var ipv6_pkt = packet.clone(this.ipv6_pkt);
+            transmit(output, ipv6_pkt);
+         }
+
+       } 
+
+       this.b4_ipv6 = inc_ipv6(this.b4_ipv6);
+       this.current_port = this.current_port + this.b4_port;
+       if( this.current_port > 65535 ) {
+         this.current_port = this.b4_port;
+         this.b4_ipv4_offset = this.b4_ipv4_offset + 1;
+       }
+
+       this.current_count = this.current_count + 1;
+       if( this.current_count >= this.count ) {
+         if( this.single_pass ) {
+           print(string.format("generated %d packets", this.current_count));
+           // make sure we won't generate more packets in the same breath, then exit
+           this.current = 0;
+           this.bucket_content = 0; 
+         }
+         this.current_count = 0;
+         this.current_port = this.b4_port;
+         this.b4_ipv4_offset = 0;
+         copy(this.b4_ipv6, this.ipv6_address, 16);
+       }
+     }
+}
+

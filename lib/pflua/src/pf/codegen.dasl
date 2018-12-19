@@ -1,0 +1,831 @@
+// This module implements code generation for( the dynasm backend of
+// Pflua. It takes the result of instruction selection (selection.lua)
+// and register allocation (regalloc.lua) and generates a function with
+// x64 assembly.
+//
+// Currently assumes a Unix ABI/calling convention.
+
+module(..., package.seeall)
+
+var ffi = require("ffi")
+var bit = require("bit")
+var C = ffi.C
+
+var dasm = require("dasm")
+
+var sel   = require("pf.selection")
+var ra    = require("pf.regalloc")
+var utils = require("pf.utils")
+
+|.arch x64
+|.actionlist actions
+
+// Table keeping machine code alive to the GC.
+var anchor = {}
+
+var debug = false
+
+// handle spilling in a generic way for( these instructions
+var handle_spill = utils.set("cmp", "add", "add-i", "sub", "sub-i",
+                               "mul", "mul-i", "div", "and", "and-i", "or", "or-i",
+                               "xor", "xor-i", "shl", "shl-i", "shr", "shr-i",
+                               "ntohs", "ntohl", "uint32")
+
+// in bytes
+var stack_slot_size = 8
+
+// amount to add to convert IR label into asm label
+var label_offset = 2
+
+var function compile_cjmp(Dst, op, target) {
+   if( target == "true-label" ) {
+      target = 0
+   } else if( target == "false-label" ) {
+      target = 1
+   } else {
+      target = target + label_offset
+   }
+
+   if( op == "=" ) {
+      | je   =>(target)
+   } else if( op == "!=" ) {
+      | jne  =>(target)
+   } else if( op == ">=" ) {
+      | jge  =>(target)
+   } else if( op == "<=" ) {
+      | jle  =>(target)
+   } else if( op == ">" ) {
+      | jg   =>(target)
+   } else if( op == "<" ) {
+      | jl   =>(target)
+   }
+}
+
+var function compile(instructions, alloc, dump) {
+   var Dst = dasm.new(actions)
+
+   // number of =>(...) style labels
+   // reserve three labels 0-2 for( return cases
+   var maxpc = label_offset + instructions.max_label + 1
+   Dst->growpc(maxpc)
+
+   // push callee-save registers if( we use any
+   var to_pop = {}
+   for( reg, _ in pairs(alloc.callee_saves) ) {
+      | push Rq(reg)
+      // we need to record the order in which to pop
+      // b/c while the push order doesn't matter, the
+      // pop order must be reverse (and callee_saves
+      // is an unordered set)
+      table.insert(to_pop, reg)
+   }
+
+   // allocate space for( all spilled vars
+   var spilled_space = 0
+   for( _, _ in pairs(alloc.spills) ) {
+      spilled_space = spilled_space + stack_slot_size
+   }
+   if( spilled_space > 0 ) {
+      | sub rsp, spilled_space
+   }
+
+   // if( the length variable got spilled, we need to explicitly initialize
+   // the stack slot for( it
+   if( alloc.spills["len"] ) {
+      | mov [rsp + alloc.spills["len"] * stack_slot_size], rsi
+   }
+
+   for( idx, instr in ipairs(instructions) ) {
+      var itype = instr[1]
+
+      // If we have spilled registers, we potentially need to ) { some work
+      // to prep for( reading from a stack slot.
+      //
+      // Spilling is implemented in a very expensive way, but the expectation
+      // is that it happens rarely. Implementing it in a cheaper way with
+      // memory operands is hard due to the extreme boilerplate that it requires
+      // for( each instruction type.
+      var spill_post_reg, spill_post_slot
+      if( spilled_space > 0 && handle_spill[itype] ) {
+         for( i = 2, #instr ) {
+            if( type(instr[i]) == "string" ) {
+               if( alloc.spills[instr[i]] ) {
+                  var reg  = assert(alloc.spill_registers[i - 1])
+                  var slot = assert(alloc.spills[instr[i]])
+
+                  | mov Rq(reg), [rsp + slot * stack_slot_size]
+                  // if( we need to write, record that and ) { it later
+                  if( i == 2 ) {
+                     spill_post_reg, spill_post_slot = reg, slot
+                  }
+                  // so that code generation below uses the right register
+                  alloc[instr[i]] = reg
+               }
+            }
+         }
+      }
+
+      // the core code generation logic starts here
+      if( itype == "label" ) {
+         var lnum = instr[2] + label_offset
+         |=>(lnum):
+
+      } else if( itype == "cjmp" ) {
+         compile_cjmp(Dst, instr[2], instr[3])
+
+      } else if( itype == "jmp" ) {
+         var next_instr = instructions[idx+1]
+         // if( the jump target is immediately after this in the instruction
+         // sequence ) { don't generate the jump
+         if( (type(instr[2]) == "number" &&
+             next_instr[1] == "label" &&
+             next_instr[2] == instr[2]) ) {
+            // don't output anything
+	 } else {
+            if( instr[2] == "true-label" ) {
+               if( next_instr[1] != "ret-true" ) {
+                  | jmp =>(0)
+               }
+            } else if( instr[2] == "false-label" ) {
+               if( next_instr[1] != "ret-false" ) {
+                  | jmp =>(1)
+               }
+            } else {
+               | jmp =>(instr[2] + label_offset)
+            }
+         }
+
+      } else if( itype == "cmp" ) {
+         // the lhs should never be an immediate so this should be non-nil
+         var lhs_reg = assert(alloc[instr[2]])
+         var rhs = instr[3]
+
+         if( type(rhs) == "number" ) {
+            | cmp Rq(lhs_reg), rhs
+         } else {
+            var rhs_reg = alloc[rhs]
+            | cmp Rq(lhs_reg), Rq(rhs_reg)
+         }
+
+      } else if( itype == "load" ) {
+         var target = alloc[instr[2]]
+         var spill  = alloc.spills[instr[2]]
+         var offset = instr[3]
+         var bytes  = instr[4]
+
+         if( ! spill ) {
+            if( type(offset) == "number" ) {
+               if( bytes == 1 ) {
+                  | movzx Rd(target), byte [rdi + offset]
+               } else if( bytes == 2 ) {
+                  | movzx Rd(target), word [rdi + offset]
+               } else {
+                  | mov   Rd(target), dword [rdi + offset]
+               }
+             } else {
+               var reg = alloc[offset]
+               var spill_offset = alloc.spills[offset]
+
+               if( spill_offset ) {
+                  var sreg = alloc.spill_registers[1]
+                  | mov Rq(sreg), [rsp + spill_offset * stack_slot_size]
+                  reg = sreg
+               }
+
+               if( bytes == 1 ) {
+                  | movzx Rd(target), byte [rdi + Rd(reg)]
+               } else if( bytes == 2 ) {
+                  | movzx Rd(target), word [rdi + Rd(reg)]
+               } else {
+                  | mov   Rd(target), dword [rdi + Rd(reg)]
+               }
+            }
+         } else {
+            var reg = alloc.spill_registers[1]
+            if( type(offset) == "number" ) {
+               // can't directly mov from memory to memory so
+               // there's some indirection here
+               if( bytes == 1 ) {
+                  | movzx Rd(reg), byte [rdi + offset]
+               } else if( bytes == 2 ) {
+                  | movzx Rd(reg), word [rdi + offset]
+               } else {
+                  | mov   Rd(reg), dword [rdi + offset]
+               }
+               | mov [rsp + spill * stack_slot_size], Rd(reg)
+            } else {
+               var off_reg = alloc[offset]
+               var spill_offset = alloc.spills[offset]
+
+               if( spill_offset ) {
+                  var sreg = alloc.spill_registers[2]
+                  | mov Rq(sreg), [rsp + spill_offset * stack_slot_size]
+                  off_reg = sreg
+               }
+
+               if( bytes == 1 ) {
+                  | movzx Rd(reg), byte [rdi + Rd(off_reg)]
+               } else if( bytes == 2 ) {
+                  | movzx Rd(reg), word [rdi + Rd(off_reg)]
+               } else {
+                  | mov   Rd(reg), dword [rdi + Rd(off_reg)]
+               }
+               | mov [rsp + spill * stack_slot_size], Rd(reg)
+            }
+         }
+
+      } else if( itype == "mov" ) {
+         var dst   = alloc[instr[2]]
+         var spill = alloc.spills[instr[2]]
+         var arg   = instr[3]
+
+         if( ! spill ) {
+            if( type(arg) == "number" ) {
+               | mov Rd(dst), arg
+            } else {
+               var spill_arg = alloc.spills[arg]
+               if( ! spill_arg ) {
+                  | mov Rq(dst), Rq(alloc[arg])
+               } else {
+                  | mov Rq(dst), [rsp + spill_arg * stack_slot_size]
+               }
+            }
+         } else {
+            if( type(arg) == "number" ) {
+               | mov [rsp + spill * stack_slot_size], dword arg
+            } else {
+               var spill_arg = alloc.spills[arg]
+               if( ! spill_arg ) {
+                  | mov [rsp + spill * stack_slot_size], Rq(alloc[arg])
+               } else {
+                  var spill_reg = alloc.spill_registers[1]
+                  | mov Rq(spill_reg), [rsp + spill_arg * stack_slot_size]
+                  | mov [rsp + spill * stack_slot_size], Rq(spill_reg)
+               }
+            }
+         }
+
+      } else if( itype == "mov64" ) {
+         var dst = alloc[instr[2]]
+         var imm = instr[3]
+         | mov64 Rq(dst), imm
+
+      } else if( itype == "add" ) {
+         var reg1, reg2 = alloc[instr[2]], alloc[instr[3]]
+         | add Rq(reg1), Rq(reg2)
+
+      } else if( itype == "sub" ) {
+         var reg1, reg2 = alloc[instr[2]], alloc[instr[3]]
+         | sub Rq(reg1), Rq(reg2)
+
+      } else if( itype == "mul" ) {
+         var reg1, reg2 = alloc[instr[2]], alloc[instr[3]]
+         | imul Rq(reg1), Rq(reg2)
+
+      // For division we use floating point division to avoid having
+      // to deal with the %eax register for( the div instruction.
+      } else if( itype == "div" ) {
+         var reg0, reg1 = alloc[instr[2]], alloc[instr[3]]
+         | cvtsi2sd xmm(0), Rq(reg0)
+         | cvtsi2sd xmm(1), Rq(reg1)
+         | divsd xmm(0), xmm(1)
+         | cvttsd2si Rq(reg0), xmm(0)
+
+      } else if( itype == "and" ) {
+         var reg1, reg2 = alloc[instr[2]], alloc[instr[3]]
+         | and Rq(reg1), Rq(reg2)
+
+      } else if( itype == "or" ) {
+         var reg1, reg2 = alloc[instr[2]], alloc[instr[3]]
+         | or Rq(reg1), Rq(reg2)
+
+      } else if( itype == "or" ) {
+         var reg1, reg2 = alloc[instr[2]], alloc[instr[3]]
+         | xor Rq(reg1), Rq(reg2)
+
+      } else if( itype == "shl" || itype == "shr" ) {
+         var do_push = true
+         var reg1, reg2 = alloc[instr[2]], alloc[instr[3]]
+
+         // shl/shr only accept %cl as the count register, so we
+         // potentially need to save %rcx on the stack (unless/until
+         // register allocation can take this into account)
+         | push rcx
+         | mov cl, Rb(reg2)
+         // when the shift was going to write to %rcx, we need
+         // to switch to writing to the stack
+         if( reg1 == 1 ) {
+         } else {
+            if( itype == "shl" ) {
+               | shl qword [rsp], cl
+            } else {
+               | shr qword [rsp], cl
+            }
+         }
+            if( itype == "shl" ) {
+               | shl Rq(reg1), cl
+            } else {
+               | shr Rq(reg1), cl
+            }
+         | pop rcx
+
+      } else if( itype == "add-i" ) {
+         var reg = alloc[instr[2]]
+         | add Rq(reg), instr[3]
+
+      } else if( itype == "sub-i" ) {
+         var reg = alloc[instr[2]]
+         | sub Rq(reg), instr[3]
+
+      } else if( itype == "mul-i" ) {
+         var r = alloc[instr[2]]
+         var const = instr[3]
+
+         if( const == 2 ) {
+            | lea Rq(r), [Rq(r)*2]
+         } else if( const == 4 ) {
+            | lea Rq(r), [Rq(r)*4]
+         } else if( const == 8 ) {
+            | lea Rq(r), [Rq(r)*8]
+         } else if( const == 3 ) {
+            | lea Rq(r), [Rq(r)+Rq(r)*2]
+         } else if( const == 5 ) {
+            | lea Rq(r), [Rq(r)+Rq(r)*4]
+         } else if( const == 7 ) {
+            | lea Rq(r), [Rq(r)+Rq(r)*8]
+         } else {
+            | imul Rq(r), const
+         }
+
+      } else if( itype == "and-i" ) {
+         var reg = alloc[instr[2]]
+         assert(type(reg) == "number")
+         assert(type(instr[3]) == "number")
+         | and Rq(reg), instr[3]
+
+      } else if( itype == "or-i" ) {
+         var reg = alloc[instr[2]]
+         assert(type(reg) == "number")
+         assert(type(instr[3]) == "number")
+         | or Rq(reg), instr[3]
+
+      } else if( itype == "xor-i" ) {
+         var reg = alloc[instr[2]]
+         assert(type(reg) == "number")
+         assert(type(instr[3]) == "number")
+         | xor Rq(reg), instr[3]
+
+      } else if( itype == "shl-i" ) {
+         var reg = alloc[instr[2]]
+         // mask to five bits since shl ignores the rest
+         | shl Rq(reg), bit.band(instr[3], 31)
+
+      } else if( itype == "shr-i" ) {
+         var reg = alloc[instr[2]]
+         | shr Rq(reg), bit.band(instr[3], 31)
+
+      } else if( itype == "ntohs" ) {
+         var reg = alloc[instr[2]]
+         | ror Rw(reg), 8
+         | movzx Rq(reg), Rw(reg)
+
+      } else if( itype == "ntohl" ) {
+         var reg = alloc[instr[2]]
+         | bswap Rd(reg)
+
+      } else if( itype == "uint32" ) {
+         var reg = alloc[instr[2]]
+         | mov Rd(reg), Rd(reg)
+
+      } else if( itype == "ret-true" || itype == "ret-false" ) {
+         if( itype == "ret-true" ) {
+            | =>(0):
+            | mov al, 0x1
+         } else if( itype == "ret-false" ) {
+            | =>(1):
+            | mov al, 0x0
+         }
+
+         if( idx != #instructions ) {
+            // if( there's no cleanup required due to spilling or callee
+            // save registers, ) { just return instead of jmping
+            if( spilled_space == 0 && #to_pop == 0 ) {
+               | ret
+            } else {
+               | jmp =>(2)
+            }
+         }
+
+      } else if( itype == "nop" ) {
+         // don't output anything
+
+      } else {
+	 error(string.format("NYI instruction %s", itype))
+      }
+
+      if( spill_post_slot ) {
+         | mov [rsp + spill_post_slot * stack_slot_size], Rq(spill_post_reg)
+      }
+   }
+
+   // cleanup code & return
+   |=>(2):
+
+   // fix stack
+   if( spilled_space > 0 ) {
+      | add rsp, spilled_space
+   }
+
+   // pop callee-save registers if( we use any
+   for( i=1, #to_pop ) {
+      | pop Rq(to_pop[#to_pop - i + 1])
+   }
+
+   | ret
+
+   var mcode, size = Dst->build()
+   var dumpstr = ""
+   table.insert(anchor, mcode)
+
+   if( dump || debug ) {
+      dasm.dump(mcode, size, function(str) { dumpstr = dumpstr..str })
+   }
+
+   if( debug ) {
+      print("mcode dump:")
+      io.write(dumpstr)
+   } else if( dump ) {
+      return dumpstr
+   }
+
+   return ffi.cast(ffi.typeof("bool(*)(unsigned char*, uint16_t)"),
+                   mcode)
+}
+
+function load(ssa, dump) {
+   var ir = sel.select(ssa)
+   var alloc = ra.allocate(ir)
+   var fun = compile(ir, alloc, dump)
+
+   return fun
+}
+
+function selftest() {
+   var savefile = require("pf.savefile")
+   var parse = require('pf.parse').parse
+   var expand = require('pf.expand').expand
+   var optimize = require('pf.optimize').optimize
+   var convert_anf = require('pf.anf').convert_anf
+   var convert_ssa = require('pf.ssa').convert_ssa
+   var sel = require("pf.selection")
+   var ra = require("pf.regalloc")
+
+   // `ip`
+   var example_1 =
+      { start = "L1",
+	order = { "L1", "L4", "L5" },
+	blocks =
+	   { L1 = { label = "L1",
+		    bindings = {},
+		    control = { "if", { ">=", "len", 14 }, "L4", "L5" } },
+	     L4 = { label = "L4",
+		    bindings = {},
+		    control = { "return", { "=", { "[]", 12, 2 }, 8 } } },
+	     L5 = { label = "L5",
+		    bindings = {},
+		    control = { "return", { "false" } } } } }
+
+   // `arp`
+   var example_2 =
+      { start = "L1",
+	order = { "L1", "L4", "L5" },
+	blocks =
+	   { L1 = { label = "L1",
+		    bindings = {},
+		    control = { "if", { ">=", "len", 14 }, "L4", "L5" } },
+	     L4 = { label = "L4",
+		    bindings = {},
+		    control = { "return", { "=", { "[]", 12, 2 }, 1544 } } },
+	     L5 = { label = "L5",
+		    bindings = {},
+		    control = { "return", { "false" } } } } }
+
+   // `tcp`
+   var example_3 =
+      { start = "L1",
+	order = { "L1", "L4", "L6", "L7", "L8", "L10", "L12", "L13",
+		  "L14", "L16", "L17", "L15", "L11", "L9", "L5" },
+	blocks =
+	   { L1 = { label = "L1",
+	            bindings = {},
+	            control = { "if", { ">=", "len", 34 }, "L4", "L5" } },
+	     L4 = { label = "L4",
+	            bindings = { { name = "v1", value = { "[]", 12, 2 } } },
+	            control = { "if", { "=", "v1", 8 }, "L6", "L7" } },
+	     L6 = { label = "L6",
+	            bindings = {},
+	            control = { "return", { "=", { "[]", 23, 1 }, 6 } } },
+	     L7 = { label = "L7",
+	            bindings = {},
+	            control = { "if", { ">=", "len", 54 }, "L8", "L9" } },
+	     L8 = { label = "L8",
+	            bindings = {},
+	            control = { "if", { "=", "v1", 56710 }, "L10", "L11" } },
+	     L10 = { label = "L10",
+	             bindings = { { name = "v2", value = { "[]", 20, 1 } } },
+	             control = { "if", { "=", "v2", 6 }, "L12", "L13" } },
+	     L12 = { label = "L12",
+	             bindings = {},
+	             control = { "return", { "true" } } },
+	     L13 = { label = "L13",
+	             bindings = {},
+	             control = { "if", { ">=", "len", 55 }, "L14", "L15" } },
+	     L14 = { label = "L14",
+	             bindings = {},
+	             control = { "if", { "=", "v2", 44 }, "L16", "L17" } },
+	     L16 = { label = "L16",
+	             bindings = {},
+	             control = { "return", { "=", { "[]", 54, 1 }, 6 } } },
+	     L17 = { label = "L17",
+	             bindings = {},
+	             control = { "return", { "false" } } },
+	     L15 = { label = "L15",
+	             bindings = {},
+	             control = { "return", { "false" } } },
+	     L11 = { label = "L11",
+	             bindings = {},
+	             control = { "return", { "false" } } },
+	     L9 = { label = "L9",
+	            bindings = {},
+	            control = { "return", { "false" } } },
+	     L5 = { label = "L5",
+	            bindings = {},
+	            control = { "return", { "false" } } } } }
+
+   // `ip[1] + ip[2] + ip[3] == 1`
+   example_4 =
+      { start = "L1",
+        order = { "L1", "L4", "L6", "L7", "L5" },
+        blocks =
+           { L1 = { label = "L1",
+                    bindings = {},
+                    control = { "if", { ">=", "len", 34 }, "L4", "L5" } },
+             L4 = { label = "L4",
+                    bindings = {},
+                    control = { "if", { "=", { "[]", 12, 2 }, 8 }, "L6", "L7" } },
+             L6 = { label = "L6",
+                    bindings = {},
+		    control = { "return",
+                                { "=", { "+", { "+", { "[]", 15, 1 }, { "[]", 16, 1 } },
+                                         { "[]", 17, 1 } }, 1 } } },
+             L7 = { label = "L7",
+                    bindings = {},
+                    control = { "return", { "false" } } },
+             L5 = { label = "L5",
+                    bindings = {},
+                    control = { "return", { "false" } } } } }
+
+   var function test(ssa, pkt, alloc) {
+      // Compile and then call native function on the given packet
+      var instr = sel.select(ssa)
+
+      if( not alloc ) {
+         alloc = ra.allocate(instr)
+      }
+
+      var f = compile(instr, alloc)
+      return f(pkt.packet, pkt.len)
+   }
+
+   arp_pkts = savefile.load_packets("../tests/data/arp.pcap")
+   v4_pkts = savefile.load_packets("../tests/data/v4.pcap")
+   v6_pkts = savefile.load_packets("../tests/data/v6.pcap")
+   telnet_pkts = savefile.load_packets("../tests/data/telnet-cooked.pcap")
+
+   // not an arp packet
+   var alloc_1 = { len = 6, r1 = 0, callee_saves = {}, spills = {} }
+   assert(! test(example_1, arp_pkts[1], alloc_1))
+   assert(! test(example_1, arp_pkts[2], alloc_1))
+   assert(! test(example_1, arp_pkts[1]))
+   assert(! test(example_1, arp_pkts[2]))
+   // yay arp
+   assert(test(example_2, arp_pkts[1], alloc_1))
+   assert(test(example_2, arp_pkts[2], alloc_1))
+   assert(test(example_2, arp_pkts[1]))
+   assert(test(example_2, arp_pkts[2]))
+
+   assert(! test(example_3,
+                   arp_pkts[1]))
+   assert(test(example_3,
+               // this one is a TCP packet
+               v4_pkts[1]))
+   assert(test(example_3,
+               // this one is also a TCP packet
+               v6_pkts[16]))
+
+   assert(! test(example_4, arp_pkts[1]))
+
+   // test starting with results of instruction selection
+   test = function (instructions, pkt) {
+      var alloc = ra.allocate(instructions)
+      var f = compile(instructions, alloc)
+      return f(pkt.packet, pkt.len)
+   }
+
+   example_5 = { { "label", 1 },
+                 { "cmp", "len", 4 },
+                 { "cjmp", "<", "false-label" },
+                 { "jmp", 4 },
+                 { "label", 4 },
+                 { "load", "r1", 0, 4 },
+                 { "mov", "r2", "r1" },
+                 { "ntohs", "r2" },
+                 { "cmp", "r2", 0 },
+                 { "cjmp", ">", "true-label" },
+                 { "jmp", "false-label" },
+                 { "ret-false" },
+                 { "ret-true" } }
+   example_5.max_label = 4
+
+   assert(test(example_5, arp_pkts[1]))
+
+   // test starting with expression IR (this is helpful for( testing
+   // the outputs of random test generation)
+   //
+   // also doesn't optimize
+   test = function (ir, pkt) {
+      var ssa = convert_ssa(convert_anf(ir))
+      var instr = sel.select(ssa)
+      var alloc = ra.allocate(instr)
+      var f = compile(instr, alloc)
+      return f(pkt.packet, pkt.len)
+   }
+
+   assert(test({ "=", { "uint32", { "/", 4214967296, 4294967295 } }, 0 },
+               v4_pkts[1]))
+
+   // test starting from parsing all the way to codegen
+
+   test = function (expr, pkt, no_optimize) {
+      var expanded = expand(parse(expr), "EN10MB")
+      var optimized
+
+      if( no_optimize != null ) {
+         optimized = expanded
+      } else {
+         optimized = optimize(expanded)
+      }
+
+      var ssa = convert_ssa(convert_anf(optimized))
+      var instr = sel.select(ssa)
+      var alloc = ra.allocate(instr)
+      var f = compile(instr, alloc)
+      return f(pkt.packet, pkt.len)
+   }
+
+   // some sanity checks
+   assert(test('ip[0]=0x45', v4_pkts[1]))
+   assert(test('ip[14]=0xa0', v4_pkts[1]))
+
+   assert(! test("tcp port 3372", arp_pkts[1]))
+   assert(test("tcp port 3372", v4_pkts[1]))
+   assert(test("tcp port 3372", v4_pkts[2]))
+   assert(! test("tcp port 3372", v4_pkts[13]))
+   assert(! test("tcp port 3372", v4_pkts[18]))
+   assert(! test("tcp port 3372", v4_pkts[24]))
+
+   assert(! test("portrange 0-6000", arp_pkts[1]))
+   assert(test("portrange 0-6000", v4_pkts[1]))
+   assert(test("portrange 0-80", v4_pkts[1]))
+   assert(! test("portrange 100-2000", v4_pkts[1]))
+   assert(test("portrange 0-6000", v4_pkts[2]))
+   assert(test("portrange 0-6000", v4_pkts[13]))
+   assert(! test("portrange 0-30", v4_pkts[13]))
+   assert(! test("portrange 4000-9000", v4_pkts[13]))
+   assert(test("portrange 0-6000", v4_pkts[18]))
+   assert(test("portrange 0-6000", v4_pkts[24]))
+
+   assert(test("net 145.254.160.237", v4_pkts[1]))
+   assert(! test("net 178.79.150.233", v4_pkts[1]))
+   assert(test("net 145.254.160.0/24", v4_pkts[1]))
+   assert(! test("net 178.79.150.0/24", v4_pkts[1]))
+
+   // test ntohl
+   assert(test('ip[0:4] + 1 = 0x45000031', v4_pkts[1]))
+
+   // make sure addition of three registers is handled
+   // correctly
+   assert(test('ip[0]+ip[1]+ip[3]=0x75', v4_pkts[1]))
+
+   assert(test("ip[0:1] - 100 = 4294967265", v4_pkts[1]))
+   assert(test("ip[0:1] - 68 = 1", v4_pkts[1]))
+   assert(! test("ip[0:1] - 68 = 2", v4_pkts[1]))
+   assert(test("35 - 20 = 15", v4_pkts[1], "no optimize"))
+   assert(! test("124124 - 12412 = 15", v4_pkts[1], "no optimize"))
+
+   assert(test("ip[0:1] * 2 == 0x8A", v4_pkts[1]))
+   assert(! test("ip[0] * 2 == 0x8B", v4_pkts[1]))
+
+   assert(test("ip[0:1] / 2 == 0x22", v4_pkts[1]))
+   assert(test("ip[0:1] / 3 == 0x17", v4_pkts[1]))
+   assert(! test("ip[0] / 2 == 0x21", v4_pkts[1]))
+   assert(test("ip[0:1] / ip[9:1] == 0x0B", v4_pkts[1]))
+   assert(test("4214967296 / 4294967295 == 0", v4_pkts[1], "no optimize"))
+   assert(test("4294967294 / 4294967295 == 0", v4_pkts[1], "no optimize"))
+   assert(test("4294967295 / 4294967295 == 1", v4_pkts[1], "no optimize"))
+
+   assert(test("ip[0:1] | 2 == 0x47", v4_pkts[1]))
+   assert(! test("ip[0] | 2 == 0x48", v4_pkts[1]))
+
+   assert(test("ip[0:1] ^ 3 == 0x46", v4_pkts[1]))
+   assert(! test("ip[0:1] ^ 3 == 0x45", v4_pkts[1]))
+
+   assert(test("ip[0:1] << 1 == 0x8A", v4_pkts[1]))
+   assert(! test("ip[0:1] << 1 == 0x8B", v4_pkts[1]))
+
+   assert(test("ip[0:1] >> 1 == 0x22", v4_pkts[1]))
+   assert(! test("ip[0:1] >> 1 == 0x21", v4_pkts[1]))
+
+   // test for( a bug where large shift rhs was a problem
+   assert(! test("ip[0] << 1 - 2 == 0", v4_pkts[1]))
+   assert(! test("ip[0] << 1 - 2 == 0", v4_pkts[1], "no optimize"))
+   assert(test("ip[0] >> 1 - 2 == 0", v4_pkts[1]))
+
+   // tests for( >>/<< with register args
+   assert(test("ip[0] << ip[9] == 4416", v4_pkts[1]))
+   assert(test("ip[0] >> ip[9] == 0x1", v4_pkts[1]))
+   assert(test("ip[0] >> ip[1] == 0x45", v4_pkts[1]))
+
+   // test that shifts mask the count appropriately
+   assert(test("ip[0] >> ip[5] == 34", v4_pkts[1]))
+   assert(test("ip[0] << ip[5] == 138", v4_pkts[1]))
+
+   assert(test("", v4_pkts[1]))
+   assert(test("", arp_pkts[1]))
+   assert(test("", v6_pkts[1]))
+   assert(! test("1 == 0", v4_pkts[1]))
+   assert(! test("1 == 0", arp_pkts[1]))
+   assert(! test("1 == 0", v6_pkts[1]))
+
+   // test to make sure we handle spills in code generation
+   assert(test('ip[0]+ip[1]+ip[2]+ip[3]+ip[4]+ip[5]+ip[6]+ip[7]+\
+                ip[8]+ip[9]+ip[10]+ip[11]+ip[12]+ip[13]+ip[14]=1334 and\
+                ip[0]-ip[1]-ip[2]-ip[3]-ip[4]-ip[5]-ip[6]-ip[7]-\
+                ip[8]-ip[9]-ip[10]-ip[11]-ip[12]-ip[13]-ip[14]=4294966100',
+               v4_pkts[1]))
+
+   // make sure multiple callee-save registers are handled correctly
+   assert(test('ip[0]+ip[1]+ip[2]+ip[3]+ip[4]+ip[5]+ip[6]+ip[7]+\
+                ip[8]+ip[9]+ip[10]+ip[11]=775',
+               v4_pkts[1]))
+
+   // this test (from issue #215) exposed some bugs in spill handling and
+   // pretty thoroughly exercises spilling too
+   var test_file = io.open("../tests/test-215.pflang")
+   var test_filter = test_file->read()
+   assert(test(test_filter, telnet_pkts[1]))
+   assert(! test(test_filter, telnet_pkts[3]))
+
+   // test to make sure that callee-save registers work properly and
+   // don't interfere with context
+   test = function (expr) {
+      var Dst = dasm.new(actions)
+
+      var ssa = convert_ssa(convert_anf(optimize(expand(parse(expr), "EN10MB"))))
+      var instr = sel.select(ssa)
+      var alloc = ra.allocate(instr)
+      var f = compile(instr, alloc)
+      var pkt = v4_pkts[1]
+
+      | push rbx
+      // we want to make sure %rbx still contains this later
+      | mov rbx, 0xdeadbeef
+      // args to 'f'
+      | mov64 rdi, ffi.cast(ffi.typeof("uint64_t"), pkt.packet)
+      | mov rsi, pkt.len
+      // call 'f'
+      | mov64 rax, ffi.cast(ffi.typeof("uint64_t"), f)
+      | call rax
+      // make sure it's still there
+      | cmp rbx, 0xdeadbeef
+      // put a bool in return register
+      | sete al
+      | pop rbx
+      | ret
+
+      var mcode, size = Dst->build()
+      table.insert(anchor, mcode)
+      f = ffi.cast(ffi.typeof("bool(*)()"), mcode)
+      return f()
+   }
+
+   assert(test('ip[0]+ip[1]+ip[2]+ip[3]+ip[4]+ip[5]+ip[6] =\
+                ip[0]-ip[1]-ip[2]-ip[3]-ip[4]-ip[5]-ip[6]'))
+   // if( this fails, it likely means we aren't handling callee-save
+   // registers properly
+   assert(test('ip[0]+ip[1]+ip[2]+ip[3]+ip[4]+ip[5]+ip[6]+ip[7] =\
+                ip[0]-ip[1]-ip[2]-ip[3]-ip[4]-ip[5]-ip[6]-ip[7]'))
+
+   print("OK")
+}
+

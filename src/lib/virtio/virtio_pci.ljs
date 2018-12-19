@@ -1,0 +1,202 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+// Application to connect to a virtio-net driver implementation
+//
+// Copyright (c) 2015 Virtual Open Systems
+//
+
+module(..., package.seeall);
+
+var debug = _G.developer_debug;
+
+var ffi       = require("ffi");
+var C         = ffi.C;
+var S         = require('syscall');
+var pci       = require("lib.hardware.pci");
+var bit       = require('bit');
+
+var band, bor, rshift, lshift = bit.band, bit.bor, bit.rshift, bit.lshift;
+
+var RESET = 0;
+var ACKNOWLEDGE = 1;
+var DRIVER = 2;
+var DRIVER_OK = 4;
+var FEATURES_OK = 8;
+var FAILED = 128;
+
+var VIRTIO_PCI_QUEUE_ADDR_SHIFT = 12; // the default page bit
+
+VirtioPci = subClass(null);
+VirtioPci._name = "virtio pci";
+
+// Parses a C struct description
+// and creates a table which maps each field name
+// to size, offset and ctype. An example string argument:
+// [[
+//    uint32_t a;
+//    uint16_t b;
+// ]]
+//
+// This will create a table with the following content:
+// { a = { fieldname = "a", ct = cdata<unsigned int>, size = 4, offset = 0},
+//   b = { fieldname = "b", ct = cdata<unsigned short>, size = 2, offset = 4} }
+var function fstruct(def) {
+   var struct = {};
+   var offset = 0;
+   for( ct, fld in def->gmatch('([%a_][%w_]*)%s+([%a_][%w_]*);') ) {
+      ct = ffi.typeof(ct);
+      struct[fld] = {
+         fieldname = fld,
+         ct = ct,
+         size = ffi.sizeof(ct),
+         offset = offset,
+      };
+      offset = offset + struct[fld].size;
+   }
+   return struct, offset;
+}
+
+// Takes a field description as created by the fstruct function
+// and a file descriptor. A value of the field specified ctype,
+// size and offset is read from the file designated from the fd
+var function fieldrd(field, fd) {
+   var buf = ffi.typeof('$ [1]', field.ct)();
+   var r, err = fd->pread(buf, field.size, field.offset);
+   if( ! r ) { error(err); }
+   return buf[0];
+}
+
+// Takes a field description as created by the fstruct function,
+// a file descriptor and a value. The value is written in the file,
+// specified by the fd, at the offset specified by the field
+var function fieldwr(field, fd, val) {
+   var buf = ffi.typeof('$ [1]', field.ct)();
+   buf[0] = val;
+   assert(fd->seek(field.offset));
+   var r, err = fd->write(buf, field.size);
+   if( ! r ) { error(err); }
+   return buf[0];
+}
+
+var virtio_pci_bar0 = fstruct([=[
+   uint32_t host_features;
+   uint32_t guest_features;
+   uint32_t queue_pfn;
+   uint16_t queue_num;
+   uint16_t queue_sel;
+   uint16_t queue_notify;
+   uint8_t status;
+   uint8_t isr;
+   uint16_t config_vector;
+   uint16_t queue_vector;
+]=]);
+
+var
+function open_bar (fname, struct) {
+   var fd, err = S.open(fname, 'rdwr');
+   if( ! fd ) { error(err); }
+   return setmetatable ({
+      fd = fd,
+      struct = struct,
+      close = function(this) { return this.fd->close(); },
+   }, {
+      __index = function (this, key) {
+         return fieldrd(this.struct[key], this.fd);
+      },
+      __newindex = function (this, key, value) {
+         return fieldwr(this.struct[key], this.fd, value);
+      },
+   });
+}
+
+function VirtioPci::new(pciaddr) {
+   var o = VirtioPci->superClass().new(this);
+
+   pci.unbind_device_from_linux (pciaddr);
+
+   o._bar = open_bar(pci.path(pciaddr..'/resource0'), virtio_pci_bar0);
+
+   return o;
+}
+
+function VirtioPci::free() {
+   this._bar->close();
+   VirtioPci->superClass().free(this);
+}
+
+function VirtioPci::set_status(status) {
+   var bar = this._bar;
+   bar.status = bor(bar.status, status);
+}
+
+function VirtioPci::reset() {
+   this._bar.status = 0;
+}
+
+function VirtioPci::acknowledge() {
+   this->set_status(ACKNOWLEDGE);
+}
+
+function VirtioPci::driver() {
+   this->set_status(DRIVER);
+}
+
+function VirtioPci::features_ok() {
+   this->set_status(FEATURES_OK);
+}
+
+function VirtioPci::driver_ok() {
+   this->set_status(DRIVER_OK);
+}
+
+function VirtioPci::failed() {
+   this->set_status(FAILED);
+}
+
+function VirtioPci::set_guest_features(min_features, want_features) {
+   var bar = this._bar;
+   var features = bar.host_features;
+   if( debug ) { print('host_features', features); }
+   if( band(features, min_features) != min_features ) {
+      this->failed();
+      return "doesn't provide minimum features";
+   }
+   if( debug ) { print('set features to:', band(features, want_features)); }
+   bar.guest_features = band(features, want_features);
+   this->features_ok();
+   if( debug ) { print('got features: ', bar.host_features, bar.guest_features); }
+   if( band(bar.status, FEATURES_OK) != FEATURES_OK ) {
+      this->failed();
+      return "feature set wasn't accepted by device";
+   }
+}
+
+function VirtioPci::get_queue_num(n) {
+   var bar = this._bar;
+
+   bar.queue_sel = n;
+   var queue_num = bar.queue_num;
+
+   if( queue_num == 0 ) { return; }
+
+   if( debug ) { print(('queue %d: size: %d')->format(n, queue_num)); }
+   return queue_num;
+}
+
+function VirtioPci::set_queue_vring(n, physaddr) {
+   var bar = this._bar;
+   bar.queue_sel = n;
+
+   bar.queue_pfn = rshift(physaddr, VIRTIO_PCI_QUEUE_ADDR_SHIFT);
+}
+
+function VirtioPci::disable_queue(n) {
+   var bar = this._bar;
+   bar.queue_sel = n;
+   bar.queue_pfn = 0;
+}
+
+function VirtioPci::notify_queue(n) {
+   var bar = this._bar;
+   bar.queue_notify = n;
+}

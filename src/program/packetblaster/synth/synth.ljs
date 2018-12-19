@@ -1,0 +1,52 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+module(..., package.seeall);
+
+var config    = require("core.config");
+var main      = require("core.main");
+var Synth     = require("apps.test.synth").Synth;
+var lib       = require("core.lib");
+
+var packetblaster = require("program.packetblaster.packetblaster");
+
+var long_opts = {
+   duration     = "D",
+   help         = "h",
+   src          = "s",
+   dst          = "d",
+   sizes        = "S",
+};
+
+var function show_usage (code) {
+   print(require("program.packetblaster.synth.README_inc"));
+   main.exit(code);
+}
+
+function run (args) {
+   var c = config.new();
+   var handlers = {};
+   var opts = {};
+   function handlers.D (arg) {
+      opts.duration = assert(tonumber(arg), "duration is not a number!");
+   }
+   function handlers.h () {
+      show_usage(0);
+   }
+
+   var source;
+   var destination;
+   var sizes;
+   function handlers.s (arg) { source = arg; }
+   function handlers.d (arg) { destination = arg; }
+   function handlers.S (arg) {
+      sizes = {};
+      for( size in string.gmatch(arg, "%d+") ) {
+         sizes[#sizes+1] = tonumber(size);
+      }
+   }
+
+   args = lib.dogetopt(args, handlers, "hD:s:d:S:", long_opts);
+   config.app(c, "source", Synth, { sizes = sizes,
+      src = source, dst = destination });
+   packetblaster.run_loadgen(c, args, opts);
+}

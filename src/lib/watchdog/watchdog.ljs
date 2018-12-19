@@ -1,0 +1,46 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+module(...,package.seeall);
+
+ffi = require("ffi");
+C   = ffi.C;
+
+// Watchdog timeout in unit defined by `precision' (just below).
+timeout = null;
+
+// Watchdog precision.
+precision = null;
+
+// Set watchdog timeout to mseconds (milliseconds). Does NOT start the
+// watchdog. Values for mseconds>1000 are truncated to the next second,
+// e.g. set(1100) <=> set(2000).
+function set (mseconds) {
+   if( mseconds > 1000 ) {
+      timeout = math.ceil(mseconds / 1000);
+      precision = "second";
+   } else {
+      timeout = mseconds * 1000;
+      precision = "microsecond";
+   }
+}
+
+// (Re)set timeout. E.g. starts the watchdog if it has not been started
+// before and resets the timeout otherwise.
+function reset () {
+   if( precision == "second" ) {
+      C.alarm(timeout);
+   } else if( precision == "microsecond" ) {
+      C.ualarm(timeout, 0);
+   } else {
+      error("Watchdog was not set.");
+   }
+}
+
+// Disable timeout.
+function stop () {
+   if( precision == "second" ) {
+      C.alarm(0);
+   } else if( precision == "microsecond" ) {
+      C.ualarm(0,0);
+   }
+}

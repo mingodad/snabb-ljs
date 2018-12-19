@@ -1,0 +1,359 @@
+module(..., package.seeall);
+
+// This module implements a level 7 firewall app that consumes the result
+// of DPI scanning done by l7spy.
+//
+// The firewall rules are a table mapping protocol names to either
+//   * a simple action ("drop", "reject", "accept")
+//   * a pfmatch expression
+
+var bit      = require("bit");
+var ffi      = require("ffi");
+var link     = require("core.link");
+var packet   = require("core.packet");
+var datagram = require("lib.protocol.datagram");
+var ether    = require("lib.protocol.ethernet");
+var icmp     = require("lib.protocol.icmp.header");
+var ipv4     = require("lib.protocol.ipv4");
+var ipv6     = require("lib.protocol.ipv6");
+var tcp      = require("lib.protocol.tcp");
+var match    = require("pf.match");
+
+ffi.cdef([=[
+  void syslog(int priority, const char*format, ...);
+]=]);
+
+// constants from <syslog.h> for syslog priority argument
+var LOG_USER = 8;
+var LOG_INFO = 6;
+
+// network constants
+var ETHER_PROTO_IPV4 = 0x0800;
+var ETHER_PROTO_IPV6 = 0x86dd;
+
+var IP_PROTO_ICMPV4 = 1;
+var IP_PROTO_TCP    = 6;
+var IP_PROTO_ICMPV6 = 58;
+
+L7Fw = {};
+L7Fw.__index = L7Fw;
+
+// create a new firewall app object given an instance of Scanner
+// and firewall rules
+function L7Fw::new(config) {
+   var obj = { local_ipv4 = config.local_ipv4,
+                 local_ipv6 = config.local_ipv6,
+                 local_macaddr = config.local_macaddr,
+                 scanner = config.scanner,
+                 rules = config.rules,
+                 // this map tracks flows to compiled pfmatch functions
+                 // so that we only compile them once per flow
+                 handler_map = {},
+                 // log level for logging filtered packets
+                 logging = config.logging || "off",
+                 // for stats
+                 accepted = 0,
+                 rejected = 0,
+                 dropped = 0,
+                 total = 0 };
+   assert(obj.logging == "on" || obj.logging == "off",
+          ("invalid log level: %s")->format(obj.logging));
+   return setmetatable(obj, this);
+}
+
+// called by pfmatch handlers, just drop the packet on the floor
+function L7Fw::drop(pkt, len) {
+   if( this.logging == "on" ) {
+      this->log_packet("DROP");
+   }
+
+   packet.free(this.current_packet);
+   this.dropped = this.dropped + 1;
+}
+
+// called by pfmatch handler, handle rejection response
+function L7Fw::reject(pkt, len) {
+   link.transmit(this.output.reject, this->make_reject_response());
+   this.rejected = this.rejected + 1;
+
+   if( this.logging == "on" ) {
+      this->log_packet("REJECT");
+   }
+
+   packet.free(this.current_packet);
+}
+
+// called by pfmatch handler, forward packet
+function L7Fw::accept(pkt, len) {
+   link.transmit(this.output.output, this.current_packet);
+   this.accepted = this.accepted + 1;
+}
+
+function L7Fw::push() {
+   var i       = assert(this.input.input, "input port not found");
+   var o       = assert(this.output.output, "output port not found");
+   var rules   = this.rules;
+   var scanner = this.scanner;
+
+   assert(this.output.reject, "output port for reject policy not found");
+
+   while( ! link.empty(i) ) {
+      var pkt  = link.receive(i);
+      var flow = scanner->get_flow(pkt);
+
+      // so that pfmatch handler methods can access the original packet
+      this.current_packet = pkt;
+
+      this.total = this.total + 1;
+
+      if( flow ) {
+         var name   = scanner->protocol_name(flow.protocol);
+         var policy = rules[name] || rules["default"];
+
+         this.current_protocol = name;
+
+         if( policy == "accept" ) {
+            this->accept(pkt.data, pkt.length);
+         } else if( policy == "drop" ) {
+            this->drop(pkt.data, pkt.length);
+         } else if( policy == "reject" ) {
+            this->reject(pkt.data, pkt.length);
+         // handle a pfmatch string case
+         } else if( type(policy) == "string" ) {
+            if( this.handler_map[policy] ) {
+               // we've already compiled a matcher for this policy
+               this.handler_map[policy](this, pkt.data, pkt.length, flow.packets);
+            } else {
+               var opts    = { extra_args = { "flow_count" } };
+               var handler = match.compile(policy, opts);
+               this.handler_map[policy] = handler;
+               handler(this, pkt.data, pkt.length, flow.packets);
+            }
+         // TODO: what should the default policy be if there is none specified?
+         } else {
+            this->accept(pkt.data, pkt.length);
+         }
+      } else {
+         // TODO: we may wish to have a default policy for packets
+         //       without detected flows instead of just forwarding
+         this->accept(pkt.data, pkt.length);
+      }
+   }
+}
+
+function L7Fw::report() {
+   var accepted, rejected, dropped =
+      this.accepted, this.rejected, this.dropped;
+   var total = this.total;
+   var a_pct = math.ceil((accepted / total) * 100);
+   var r_pct = math.ceil((rejected / total) * 100);
+   var d_pct = math.ceil((dropped / total) * 100);
+   print(("Accepted packets: %d (%d%%)")->format(accepted, a_pct));
+   print(("Rejected packets: %d (%d%%)")->format(rejected, r_pct));
+   print(("Dropped packets:  %d (%d%%)")->format(dropped, d_pct));
+}
+
+var logging_priority = bit.bor(LOG_USER, LOG_INFO);
+
+function L7Fw::log_packet(type) {
+   var pkt      = this.current_packet;
+   var protocol = this.current_protocol;
+   var eth_h    = assert(ether->new_from_mem(pkt.data, pkt.length));
+   var ip_h;
+
+   if( eth_h->type() == ETHER_PROTO_IPV4 ) {
+      ip_h = ipv4->new_from_mem(pkt.data + eth_h->sizeof(),
+                               pkt.length - eth_h->sizeof());
+   } else if( eth_h->type() == ETHER_PROTO_IPV6 ) {
+      ip_h = ipv6->new_from_mem(pkt.data + eth_h->sizeof(),
+                               pkt.length - eth_h->sizeof());
+   }
+   assert(ip_h);
+
+   var msg = string.format("[Snabbwall %s] PROTOCOL=%s MAC=%s SRC=%s DST=%s",
+                             type, protocol,
+                             ether->ntop(eth_h->src()),
+                             ip_h->ntop(ip_h->src()),
+                             ip_h->ntop(ip_h->dst()));
+   ffi.C.syslog(logging_priority, msg);
+}
+
+// create either an ICMP port unreachable packet or a TCP RST to
+// send in case of a reject policy
+function L7Fw::make_reject_response() {
+   var pkt        = this.current_packet;
+   var ether_orig = assert(ether->new_from_mem(pkt.data, pkt.length));
+   var ip_orig;
+
+   if( ether_orig->type() == ETHER_PROTO_IPV4 ) {
+      ip_orig = ipv4->new_from_mem(pkt.data + ether_orig->sizeof(),
+                                  pkt.length - ether_orig->sizeof());
+   } else if( ether_orig->type() == ETHER_PROTO_IPV6 ) {
+      ip_orig = ipv6->new_from_mem(pkt.data + ether_orig->sizeof(),
+                                  pkt.length - ether_orig->sizeof());
+   } else {
+      // no responses to non-IP packes
+      return;
+   }
+   assert(ip_orig);
+
+   var is_tcp  = false;
+   var ip_protocol;
+
+   if( ip_orig->version() == 4 ) {
+      if( ip_orig->protocol() == 6 ) {
+         is_tcp = true;
+         ip_protocol = IP_PROTO_TCP;
+      } else {
+         ip_protocol = IP_PROTO_ICMPV4;
+      }
+   } else {
+      if( ip_orig->next_header() == 6 ) {
+         is_tcp = true;
+         ip_protocol = IP_PROTO_TCP;
+      } else {
+         ip_protocol = IP_PROTO_ICMPV6;
+      }
+   }
+
+   var dgram = datagram->new();
+   var ether_h, ip_h;
+
+   if( ip_orig->version() == 4 ) {
+      ether_h = ether->new({ dst = ether_orig->src(),
+                            src = this.local_macaddr,
+                            type = ETHER_PROTO_IPV4 });
+      assert(this.local_ipv4, "config is missing local_ipv4");
+      ip_h = ipv4->new({ dst = ip_orig->src(),
+                        src = ipv4->pton(this.local_ipv4),
+                        protocol = ip_protocol,
+                        ttl = 64 });
+   } else {
+      ether_h = ether->new({ dst = ether_orig->src(),
+                            src = this.local_macaddr,
+                            type = ETHER_PROTO_IPV6 });
+      assert(this.local_ipv6, "config is missing local_ipv6");
+      ip_h = ipv6->new({ dst = ip_orig->src(),
+                        src = ipv6->pton(this.local_ipv6),
+                        next_header = ip_protocol,
+                        ttl = 64 });
+   }
+
+   if( is_tcp ) {
+      var tcp_orig = tcp->new_from_mem(pkt.data + ether_orig->sizeof() +
+                                        ip_orig->sizeof(),
+                                        pkt.length - ether_orig->sizeof() -
+                                        ip_orig->sizeof());
+      assert(tcp_orig);
+      var tcp_h    = tcp->new({src_port = tcp_orig->dst_port(),
+                                dst_port = tcp_orig->src_port(),
+                                seq_num  = tcp_orig->seq_num() + 1,
+                                ack_num  = tcp_orig->ack_num() + 1,
+                                ack      = 1,
+                                rst      = 1,
+                                // minimum TCP header size is 5 words
+                                offset   = 5 });
+
+      // checksum needs a non-nil first argument, but we have zero payload bytes
+      // so give a bogus value
+      tcp_h->checksum(ffi.new("uint8_t[0]"), 0);
+      dgram->push(tcp_h);
+      if( ip_h->version() == 4 ) {
+         ip_h->total_length(ip_h->sizeof() + tcp_h->sizeof());
+      } else {
+         ip_h->payload_length(ip_h->sizeof() + tcp_h->sizeof());
+      }
+   } else {
+      var icmp_h;
+
+      if( ip_h->version() == 4 ) {
+         // ICMPv4 code & type for "port unreachable"
+         icmp_h = icmp->new(3, 3);
+      } else {
+         // ICMPv6 code & type for "administratively prohibited"
+         icmp_h = icmp->new(1, 1);
+      }
+
+      dgram->payload(ffi.new("uint8_t [4]"), 4);
+
+      if( ip_h->version() == 4 ) {
+         dgram->payload(ip_orig->header(), ip_orig->sizeof());
+         // ICMPv4 port unreachable errors come with the original IPv4
+         // header and 8 bytes of the original payload
+         dgram->payload(pkt.data + ether_orig->sizeof() + ip_orig->sizeof(), 8);
+
+         icmp_h->checksum(dgram->payload());
+         dgram->push(icmp_h);
+
+         ip_h->total_length(ip_h->sizeof() + icmp_h->sizeof() +
+                           4 + // extra zero bytes
+                           ip_orig->sizeof() + 8);
+      } else {
+         // ICMPv6 destination unreachable packets contain up to 1232 bytes
+         // of the original packet
+         // (the minimum MTU 1280 - IPv6 header length - ICMPv6 header)
+         var payload_len =
+            math.min(1232, pkt.length - ether_orig->sizeof() - ip_orig->sizeof());
+         dgram->payload(ip_orig->header(), ip_orig->sizeof());
+         dgram->payload(pkt.data + ether_orig->sizeof() + ip_orig->sizeof(),
+                       payload_len);
+
+         var mem, len = dgram->payload();
+         icmp_h->checksum(mem, len, ip_h);
+         dgram->push(icmp_h);
+
+         ip_h->payload_length(icmp_h->sizeof() +
+                             4 + // extra zero bytes
+                             ip_orig->sizeof() + payload_len);
+      }
+   }
+
+   dgram->push(ip_h);
+   dgram->push(ether_h);
+
+   return dgram->packet();
+}
+
+function selftest() {
+   var savefile = require("pf.savefile");
+   var pflua    = require("pf");
+
+   var function test(name, packet, pflang) {
+      var fake_self = { local_ipv4 = "192.168.42.42",
+                          local_ipv6 = "2001:0db8:85a3:0000:0000:8a2e:0370:7334",
+                          local_macaddr = "01:23:45:67:89:ab",
+                          current_packet = { data = packet.packet,
+                                             length = packet.len } };
+      var response  = L7Fw.make_reject_response(fake_self);
+      var pred      = pf.compile_filter(pflang);
+
+      assert(pred(response.data, response.length),
+             string.format("test %s failed", name));
+   }
+
+   var base_dir = "./program/wall/tests/data/";
+   var dhcp     = savefile.load_packets(base_dir .. "dhcp.pcap");
+   var dhcpv6   = savefile.load_packets(base_dir .. "dhcpv6.pcap");
+   var v4http   = savefile.load_packets(base_dir .. "http.cap");
+   var v6http   = savefile.load_packets(base_dir .. "v6-http.cap");
+
+   test("icmpv4-1", dhcp[2], [=[ether proto ip]=]);
+   test("icmpv4-2", dhcp[2], [=[ip proto icmp]=]);
+   test("icmpv4-3", dhcp[2], [=[icmp and dst net 192.168.0.1]=]);
+   test("icmpv4-3", dhcp[2], [=[icmp[icmptype] = 3 and icmp[icmpcode] = 3]=]);
+
+   test("icmpv6-1", dhcpv6[1], [=[ether proto ip6]=]);
+   // TODO: ip6 protochain is not implemented in pflang
+   //test("icmpv6-2", dhcpv6[1], [[ip6 protochain 58]])
+   // it would be nice to test the icmp type & code here, but pflang
+   // does not have good support for dereferencing ip6 protocols
+   test("icmpv6-3", dhcpv6[1], [=[icmp6 and dst net fe80::a00:27ff:fefe:8f95]=]);
+
+   test("tcpv4-1", v4http[5], [=[ether proto ip]=]);
+   test("tcpv4-2", v4http[5], [=[tcp and tcp[tcpflags] & (tcp-rst|tcp-ack) != 0]=]);
+
+   test("tcpv6-1", v6http[50], [=[ether proto ip6]=]);
+   test("tcpv6-2", v6http[50], [=[tcp]=]);
+
+   print("selftest ok");
+}

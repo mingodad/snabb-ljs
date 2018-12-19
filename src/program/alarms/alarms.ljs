@@ -1,0 +1,24 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+module(..., package.seeall);
+
+var lib = require("core.lib");
+
+var function show_usage(status) {
+   print(require("program.alarms.README_inc"));
+   main.exit(status);
+}
+
+var function parse_args(args) {
+   var handlers = {};
+   handlers.h = function() { show_usage(0); };
+   args = lib.dogetopt(args, handlers, "h", {help="h"});
+   if( #args < 1 ) { show_usage(1); }
+   return args;
+}
+
+function run(args) {
+   args = parse_args(args);
+   var command = string.gsub(table.remove(args, 1), "-", "_");
+   var modname = ("program.alarms.%s.%s")->format(command, command);
+   require(modname).run(args);
+}

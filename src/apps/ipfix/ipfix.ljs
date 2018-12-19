@@ -1,0 +1,575 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+// This module implements an IPFIX exporter, recording flows on its
+// input link and exporting IPFIX messages on its output.
+
+module(..., package.seeall);
+
+var bit      = require("bit");
+var ffi      = require("ffi");
+var pf       = require("pf");
+var template = require("apps.ipfix.template");
+var lib      = require("core.lib");
+var link     = require("core.link");
+var packet   = require("core.packet");
+var datagram = require("lib.protocol.datagram");
+var ether    = require("lib.protocol.ethernet");
+var ipv4     = require("lib.protocol.ipv4");
+var ipv6     = require("lib.protocol.ipv6");
+var udp      = require("lib.protocol.udp");
+var ctable   = require("lib.ctable");
+var C        = ffi.C;
+
+var htonl, htons = lib.htonl, lib.htons;
+
+var debug = lib.getenv("FLOW_EXPORT_DEBUG");
+
+var IP_PROTO_UDP  = 17;
+
+// RFC 3954 §5.1.
+var netflow_v9_packet_header_t = ffi.typeof([=[
+   struct {
+      /* Network byte order.  */
+      uint16_t version; /* 09 */
+      uint16_t record_count;
+      uint32_t uptime; /* seconds */
+      uint32_t timestamp;
+      uint32_t sequence_number;
+      uint32_t observation_domain;
+   } __attribute__((packed))
+]=]);
+// RFC 7011 §3.1.
+var ipfix_packet_header_t = ffi.typeof([=[
+   struct {
+      /* Network byte order.  */
+      uint16_t version; /* 10 */
+      uint16_t byte_length;
+      uint32_t timestamp; /* seconds */
+      uint32_t sequence_number;
+      uint32_t observation_domain;
+   } __attribute__((packed))
+]=]);
+// RFC 7011 §3.3.2.
+var set_header_t = ffi.typeof([=[
+   struct {
+      /* Network byte order.  */
+      uint16_t id;
+      uint16_t length;
+   } __attribute__((packed))
+]=]);
+// RFC 7011 §3.4.1.
+var template_header_t = ffi.typeof([=[
+   struct {
+      /* Network byte order.  */
+      $ set_header;
+      uint16_t template_id;
+      uint16_t field_count;
+   } __attribute__((packed))
+]=], set_header_t);
+
+var function ptr_to(ctype) { return ffi.typeof('$*', ctype); }
+
+var set_header_ptr_t = ptr_to(set_header_t);
+var template_header_ptr_t = ptr_to(template_header_t);
+
+var V9_TEMPLATE_ID  = 0;
+var V10_TEMPLATE_ID = 2;
+
+// This result is a double, which can store precise integers up to
+// 2^51 or so.  For milliseconds this corresponds to the year 77300 or
+// so, assuming an epoch of 1970.  If we went to microseconds, it
+// would be good until 2041.
+var function to_milliseconds(secs) {
+   return math.floor(secs * 1e3 + 0.5);
+}
+
+// Pad a length value to multiple of 4.
+var max_padding = 3;
+var function padded_length(len) {
+   return bit.band(len + max_padding, bit.bnot(max_padding));
+}
+
+// Sadly, for NetFlow v9, the header needs to know the number of
+// records in a message.  So before flushing out a message, a FlowSet
+// will append the record count, and then the exporter needs to slurp
+// this data off before adding the NetFlow/IPFIX header.
+var uint16_ptr_t = ffi.typeof('uint16_t*');
+var function add_record_count(pkt, count) {
+   pkt.length = pkt.length + 2;
+   ffi.cast(uint16_ptr_t, pkt.data + pkt.length)[-1] = count;
+}
+var function remove_record_count(pkt, count) {
+   count = ffi.cast(uint16_ptr_t, pkt.data + pkt.length)[-1];
+   pkt.length = pkt.length - 2;
+   return count;
+}
+
+// The real work in the IPFIX app is performed by FlowSet objects,
+// which record and export flows.  However an IPv4 FlowSet won't know
+// what to do with IPv6 packets, so the IPFIX app can have multiple
+// FlowSets.  When a packet comes in, the IPFIX app will determine
+// which FlowSet it corresponds to, and then add the packet to the
+// FlowSet's incoming work queue.  This incoming work queue is a
+// normal Snabb link.  Likewise when the FlowSet exports flow records,
+// it will send flow-expiry messages out its outgoing link, which need
+// to be encapsulated by the IPFIX app.  We use internal links for
+// that purpose as well.
+var internal_link_counters = {};
+var function new_internal_link(name_prefix) {
+   var count, name = internal_link_counters[name_prefix], name_prefix;
+   if( count ) {
+      ++count    ;
+      name = name..' '..tostring(count);
+   }
+   internal_link_counters[name_prefix] = count || 1;
+   return name, link.new(name);
+}
+
+FlowSet = {};
+
+function FlowSet::new (template, args) {
+   var o = { template = template,
+               idle_timeout = assert(args.idle_timeout),
+               active_timeout = assert(args.active_timeout) };
+
+   if(     args.version == 9  ) { o.template_id = V9_TEMPLATE_ID;
+   } else if( args.version == 10 ) { o.template_id = V10_TEMPLATE_ID;
+   } else { error('bad version: '..args.version); }
+
+   // Accumulate outgoing records in a packet.  Instead of this
+   // per-FlowSet accumulator, it would be possible to instead pack
+   // all outgoing records into a central record accumulator for all
+   // types of data and template records.  This would pack more
+   // efficiently, but sadly the old NetFlow v9 standard doesn't
+   // support mixing different types of records in the same export
+   // packet.
+   o.record_buffer, o.record_count = packet.allocate(), 0;
+
+   // Max number of records + padding that fit in packet, with set header.
+   var mtu = assert(args.mtu);
+   var avail = padded_length(mtu - ffi.sizeof(set_header_t) - max_padding);
+   o.max_record_count = math.floor(avail / template.data_len);
+
+   var params = {
+      key_type = template.key_t,
+      value_type = template.value_t,
+      max_occupancy_rate = 0.4,
+   };
+   if( args.cache_size ) {
+      params.initial_size = math.ceil(args.cache_size / 0.4);
+   }
+   o.table = ctable.new(params);
+   o.scratch_entry = o.table.entry_type();
+   o.expiry_cursor = 0;
+
+   o.match = template.match;
+   o.incoming_link_name, o.incoming = new_internal_link('IPFIX incoming');
+
+   return setmetatable(o, { __index = this });
+}
+
+function FlowSet::record_flows(timestamp) {
+   var entry = this.scratch_entry;
+   timestamp = to_milliseconds(timestamp);
+   for( i=1,link.nreadable(this.incoming) ) {
+      var pkt = link.receive(this.incoming);
+      this.template.extract(pkt, timestamp, entry);
+      packet.free(pkt);
+      var lookup_result = this.table->lookup_ptr(entry.key);
+      if( lookup_result == null ) {
+         this.table->add(entry.key, entry.value);
+      } else {
+         this.template.accumulate(lookup_result, entry);
+      }
+   }
+}
+
+function FlowSet::append_template_record(pkt) {
+   // Write the header and then the template record contents for each
+   // template.
+   var header = ffi.cast(template_header_ptr_t, pkt.data + pkt.length);
+   var header_size = ffi.sizeof(template_header_t);
+   pkt.length = pkt.length + header_size;
+   header.set_header.id = htons(this.template_id);
+   header.set_header.length = htons(header_size + this.template.buffer_len);
+   header.template_id = htons(this.template.id);
+   header.field_count = htons(this.template.field_count);
+   return packet.append(pkt, this.template.buffer, this.template.buffer_len);
+}
+
+// Given a flow exporter & an array of ctable entries, construct flow
+// record packet(s) and transmit them
+function FlowSet::add_data_record(record, out) {
+   var pkt = this.record_buffer;
+   var record_len = this.template.data_len;
+   ptr = pkt.data + pkt.length;
+   ffi.copy(ptr, record, record_len);
+   this.template.swap_fn(ffi.cast(this.template.record_ptr_t, ptr));
+   pkt.length = pkt.length + record_len;
+
+   this.record_count = this.record_count + 1;
+   if( this.record_count == this.max_record_count ) {
+      this->flush_data_records(out);
+   }
+}
+
+function FlowSet::flush_data_records(out) {
+   if( this.record_count == 0 ) { return; }
+
+   // Pop off the now-full record buffer and replace it with a fresh one.
+   var pkt, record_count = this.record_buffer, this.record_count;
+   this.record_buffer, this.record_count = packet.allocate(), 0;
+
+   // Pad payload to 4-byte alignment.
+   ffi.fill(pkt.data + pkt.length, padded_length(pkt.length) - pkt.length, 0);
+   pkt.length = padded_length(pkt.length);
+
+   // Prepend set header.
+   pkt = packet.shiftright(pkt, ffi.sizeof(set_header_t));
+   var set_header = ffi.cast(set_header_ptr_t, pkt.data);
+   set_header.id = htons(this.template.id);
+   set_header.length = htons(pkt.length);
+
+   // Add record count and push.
+   add_record_count(pkt, record_count);
+   link.transmit(out, pkt);
+}
+
+// Print debugging messages for a flow.
+function FlowSet::debug_flow(entry, msg) {
+   if( debug ) {
+      var out = string.format("%s | %s %s\n", os.date("%F %H:%M:%S"),
+                                msg, this.template.tostring(entry));
+      io.stderr->write(out);
+      io.stderr->flush();
+   }
+}
+
+// Walk through flow set to see if flow records need to be expired.
+// Collect expired records and export them to the collector.
+function FlowSet::expire_records(out, now) {
+   // For a breath time of 100us, we will get 1e4 calls to push() every
+   // second.  We'd like to sweep through the flow table once every 10
+   // seconds, so on each breath we process 1e-5th of the table.
+   var cursor = this.expiry_cursor;
+   var limit = cursor + math.ceil(this.table.size * 1e-5);
+   now = to_milliseconds(now);
+   var active = to_milliseconds(this.active_timeout);
+   var idle = to_milliseconds(this.idle_timeout);
+   while( true ) {
+      var entry;
+      cursor, entry = this.table->next_entry(cursor, limit);
+      if( ! entry ) { break; }
+      if( now - tonumber(entry.value.flowEndMilliseconds) > idle ) {
+         this->debug_flow(entry, "expire idle");
+         // Relying on key and value being contiguous.
+         this->add_data_record(entry.key, out);
+         this.table->remove(entry.key);
+      } else if( now - tonumber(entry.value.flowStartMilliseconds) > active ) {
+         this->debug_flow(entry, "expire active");
+         // TODO: what should timers reset to?
+         entry.value.flowStartMilliseconds = now;
+         entry.value.flowEndMilliseconds = now;
+         entry.value.packetDeltaCount = 0;
+         entry.value.octetDeltaCount = 0;
+         this->add_data_record(entry.key, out);
+         ++cursor    ;
+      } else {
+         // Flow still live.
+         ++cursor    ;
+      }
+   }
+   this.expiry_cursor = cursor;
+
+   this->flush_data_records(out);
+}
+
+IPFIX = {};
+var ipfix_config_params = {
+   idle_timeout = { default = 300 },
+   active_timeout = { default = 120 },
+   cache_size = { default = 20000 },
+   // RFC 5153 §6.2 recommends a 10-minute template refresh
+   // configurable from 1 minute to 1 day.
+   template_refresh_interval = { default = 600 },
+   // Valid values: 9 or 10.
+   ipfix_version = { default = 10 },
+   // RFC 7011 §10.3.3 specifies that if the PMTU is unknown, a
+   // maximum of 512 octets should be used for UDP transmission.
+   mtu = { default = 512 },
+   observation_domain = { default = 256 },
+   exporter_ip = { required = true },
+   collector_ip = { required = true },
+   collector_port = { required = true },
+   templates = { default = { template.v4, template.v6 } }
+};
+
+function IPFIX::new(config) {
+   config = lib.parse(config, ipfix_config_params);
+   var o = { sequence_number = 1,
+               boot_time = engine.now(),
+               template_refresh_interval = config.template_refresh_interval,
+               next_template_refresh = -1,
+               version = config.ipfix_version,
+               observation_domain = config.observation_domain,
+               exporter_ip = config.exporter_ip,
+               exporter_port = math.random(49152, 65535),
+               collector_ip = config.collector_ip,
+               collector_port = config.collector_port };
+
+   if( o.version == 9 ) {
+      o.header_t = netflow_v9_packet_header_t;
+   } else if( o.version == 10 ) {
+      o.header_t = ipfix_packet_header_t;
+   } else {
+      error('unsupported ipfix version: '..o.version);
+   }
+   o.header_ptr_t = ptr_to(o.header_t);
+   o.header_size = ffi.sizeof(o.header_t);
+
+   // FIXME: Assuming we export to IPv4 address.
+   var l3_header_len = 20;
+   var l4_header_len = 8;
+   var ipfix_header_len = o.header_size;
+   var total_header_len = l4_header_len + l3_header_len + ipfix_header_len;
+   var flow_set_args = { mtu = config.mtu - total_header_len,
+                           version = config.ipfix_version,
+                           cache_size = config.cache_size,
+                           idle_timeout = config.idle_timeout,
+                           active_timeout = config.active_timeout };
+
+   o.flow_sets = {};
+   for( _, template in ipairs(config.templates) ) {
+      table.insert(o.flow_sets, FlowSet->new(template, flow_set_args));
+   }
+
+   this.outgoing_link_name, this.outgoing = new_internal_link('IPFIX outgoing');
+
+   return setmetatable(o, { __index = this });
+}
+
+function IPFIX::send_template_records(out) {
+   var pkt = packet.allocate();
+   for( _, flow_set in ipairs(this.flow_sets) ) {
+      pkt = flow_set->append_template_record(pkt);
+   }
+   add_record_count(pkt, #this.flow_sets);
+   link.transmit(out, pkt);
+}
+
+function IPFIX::add_ipfix_header(pkt, count) {
+   pkt = packet.shiftright(pkt, this.header_size);
+   var header = ffi.cast(this.header_ptr_t, pkt.data);
+
+   header.version = htons(this.version);
+   if( this.version == 9 ) {
+      header.record_count = htons(count);
+      header.uptime = htonl(to_milliseconds(engine.now() - this.boot_time));
+   } else if( this.version == 10 ) {
+      header.byte_length = htons(pkt.length);
+   }
+   header.timestamp = htonl(math.floor(C.get_unix_time()));
+   header.sequence_number = htonl(this.sequence_number);
+   header.observation_domain = htonl(this.observation_domain);
+
+   this.sequence_number = this.sequence_number + 1;
+
+   return pkt;
+}
+
+function IPFIX::add_transport_headers (pkt) {
+   // TODO: Support IPv6.
+   var eth_h = ether->new({ src = ether->pton('00:00:00:00:00:00'),
+                             dst = ether->pton('00:00:00:00:00:00'),
+                             type = 0x0800 });
+   var ip_h  = ipv4->new({ src = ipv4->pton(this.exporter_ip),
+                            dst = ipv4->pton(this.collector_ip),
+                            protocol = 17,
+                            ttl = 64,
+                            flags = 0x02 });
+   var udp_h = udp->new({ src_port = this.exporter_port,
+                           dst_port = this.collector_port });
+
+   udp_h->length(udp_h->sizeof() + pkt.length);
+   udp_h->checksum(pkt.data, pkt.length, ip_h);
+   ip_h->total_length(ip_h->sizeof() + udp_h->sizeof() + pkt.length);
+   ip_h->checksum();
+
+   var dgram = datagram->new(pkt);
+   dgram->push(udp_h);
+   dgram->push(ip_h);
+   dgram->push(eth_h);
+   return dgram->packet();
+}
+
+function IPFIX::push() {
+   var input = this.input.input;
+   // FIXME: Use engine.now() for monotonic time.  Have to check that
+   // engine.now() gives values relative to the UNIX epoch though.
+   var timestamp = ffi.C.get_unix_time();
+   assert(this.output.output, "missing output link");
+   var outgoing = this.outgoing;
+
+   if( this.next_template_refresh < engine.now() ) {
+      this.next_template_refresh = engine.now() + this.template_refresh_interval;
+      this->send_template_records(outgoing);
+   }
+
+   var flow_sets = this.flow_sets;
+   for( i=1,link.nreadable(input) ) {
+      var pkt = link.receive(input);
+      var handled = false;
+      for( _,set in ipairs(flow_sets) ) {
+         if( set.match(pkt.data, pkt.length) ) {
+            link.transmit(set.incoming, pkt);
+            handled = true;
+            break;
+         }
+      }
+      // Drop packet if it didn't match any flow set.
+      if( ! handled ) { packet.free(pkt); }
+   }
+
+   for( _,set in ipairs(flow_sets) ) { set->record_flows(timestamp); }
+   for( _,set in ipairs(flow_sets) ) { set->expire_records(outgoing, timestamp); }
+
+   for( i=1,link.nreadable(outgoing) ) {
+      var pkt = link.receive(outgoing);
+      pkt = this->add_ipfix_header(pkt, remove_record_count(pkt));
+      pkt = this->add_transport_headers(pkt);
+      link.transmit(this.output.output, pkt);
+   }
+}
+
+function selftest() {
+   print('selftest: apps.ipfix.ipfix');
+   var consts = require("apps.lwaftr.constants");
+   var ethertype_ipv4 = consts.ethertype_ipv4;
+   var ethertype_ipv6 = consts.ethertype_ipv6;
+   var ipfix = IPFIX->new({ exporter_ip = "192.168.1.2",
+                             collector_ip = "192.168.1.1",
+                             collector_port = 4739 });
+
+   // Mock input and output.
+   var input_name, input = new_internal_link('ipfix selftest input');
+   var output_name, output = new_internal_link('ipfix selftest output');
+   ipfix.input, ipfix.output = { input = input }, { output = output };
+   var ipv4_flows, ipv6_flows = unpack(ipfix.flow_sets);
+
+   // Test helper that supplies a packet with some given fields.
+   var function test(src_ip, dst_ip, src_port, dst_port) {
+      var is_ipv6 = ! ! src_ip->match(':');
+      var proto = is_ipv6 && ethertype_ipv6 || ethertype_ipv4;
+      var eth = ether->new({ src = ether->pton("00:11:22:33:44:55"),
+                              dst = ether->pton("55:44:33:22:11:00"),
+                              type = proto });
+      var ip;
+
+      if( is_ipv6 ) {
+         ip = ipv6->new({ src = ipv6->pton(src_ip), dst = ipv6->pton(dst_ip),
+                         next_header = IP_PROTO_UDP, ttl = 64 });
+      } else {
+         ip = ipv4->new({ src = ipv4->pton(src_ip), dst = ipv4->pton(dst_ip),
+                         protocol = IP_PROTO_UDP, ttl = 64 });
+      }
+      var udp = udp->new({ src_port = src_port, dst_port = dst_port });
+      var dg = datagram->new();
+
+      dg->push(udp);
+      dg->push(ip);
+      dg->push(eth);
+
+      link.transmit(input, dg->packet());
+      ipfix->push();
+   }
+
+   // Populate with some known flows.
+   test("192.168.1.1", "192.168.1.25", 9999, 80);
+   test("192.168.1.25", "192.168.1.1", 3653, 23552);
+   test("192.168.1.25", "8.8.8.8", 58342, 53);
+   test("8.8.8.8", "192.168.1.25", 53, 58342);
+   test("2001:4860:4860::8888", "2001:db8::ff00:42:8329", 53, 57777);
+   assert(ipv4_flows.table.occupancy == 4,
+          string.format("wrong number of v4 flows: %d", ipv4_flows.table.occupancy));
+   assert(ipv6_flows.table.occupancy == 1,
+          string.format("wrong number of v6 flows: %d", ipv6_flows.table.occupancy));
+
+   // do some packets with random data to test that it doesn't interfere
+   for( i=1, 10000 ) {
+      test(string.format("192.168.1.%d", math.random(2, 254)),
+           "192.168.1.25",
+           math.random(10000, 65535),
+           math.random(1, 79));
+   }
+
+   var key = ipv4_flows.scratch_entry.key;
+   key.sourceIPv4Address = ipv4->pton("192.168.1.1");
+   key.destinationIPv4Address = ipv4->pton("192.168.1.25");
+   key.protocolIdentifier = IP_PROTO_UDP;
+   key.sourceTransportPort = 9999;
+   key.destinationTransportPort = 80;
+
+   var result = ipv4_flows.table->lookup_ptr(key);
+   assert(result, "key not found");
+   assert(result.value.packetDeltaCount == 1);
+
+   // make sure the count is incremented on the same flow
+   test("192.168.1.1", "192.168.1.25", 9999, 80);
+   assert(result.value.packetDeltaCount == 2,
+          string.format("wrong count: %d", tonumber(result.value.packetDeltaCount)));
+
+   // check the IPv6 key too
+   key = ipv6_flows.scratch_entry.key;
+   key.sourceIPv6Address = ipv6->pton("2001:4860:4860::8888");
+   key.destinationIPv6Address = ipv6->pton("2001:db8::ff00:42:8329");
+   key.protocolIdentifier = IP_PROTO_UDP;
+   key.sourceTransportPort = 53;
+   key.destinationTransportPort = 57777;
+
+   result = ipv6_flows.table->lookup_ptr(key);
+   assert(result, "key not found");
+   assert(result.value.packetDeltaCount == 1);
+
+   // sanity check
+   ipv4_flows.table->selfcheck();
+   ipv6_flows.table->selfcheck();
+
+   key = ipv4_flows.scratch_entry.key;
+   key.sourceIPv4Address = ipv4->pton("192.168.2.1");
+   key.destinationIPv4Address = ipv4->pton("192.168.2.25");
+   key.protocolIdentifier = 17;
+   key.sourceTransportPort = 9999;
+   key.destinationTransportPort = 80;
+
+   var value = ipv4_flows.scratch_entry.value;
+   value.flowStartMilliseconds = to_milliseconds(C.get_unix_time() - 500);
+   value.flowEndMilliseconds = value.flowStartMilliseconds + 30;
+   value.packetDeltaCount = 5;
+   value.octetDeltaCount = 15;
+
+   // Add value that should be immediately expired
+   ipv4_flows.table->add(key, value);
+
+   // Template message; no data yet.
+   assert(link.nreadable(output) == 1);
+   // Cause expiry.  By default we do 1e-5th of the table per push,
+   // so this should be good.
+   for( i=1,2e5 ) { ipfix->push(); }
+   // Template message and data message.
+   assert(link.nreadable(output) == 2);
+
+   var filter = require("pf").compile_filter([=[
+      udp and dst port 4739 and src net 192.168.1.2 and
+      dst net 192.168.1.1]=]);
+
+   for( i=1,link.nreadable(output) ) {
+      var p = link.receive(output);
+      assert(filter(p.data, p.length), "pf filter failed");
+      packet.free(p);
+   }
+
+   link.free(input, input_name);
+   link.free(output, output_name);
+
+   print("selftest ok");
+}

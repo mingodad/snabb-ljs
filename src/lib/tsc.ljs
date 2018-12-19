@@ -1,0 +1,120 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+// Provide a time stamp counter suitable for measuring time intervals.
+
+module(...,package.seeall);
+
+var lib = require("core.lib");
+var C   = require("ffi").C;
+require("core.lib_h");
+
+default_source = 'rdtsc';
+var calibration_interval = 5e8;
+
+// Return the value of the CPU's TSC register
+var rdtsc_code;
+rdtsc = require('dynasm').loadstring ([=[
+   var ffi = require('ffi');
+   var dasm = require('dasm');
+   |.arch x64
+   |.actionlist actions
+   var Dst = dasm.new(actions);
+   | rdtsc
+   | shl rdx, 32
+   | or rax, rdx
+   | ret
+   rdtsc_code = Dst->build()
+   return ffi.cast('uint64_t (*)()', rdtsc_code);
+]=])();
+
+var cpuinfo = lib.readfile("/proc/cpuinfo", "*a");
+assert(cpuinfo, "failed to read /proc/cpuinfo for tsc check");
+var have_usable_rdtsc = (cpuinfo->match("constant_tsc") &&
+                              cpuinfo->match("nonstop_tsc"));
+
+var time_sources = {
+   rdtsc = {
+      time_fn = rdtsc,
+      calibrate_fn = function () {
+         var start_ns = C.get_time_ns();
+         var start_ticks = rdtsc();
+         for( _ = 1, calibration_interval ) { }
+         var end_ticks = rdtsc();
+         var end_ns = C.get_time_ns();
+         return tonumber(end_ticks - start_ticks)/tonumber(end_ns - start_ns)
+            * 1000000000 + 0ULL;
+      }
+   },
+   system = {
+      time_fn = C.get_time_ns,
+      calibrate_fn = function () {
+         return 1000000000ULL;
+      }
+   }
+};
+
+var tsc = {};
+
+function new (arg) {
+   var config = lib.parse(arg, { source = { default = default_source } });
+   var o = {};
+   if( config.source == 'rdtsc' && ! have_usable_rdtsc ) {
+      print("tsc: rdtsc is unusable on this system, "
+               .. "falling back to system time source");
+      config.source = 'system';
+   }
+   o._source = config.source;
+
+   var source = assert(time_sources[o._source],
+                         "tsc: unknown time source '" .. o._source .."'");
+   o._time_fn = source.time_fn;
+   // Ticks per second (uint64)
+   o._tps = source.calibrate_fn();
+   // Nanoseconds per tick (Lua number)
+   o._nspt = 1/tonumber(o._tps) * 1000000000;
+
+   return setmetatable( o, { __index = tsc });
+}
+
+function tsc::source () {
+   return this._source;
+}
+
+function tsc::time_fn () {
+   return this._time_fn;
+}
+
+function tsc::stamp () {
+   return this._time_fn();
+}
+
+function tsc::tps () {
+   return this._tps;
+}
+
+function tsc::to_ns (ticks) {
+   if( this._source == 'system' ) {
+      return ticks;
+   } else {
+      return tonumber(ticks) * this._nspt + 0ULL;
+   }
+}
+
+function selftest() {
+   var function check(tsc) {
+      for( _ = 1, 10 ) {
+         var start_ns = C.get_time_ns();
+         var start_tsc = tsc->stamp();
+         for( _ = 1, calibration_interval ) { }
+         var end_ns = C.get_time_ns();
+         var end_tsc = tsc->stamp();
+         var diff_ns = tonumber(end_ns - start_ns);
+         var diff_tsc = tonumber(tsc->to_ns(end_tsc) - tsc->to_ns(start_tsc));
+         var diff = diff_ns - diff_tsc;
+         assert(math.abs(diff/diff_ns) < 1e-3, tsc->source());
+      }
+   }
+
+   check(new({ source = 'rdtsc' }));
+   check(new({ source = 'system' }));
+}

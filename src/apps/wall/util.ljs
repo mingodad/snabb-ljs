@@ -1,0 +1,114 @@
+var link   = require("core.link");
+var packet = require("core.packet");
+var ffi    = require("ffi");
+var bit    = require("bit");
+
+var l_receive, l_transmit = link.receive, link.transmit;
+var l_nreadable, l_nwritable = link.nreadable, link.nwritable;
+var p_free = packet.free;
+
+var uint16_ptr_t = ffi.typeof("uint16_t*");
+var function rd16(address) {
+   return ffi.cast(uint16_ptr_t, address)[0];
+}
+
+var uint32_ptr_t = ffi.typeof("uint32_t*");
+var function rd32(address) {
+   return ffi.cast(uint16_ptr_t, address)[0];
+}
+
+//
+// Factory function to create memcmp()-style functions in pure-Lua to avoid
+// calling into C via the FFI, with the amount of bytes being compared set
+// to a fixed amount. This is used to create functions to compare IPv4 and
+// IPv6 addresses below.
+//
+var function make_fixed_memcmp_function(len) {
+   return function (a, b) {
+      for( i = 0, len - 1 ) {
+         var d = a[i] - b[i];
+         if( d != 0 ) {
+            return d;
+         }
+      }
+      return 0;
+   };
+}
+
+//
+// Base full-duplex application skeleton which passes packets between two
+// endpoints (south <--> north), applying a callback on each packet seen.
+// Usage:
+//
+//   local MyApp = setmetatable({}, SouthAndNorth)
+//
+//   function MyApp:on_southbound_packet (pkt):
+//      -- Do something with the packet and return a packet to be
+//      -- forwarded to the "south" link (possible the same). Return
+//      -- "nil" to discard packets.
+//      return pkt
+//   end
+//
+var SouthAndNorth = {};
+SouthAndNorth.__index = SouthAndNorth;
+
+var function _pass_packets (this, ilink, olink, cb) {
+   if( olink ) {
+      var n = math.min(l_nreadable(ilink), l_nwritable(olink));
+      for( _ = 1, n ) {
+         var p = l_receive(ilink);
+         var newp = cb(this, p);
+         if( type(newp) != "cdata" && newp == false ) {
+            // Do not transmit
+            p_free(p);
+         } else {
+            if( newp && p != newp ) {
+               p_free(p);
+               p = newp;
+            }
+            l_transmit(olink, p);
+         }
+      }
+   } else if( l_nreadable(ilink) > 0 ) {
+      // No output link: kitchen sink
+      for( _ = 1, l_nreadable(ilink) ) {
+         var p = l_receive(ilink);
+         var newp = cb(this, p);
+         // Free packets to avoid leaking them
+         if( newp && p != newp ) {
+            p_free(newp);
+         }
+         p_free(p);
+      }
+   }
+}
+
+function SouthAndNorth::push_southbound () {
+   if( this.input.north ) {
+      _pass_packets(this, this.input.north, this.output.south,
+         this.on_southbound_packet || (function (s, p) { return p; }));
+   }
+}
+
+function SouthAndNorth::push_northbound () {
+   if( this.input.south ) {
+      _pass_packets(this, this.input.south, this.output.north,
+         this.on_northbound_packet || (function (s, p) { return p; }));
+   }
+}
+
+function SouthAndNorth::push () {
+   this->push_northbound();
+   this->push_southbound();
+}
+
+
+return {
+   rd16 = rd16,
+   rd32 = rd32,
+
+   ipv4_addr_cmp = make_fixed_memcmp_function(4),
+   ipv6_addr_cmp = make_fixed_memcmp_function(16),
+
+   SouthAndNorth = SouthAndNorth,
+};

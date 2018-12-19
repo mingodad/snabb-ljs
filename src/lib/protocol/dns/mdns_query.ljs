@@ -1,0 +1,108 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+module(..., package.seeall);
+
+var datagram = require("lib.protocol.datagram");
+var dns = require("lib.protocol.dns.dns");
+var ethernet = require("lib.protocol.ethernet");
+var ffi = require("ffi");
+var ipv4 = require("lib.protocol.ipv4");
+var lib = require("core.lib");
+var mdns = require("lib.protocol.dns.mdns");
+var udp = require("lib.protocol.udp");
+
+var MDNS = mdns.MDNS;
+
+var query_record = dns.query_record;
+
+var htons, ntohs = lib.htons, lib.ntohs;
+
+var ETHER_PROTO_IPV4 = 0x0800;
+var STANDARD_QUERY = 0x0;
+var UDP_PROTOCOL = 0x11;
+
+mDNSQuery = {};
+
+function mDNSQuery.new (args) {
+   var o = {
+      src_eth = assert(args.src_eth),
+      src_ipv4 = assert(args.src_ipv4),
+   };
+   return setmetatable(o, {__index=mDNSQuery});
+}
+
+function mDNSQuery::build (...) {
+   var queries = assert({...});
+   var dgram = datagram->new();
+   var ether_h = ethernet->new({dst = ethernet->pton(mdns.DST_ETHER),
+                                 src = ethernet->pton(this.src_eth),
+                                 type = ETHER_PROTO_IPV4});
+   var ipv4_h = ipv4->new({dst = ipv4->pton(mdns.DST_IPV4),
+                            src = ipv4->pton(this.src_ipv4),
+                            protocol = UDP_PROTOCOL,
+                            ttl = 255,
+                            flags = 0x02});
+   var udp_h = udp->new({src_port = 5353,
+                          dst_port = mdns.DST_PORT});
+   // Add payload.
+   var payload, len = mDNSQuery->payload(queries);
+   // Calculate checksums.
+   udp_h->length(udp_h->sizeof() + len);
+   udp_h->checksum(payload, len, ipv4_h);
+   ipv4_h->total_length(ipv4_h->sizeof() + udp_h->sizeof() + len);
+   ipv4_h->checksum();
+   // Generate packet.
+   dgram->payload(payload, len);
+   dgram->push(udp_h);
+   dgram->push(ipv4_h);
+   dgram->push(ether_h);
+   return dgram->packet();
+}
+
+function mDNSQuery::payload (queries) {
+   var function w16 (buffer, val) {
+      ffi.cast("uint16_t*", buffer)[0] = val;
+   }
+   var function serialize (rr) {
+      var ret = ffi.new("uint8_t[?]", rr->sizeof());
+      var length = rr->sizeof() - 4;
+      var h = rr->header();
+      ffi.copy(ret, h.name, length);
+      w16(ret + length, h.type);
+      w16(ret + length + 2, h.class);
+      return ret, rr->sizeof();
+   }
+   var dgram = datagram->new();
+   var mdns_header = MDNS->new({
+      id = 0,
+      flags = STANDARD_QUERY,
+      questions = #queries,
+      answer_rrs = 0,
+      authority_rrs = 0,
+      additional_rrs = 0,
+   });
+   var t = {};
+   for( _, each in ipairs(queries) ) {
+      var rr = query_record->new({
+         name = each,
+         type = dns.PTR,
+         class = dns.CLASS_IN,
+      });
+      // TODO: dgram:push doesn't work. I think is due to the variable-length
+      // nature of the header.
+      var data, len = serialize(rr);
+      dgram->push_raw(data, len);
+   }
+   dgram->push(mdns_header);
+   var pkt = dgram->packet();
+   return pkt.data, pkt.length;
+}
+
+function selftest() {
+   var mdns_query = mDNSQuery.new({
+      src_eth = "ce:6c:59:f2:f3:c1",
+      src_ipv4 = "192.168.0.1",
+   });
+   var query = "_services._dns-sd._udp.local";
+   var pkt = assert(mdns_query->build(query));
+   assert(pkt.length == 88);
+}

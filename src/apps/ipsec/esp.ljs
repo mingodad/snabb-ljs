@@ -1,0 +1,76 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+// This app implements a point-to-point encryption tunnel using ESP with
+// AES128GCM12 in transport mode over IPv6.
+
+module(..., package.seeall);
+var esp = require("lib.ipsec.esp");
+var counter = require("core.counter");
+var C = require("ffi").C;
+
+AES128gcm = {
+   config = {
+      spi = {required=true},
+      transmit_key = {required=true},
+      transmit_salt =  {required=true},
+      receive_key = {required=true},
+      receive_salt =  {required=true},
+      receive_window = {},
+      resync_threshold = {},
+      resync_attempts = {},
+      auditing = {}
+   },
+   shm = {
+      txerrors = {counter}, rxerrors = {counter}
+   }
+};
+
+function AES128gcm::new (conf) {
+   var self = {};
+   assert(conf.transmit_salt != conf.receive_salt,
+          "Refusing to operate with transmit_salt == receive_salt");
+   self.encrypt = esp.encrypt->new({
+      mode = "aes-gcm-128-12",
+      spi = conf.spi,
+      key = conf.transmit_key,
+      salt = conf.transmit_salt});
+   self.decrypt = esp.decrypt->new({
+      mode = "aes-gcm-128-12",
+      spi = conf.spi,
+      key = conf.receive_key,
+      salt = conf.receive_salt,
+      window_size = conf.receive_window,
+      resync_threshold = conf.resync_threshold,
+      resync_attempts = conf.resync_attempts,
+      auditing = conf.auditing});
+   return setmetatable(self, {__index = AES128gcm});
+}
+
+function AES128gcm::push () {
+   // Encapsulation path
+   var input = this.input.decapsulated;
+   var output = this.output.encapsulated;
+   for( _=1,link.nreadable(input) ) {
+      var p = link.receive(input);
+      var p_enc = this.encrypt->encapsulate_transport6(p);
+      if( p_enc ) {
+         link.transmit(output, p_enc);
+      } else {
+         packet.free(p);
+         counter.add(this.shm.txerrors);
+      }
+   }
+   // Decapsulation path
+   input = this.input.encapsulated;
+   output = this.output.decapsulated;
+   for( _=1,link.nreadable(input) ) {
+      var p = link.receive(input);
+      var p_dec = this.decrypt->decapsulate_transport6(p);
+      if( p_dec ) {
+         link.transmit(output, p_dec);
+      } else {
+         packet.free(p);
+         counter.add(this.shm.rxerrors);
+      }
+   }
+}

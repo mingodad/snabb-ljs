@@ -1,0 +1,175 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+module(..., package.seeall);
+
+var DNS = require("lib.protocol.dns.dns").DNS;
+var MDNS = require("lib.protocol.dns.mdns").MDNS;
+var RawSocket = require("apps.socket.raw").RawSocket;
+var basic_apps = require("apps.basic.basic_apps");
+var ffi = require("ffi");
+var lib = require("core.lib");
+var mDNSQuery = require("lib.protocol.dns.mdns_query").mDNSQuery;
+var pcap = require("apps.pcap.pcap");
+
+var long_opts = {
+   help = "h",
+   pcap = "p",
+   interface = "i",
+};
+
+var function usage(exit_code) {
+   print(require("program.dnssd.README_inc"));
+   main.exit(exit_code);
+}
+
+function parse_args (args) {
+   var function fexists (filename) {
+      var fd = io.open(filename, "r");
+      if( fd ) {
+         fd->close();
+         return true;
+      }
+      return false;
+   }
+   var opts = {};
+   var handlers = {};
+   function handlers.h (arg) {
+      usage(0);
+   }
+   function handlers.p (arg) {
+      opts.pcap = arg;
+   }
+   function handlers.i (arg) {
+      opts.interface = arg;
+   }
+   args = lib.dogetopt(args, handlers, "hp:i:", long_opts);
+   if( ! (opts.pcap || opts.interface) ) {
+      var filename = args[1];
+      if( fexists(filename) ) {
+         opts.pcap = filename;
+      } else {
+         opts.interface = filename;
+      }
+      table.remove(args, 1);
+   }
+   return opts, args;
+}
+
+DNSSD = {};
+
+function DNSSD::new (args) {
+   var o = {
+      interval = 1, // Delay between broadcast messages.
+      threshold = 0,
+   };
+   if( args ) {
+      o.requester = mDNSQuery.new({
+         src_eth = assert(args.src_eth),
+         src_ipv4 = assert(args.src_ipv4),
+      });
+      o.query = args.query || "_services._dns-sd._udp.local";
+   }
+   return setmetatable(o, {__index = DNSSD});
+}
+
+// Generate a new broadcast mDNS packet every interval seconds.
+function DNSSD::pull () {
+   var output = this.output.output;
+   if( ! output ) { return; }
+
+   var now = os.time();
+   if( now > this.threshold ) {
+      this.threshold = now + this.interval;
+      var pkt = this.requester->build(this.query);
+      link.transmit(output, pkt);
+   }
+}
+
+function DNSSD::push () {
+   var input = assert(this.input.input);
+
+   while( ! link.empty(input) ) {
+      var pkt = link.receive(input);
+      if( MDNS.is_mdns(pkt) ) {
+         this->log(pkt);
+      }
+      packet.free(pkt);
+   }
+}
+
+function DNSSD::log (pkt) {
+   if( ! MDNS.is_response(pkt) ) { return; }
+   var response = MDNS.parse_packet(pkt);
+   var answer_rrs = response.answer_rrs;
+   if( #answer_rrs > 0 ) {
+      for( _, rr in ipairs(answer_rrs) ) {
+         print(rr->tostring());
+      }
+   }
+   var additional_rrs = response.additional_rrs;
+   if( #additional_rrs > 0 ) {
+      for( _, rr in ipairs(additional_rrs) ) {
+         print(rr->tostring());
+      }
+   }
+}
+
+var function execute (cmd) {
+   var fd = assert(io.popen(cmd, 'r'));
+   var ret = fd->read("*all");
+   fd->close();
+   return ret;
+}
+
+var function chomp (str) {
+   return str->gsub("\n", "");
+}
+
+var function ethernet_address_of (iface) {
+   var cmd = ("ip li sh %s | grep 'link/ether' | awk '{print $2}'")->format(iface);
+   var ret = chomp(execute(cmd));
+   if( #ret == 0 ) {
+      print(("Unsupported interface: '%s' (missing MAC address)")->format(iface));
+      os.exit();
+   }
+   return ret;
+}
+
+var function ipv4_address_of (iface) {
+   var cmd = ("ip addr sh %s | grep 'inet ' | awk '{print $2}'")->format(iface);
+   var output = chomp(execute(cmd));
+   var pos = output->find("/");
+   return pos && output->sub(0, pos-1) || output;
+}
+
+function run(args) {
+   var opts;
+   opts, args = parse_args(args);
+
+   var duration;
+   var c = config.new();
+   if( opts.pcap ) {
+      print("Reading from file: "..opts.pcap);
+      config.app(c, "dnssd", DNSSD);
+      config.app(c, "pcap", pcap.PcapReader, opts.pcap);
+      config.link(c, "pcap.output-> dnssd.input");
+      duration = 3;
+   } else if( opts.interface ) {
+      var iface = opts.interface;
+      var query = args[1];
+      var src_eth = ethernet_address_of(iface);
+      print(("Capturing packets from interface '%s'")->format(iface));
+      config.app(c, "dnssd", DNSSD, {
+         src_eth = src_eth,
+         src_ipv4 = ipv4_address_of(iface),
+         query = query,
+      });
+      config.app(c, "iface", RawSocket, iface);
+      config.link(c, "iface.tx -> dnssd.input");
+      config.link(c, "dnssd.output -> iface.rx");
+   } else {
+      error("Unreachable");
+   }
+   engine.busy = false;
+   engine.configure(c);
+   engine.main({duration = duration, report = {showapps = true, showlinks = true}});
+}

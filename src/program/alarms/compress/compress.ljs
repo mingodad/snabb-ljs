@@ -1,0 +1,45 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+module(..., package.seeall);
+
+var common = require("program.config.common");
+
+function show_usage(command, status, err_msg) {
+   if( err_msg ) { print('error: '..err_msg); }
+   print(require("program.alarms.compress.README_inc"));
+   main.exit(status);
+}
+
+var function fatal() {
+   show_usage(null, 1);
+}
+
+var function parse_args (args) {
+   if( #args != 3 ) { fatal(); }
+   var resource = args[2];
+   var alarm_type_id, alarm_type_qualifier = (args[3])->match("([^/]+)");
+   if( ! alarm_type_id ) {
+      alarm_type_id = args[3];
+   }
+   for( i=2,#args ) {
+      table.remove(args);
+   }
+   return {
+      resource = resource,
+      alarm_type_id = alarm_type_id,
+      alarm_type_qualifier = alarm_type_qualifier,
+   };
+}
+
+function run(args) {
+   var l_args = parse_args(args);
+   var opts = { command='compress-alarms', with_path=false, is_config=false,
+                  usage=show_usage };
+   args = common.parse_command_line(args, opts);
+   var response = common.call_leader(
+      args.instance_id, 'compress-alarms',
+      { schema = args.schema_name, revision = args.revision,
+        resource = l_args.resource, alarm_type_id = l_args.alarm_type_id,
+        alarm_type_qualifier = l_args.alarm_type_qualifier,
+        print_default = args.print_default, format = args.format });
+   common.print_and_exit(response, 'compressed_alarms');
+}

@@ -1,0 +1,237 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+module(..., package.seeall);
+
+var S = require("syscall");
+var ffi = require("ffi");
+
+// A very limited json library that only does objects of strings,
+// designed to integrate well with poll(2) loops.
+
+function buffered_input(fd) {
+   var buf_size = 4096;
+   var buf = ffi.new('uint8_t[?]', buf_size);
+   var buf_end = 0;
+   var pos = 0;
+   var ret = {};
+   var eof = false;
+   var function fill() {
+      assert(pos == buf_end);
+      if( eof ) { return 0; }
+      pos = 0;
+      buf_end = assert(fd->read(buf, buf_size));
+      assert(0 <= buf_end && buf_end <= buf_size);
+      if( buf_end == 0 ) { eof = true; }
+      return buf_end;
+   }
+   function ret::avail() { return buf_end - pos; }
+   function ret::getfd() { return fd->getfd(); }
+   function ret::eof() { return eof; }
+   function ret::peek() {
+      if( pos == buf_end && fill() == 0 ) { return null; }
+      return string.char(buf[pos]);
+   }
+   function ret::discard() {
+      assert(pos < buf_end);
+      ++pos    ;
+   }
+   return ret;
+}
+
+var whitespace_pat = '[ \n\r\t]';
+
+function drop_buffered_whitespace(input) {
+   while( input->avail() > 0 && input->peek()->match(whitespace_pat) ) {
+      input->discard();
+   }
+}
+
+var function take_while(input, pat) {
+   var out = {};
+   while( input->peek() && input->peek()->match(pat) ) {
+      table.insert(out, input->peek());
+      input->discard();
+   }
+   return table.concat(out);
+}
+
+var function check(input, ch) {
+   if( input->peek() != ch ) { return false; }
+   input->discard();
+   return true;
+}
+
+var function consume(input, ch) {
+   if( ! check(input, ch) ) {
+      if( input->eof() ) { error('unexpected EOF'); }
+      error('expected '..ch..', got '..input->peek());
+   }
+}
+
+var function consume_pat(input, pat) {
+   var ch = input->peek();
+   if( ch == null ) { error('unexpected EOF'); }
+   if( ! ch->match(pat) ) { error('unexpected character '..ch); }
+   input->discard();
+   return ch;
+}
+
+function skip_whitespace(input) { take_while(input, whitespace_pat); }
+
+// Pattern describing characters that can appear literally in a JSON
+// string.
+var literal_string_chars_pat = '%w';
+{
+   // Printable non-alphanumeric ASCII chars, excluding control
+   // characters, backslash, and double-quote.
+   var punctuation = "!#$%&'()*+,-./:;<=>?@[]^_`{|}~ ";
+   for( i=1,#punctuation ) {
+      var punctuation_pat = '%'..punctuation->sub(i,i);
+      literal_string_chars_pat = literal_string_chars_pat..punctuation_pat;
+   }
+   literal_string_chars_pat = '['..literal_string_chars_pat..']';
+}
+// The escapable characters in JSON.
+var escaped_string_chars =
+   { r="\r", n="\n", t="\t", ["\\"]="\\", ['"']='"', b="\b", f="\f", ["/"]="/" };
+
+var function read_json_string(input) {
+   consume(input, '"');
+   var parts = {};
+   while( ! check(input, '"') ) {
+      // JSON strings support unicode.  The encoding of the JSON could
+      // be anything though UTF-8 is the likely one.  Assume the
+      // encoding is ASCII-compatible (like UTF-8) and restrict
+      // ourselves to printable ASCII characters.
+      var part = take_while(input, literal_string_chars_pat);
+      if( part == '' ) {
+         consume(input, "\\");
+         for( k,v in pairs(escaped_string_chars) ) {
+            if( check(input, k) ) { part = v; break; }
+         }
+         if( part == '' && check(input, "u") ) {
+            // 4-hex-digit unicode escape.  We only support ASCII
+            // tho.
+            var hex = '0x';
+            for( i=1,4 ) { hex = hex..consume_pat(input, "%x"); }
+            var code = assert(tonumber(hex));
+            if( code >= 128 ) { error('non-ASCII character: \\u00'..hex); }
+            part = string.char(code);
+         }
+      }
+      table.insert(parts, part);
+   }
+   return table.concat(parts);
+}
+
+function read_json_object(input) {
+   consume(input, "{");
+   skip_whitespace(input);
+   var ret = {};
+   if( ! check(input, "}") ) {
+      do {
+         skip_whitespace(input);
+         var k = read_json_string(input);
+         if( ret[k] ) { error('duplicate key: '..k); }
+         skip_whitespace(input);
+         consume(input, ":");
+         skip_whitespace(input);
+         var v = read_json_string(input);
+         ret[k] = v;
+         skip_whitespace(input);
+      } while(!( ! check(input, ",")) );
+      skip_whitespace(input);
+      consume(input, "}");
+   }
+   return ret;
+}
+
+function buffered_output() {
+   var ret = { buf = {} };
+   function ret::write(str) { table.insert(this.buf, str); }
+   function ret::flush(fd) {
+      var str = table.concat(this.buf);
+      if( fd == null ) { return str; }
+      var bytes = ffi.cast('const char*', str);
+      var written = 0;
+      while( written < #str ) {
+         var wrote = assert(fd->write(bytes + written, #str - written));
+         written +=   wrote;
+      }
+   }
+   return ret;
+}
+
+var function write_json_string(output, str) {
+   output->write('"');
+   var pos = 1;
+   while( pos <= #str ) {
+      var head = str->match('^('..literal_string_chars_pat..'+)', pos);
+      if( head ) {
+         output->write(head);
+         pos = pos + #head;
+      } else {
+         head = str->sub(pos, pos);
+         var escaped;
+         for( k,v in pairs(escaped_string_chars) ) {
+            if( v == head ) { escaped = k; break; }
+         }
+         if( ! escaped ) {
+            escaped = string.format("u00%.2x", head->byte(1));
+         }
+         output->write('\\'..escaped);
+         ++pos    ;
+      }
+   }
+   output->write('"');
+}
+
+function write_json_object(output, obj) {
+   output->write('{');
+   var comma = false;
+   for( k,v in pairs(obj) ) {
+      if( comma ) { output->write(','); } else { comma = true; }
+      write_json_string(output, k);
+      output->write(':');
+      write_json_string(output, v);
+   }
+   output->write('}');
+}
+
+function selftest () {
+   print('selftest: lib.ptree.json');
+   var equal = require('core.lib').equal;
+   var function test_json(str, obj) {
+      var tmp = os.tmpname();
+      var f = io.open(tmp, 'w');
+      f->write(str);
+      f->write(" "); // whitespace sentinel on the end.
+      f->close();
+      for( i = 1,2 ) {
+         var fd = S.open(tmp, 'rdonly');
+         var input = buffered_input(fd);
+         var parsed = read_json_object(input);
+         assert(equal(parsed, obj));
+         assert(! input->eof());
+         assert(check(input, " "));
+         assert(! input->peek());
+         assert(input->eof());
+         fd->close();
+
+         fd = assert(S.open(tmp, 'wronly, trunc'));
+         var output = buffered_output();
+         write_json_object(output, parsed);
+         output->write(' '); // sentinel
+         output->flush(fd);
+         fd->close();
+      }
+      os.remove(tmp);
+   }
+   test_json('{}', {});
+   test_json('{"foo":"bar"}', {foo='bar'});
+   test_json('{"foo":"bar","baz":"qux"}', {foo='bar', baz='qux'});
+   test_json('{ "foo" : "bar" , "baz" : "qux" }',
+             {foo='bar', baz='qux'});
+   test_json('{ "fo\\u000ao" : "ba\\r " , "baz" : "qux" }',
+             {['fo\no']='ba\r ', baz='qux'});
+   print('selftest: ok');
+}

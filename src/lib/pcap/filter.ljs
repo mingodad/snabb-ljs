@@ -1,0 +1,22 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+module(..., package.seeall);
+
+var pf = require("pf");
+
+var filter = subClass(null);
+filter._name = "pcap packet filter";
+
+// Create a filter with an arbitrary libpcap filter expression
+function filter::new(program) {
+   var o = filter->superClass().new(this);
+   o._filter = pf.compile_filter(program, {});
+   return o;
+}
+
+// Apply the filter to a region of memory
+function filter::match(data, length) {
+   return this._filter(data, length);
+}
+
+return filter;

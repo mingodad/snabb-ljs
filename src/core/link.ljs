@@ -1,0 +1,131 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+module(...,package.seeall);
+
+var debug = _G.developer_debug;
+
+var shm = require("core.shm");
+var ffi = require("ffi");
+var C = ffi.C;
+
+var packet = require("core.packet");
+require("core.packet_h");
+
+var counter = require("core.counter");
+require("core.counter_h");
+
+require("core.link_h");
+var link_t = ffi.typeof("struct link");
+
+var band = require("bit").band;
+
+var size = C.LINK_RING_SIZE;         // NB: Huge slow-down if this is not local
+max        = C.LINK_MAX_PACKETS;
+
+var provided_counters = {
+   "dtime", "rxpackets", "rxbytes", "txpackets", "txbytes", "txdrop"
+};
+
+function new (name) {
+   var r = ffi.new(link_t);
+   for( _, c in ipairs(provided_counters) ) {
+      r.stats[c] = counter.create("links/"..name.."/"..c..".counter");
+   }
+   counter.set(r.stats.dtime, C.get_unix_time());
+   return r;
+}
+
+function free (r, name) {
+   while( ! empty(r) ) {
+      packet.free(receive(r));
+   }
+   for( _, c in ipairs(provided_counters) ) {
+      counter.delete("links/"..name.."/"..c..".counter");
+   }
+   shm.unlink("links/"..name);
+}
+
+function receive (r) {
+//   if debug then assert(not empty(r), "receive on empty link") end
+   var p = r.packets[r.read];
+   r.read = band(r.read + 1, size - 1);
+
+   counter.add(r.stats.rxpackets);
+   counter.add(r.stats.rxbytes, p.length);
+   return p;
+}
+
+function front (r) {
+   return (r.read != r.write) && r.packets[r.read] || null;
+}
+
+function transmit (r, p) {
+//   assert(p)
+   if( full(r) ) {
+      counter.add(r.stats.txdrop);
+      packet.free(p);
+   } else {
+      r.packets[r.write] = p;
+      r.write = band(r.write + 1, size - 1);
+      counter.add(r.stats.txpackets);
+      counter.add(r.stats.txbytes, p.length);
+   }
+}
+
+// Return true if the ring is empty.
+function empty (r) {
+   return r.read == r.write;
+}
+
+// Return true if the ring is full.
+function full (r) {
+   return band(r.write + 1, size - 1) == r.read;
+}
+
+// Return the number of packets that are ready for read.
+function nreadable (r) {
+   if( r.read > r.write ) {
+      return r.write + size - r.read;
+   } else {
+      return r.write - r.read;
+   }
+}
+
+function nwritable (r) {
+   return max - nreadable(r);
+}
+
+function stats (r) {
+   var stats = {};
+   for( _, c in ipairs(provided_counters) ) {
+      stats[c] = tonumber(counter.read(r.stats[c]));
+   }
+   return stats;
+}
+
+function selftest () {
+   print("selftest: link");
+   var r = new("test");
+   var p = packet.allocate();
+   assert(counter.read(r.stats.txpackets) == 0 && empty(r) == true  && full(r) == false);
+   assert(nreadable(r) == 0);
+   transmit(r, p);
+   assert(counter.read(r.stats.txpackets) == 1 && empty(r) == false && full(r) == false);
+   for( i = 1, max-2 ) {
+      transmit(r, p);
+   }
+   assert(counter.read(r.stats.txpackets) == max-1 && empty(r) == false && full(r) == false);
+   assert(nreadable(r) == counter.read(r.stats.txpackets));
+   transmit(r, p);
+   assert(counter.read(r.stats.txpackets) == max   && empty(r) == false && full(r) == true);
+   transmit(r, p);
+   assert(counter.read(r.stats.txpackets) == max && counter.read(r.stats.txdrop) == 1);
+   assert(! empty(r) && full(r));
+   while( ! empty(r) ) {
+      receive(r);
+   }
+   assert(counter.read(r.stats.rxpackets) == max);
+   link.free(r, "test");
+   print("selftest OK");
+}
+

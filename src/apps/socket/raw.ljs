@@ -1,0 +1,165 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+module(..., package.seeall);
+
+var S = require("syscall");
+var h = require("syscall.helpers");
+var bit = require("bit");
+var link = require("core.link");
+var packet = require("core.packet");
+var counter = require("core.counter");
+var ethernet = require("lib.protocol.ethernet");
+var ffi = require("ffi");
+var C = ffi.C;
+
+var c, t = S.c, S.types.t;
+
+RawSocket = {};
+
+function RawSocket::new (ifname) {
+   assert(ifname);
+   var index, err = S.util.if_nametoindex(ifname);
+   if( ! index ) { error(err); }
+
+   var tp = h.htons(c.ETH_P["ALL"]);
+   var sock = assert(S.socket(c.AF.PACKET, bit.bor(c.SOCK.RAW, c.SOCK.NONBLOCK), tp));
+   index, err = S.util.if_nametoindex(ifname);
+   if( ! index ) {
+      sock->close();
+      error(err);
+   }
+
+   var addr = t.sockaddr_ll({sll_family = c.AF.PACKET, sll_ifindex = index, sll_protocol = tp});
+   var ok;
+   ok, err = S.bind(sock, addr);
+   if( ! ok ) {
+      sock->close();
+      error(err);
+   }
+   return setmetatable({sock = sock,
+                        rx_p = packet.allocate(),
+                        shm  = { rxbytes   = {counter},
+                                 rxpackets = {counter},
+                                 rxmcast   = {counter},
+                                 rxbcast   = {counter},
+                                 txbytes   = {counter},
+                                 txpackets = {counter},
+                                 txmcast   = {counter},
+                                 txbcast   = {counter} }},
+                       {__index = RawSocket});
+}
+
+function RawSocket::pull () {
+   var l = this.output.tx;
+   if( l == null ) { return; }
+   var limit = engine.pull_npackets;
+   while( limit > 0 && this->can_receive() ) {
+      --limit    ;
+      link.transmit(l, this->receive());
+   }
+}
+
+function RawSocket::can_receive () {
+   var t, err = S.select({readfds = {this.sock}}, 0);
+   while( ! t && (err.AGAIN || err.INTR) ) {
+      t, err = S.select({readfds = {this.sock}}, 0);
+   }
+   assert(t, err);
+   return t.count == 1;
+}
+
+function RawSocket::receive () {
+   var p = this.rx_p;
+   var sz = assert(S.read(this.sock, p.data, packet.max_payload));
+   p.length = sz;
+   counter.add(this.shm.rxbytes, sz);
+   counter.add(this.shm.rxpackets);
+   if( ethernet->is_mcast(p.data) ) {
+      counter.add(this.shm.rxmcast);
+   }
+   if( ethernet->is_bcast(p.data) ) {
+      counter.add(this.shm.rxbcast);
+   }
+   return packet.clone(p);
+}
+
+function RawSocket::push () {
+   var l = this.input.rx;
+   if( l == null ) { return; }
+   while( ! link.empty(l) && this->can_transmit() ) {
+      var p = link.receive(l);
+      this->transmit(p);
+      counter.add(this.shm.txbytes, p.length);
+      counter.add(this.shm.txpackets);
+      if( ethernet->is_mcast(p.data) ) {
+         counter.add(this.shm.txmcast);
+      }
+      if( ethernet->is_bcast(p.data) ) {
+         counter.add(this.shm.txbcast);
+      }
+      packet.free(p);
+   }
+}
+
+function RawSocket::can_transmit () {
+   var t, err = S.select({writefds = {this.sock}}, 0);
+   while( ! t && (err.AGAIN || err.INTR) ) {
+      t, err = S.select({writefds = {this.sock}}, 0);
+   }
+   assert(t, err);
+   return t.count == 1;
+}
+
+function RawSocket::transmit (p) {
+   var sz, err = S.write(this.sock, p.data, p.length);
+   assert(sz, err);
+   assert(sz == p.length);
+}
+
+function RawSocket::stop() {
+   this.sock->close();
+   packet.free(this.rx_p);
+}
+
+function selftest () {
+   // Send a packet over the loopback device and check
+   // that it is received correctly.
+   var datagram = require("lib.protocol.datagram");
+   var ethernet = require("lib.protocol.ethernet");
+   var ipv6 = require("lib.protocol.ipv6");
+   var Match = require("apps.test.match").Match;
+
+   // Initialize RawSocket and Match.
+   var c = config.new();
+   config.app(c, "lo", RawSocket, "lo");
+   config.app(c, "match", Match, {fuzzy=true});
+   config.link(c, "lo.tx->match.rx");
+   engine.configure(c);
+   var link_in, link_cmp = link.new("test_in"), link.new("test_cmp");
+   engine.app_table.lo.input.rx = link_in;
+   engine.app_table.match.input.comparator = link_cmp;
+   // Construct packet.
+   var dg_tx = datagram->new();
+   var src = ethernet->pton("02:00:00:00:00:01");
+   var dst = ethernet->pton("02:00:00:00:00:02");
+   var localhost = ipv6->pton("0:0:0:0:0:0:0:1");
+   dg_tx->push(ipv6->new({src = localhost,
+                        dst = localhost,
+                        next_header = 59, // No next header.
+                        hop_limit = 1}));
+   dg_tx->push(ethernet->new({src = src,
+                            dst = dst,
+                            type = 0x86dd}));
+   // Transmit packets.
+   link.transmit(link_in, dg_tx->packet());
+   link.transmit(link_cmp, packet.clone(dg_tx->packet()));
+   engine.app_table.lo->push();
+   // Run engine.
+   engine.main({duration = 0.01, report = {showapps=true,showlinks=true}});
+   assert(#engine.app_table.match->errors() == 0);
+   print("selftest passed");
+
+   // XXX Another useful test would be to feed a pcap file with
+   // pings to 127.0.0.1 and ::1 into lo and capture/compare
+   // the responses with a pre-recorded pcap.
+}

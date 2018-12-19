@@ -1,0 +1,53 @@
+//- MAC address handling object.
+// depends on LuaJIT's 64-bit capabilities,
+// both for numbers and bit.* library
+var bit = require ("bit");
+var ffi = require ("ffi");
+
+var mac_t = ffi.typeof('union { int64_t bits; uint8_t bytes[6];}');
+var mac_mt = {};
+mac_mt.__index = mac_mt;
+
+function mac_mt::new (m) {
+   if( ffi.istype(mac_t, m) ) {
+      return m;
+   }
+   var macobj = mac_t();
+   if( type(m) == 'string' ) {
+      var i = 0;
+      for( b in m->gmatch('%x%x') ) {
+         if( i == 6 ) {
+            // avoid out of bound array index
+            return null, "malformed MAC address: " .. m;
+         }
+         macobj.bytes[i] = tonumber(b, 16);
+         ++i    ;
+      }
+      if( i < 6 ) {
+         return null, "malformed MAC address: " .. m;
+      }
+   } else {
+      macobj.bits = m;
+   }
+   return macobj;
+}
+
+function mac_mt::__tostring () {
+   return string.format('%02X:%02X:%02X:%02X:%02X:%02X',
+      this.bytes[0], this.bytes[1], this.bytes[2],
+      this.bytes[3], this.bytes[4], this.bytes[5]);
+}
+
+function mac_mt.__eq (a, b) {
+   return a.bits == b.bits;
+}
+
+function mac_mt::subbits (i,j) {
+   var b = bit.rshift(this.bits, i);
+   var mask = bit.bnot(bit.lshift(0xffffffffffffLL, j-i));
+   return tonumber(bit.band(b, mask));
+}
+
+mac_t = ffi.metatype(mac_t, mac_mt);
+
+return mac_mt;

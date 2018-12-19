@@ -1,0 +1,217 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+module(..., package.seeall);
+
+var lib = require("core.lib");
+var ffi = require("ffi");
+var ipv4 = require("lib.protocol.ipv4");
+
+ffi.cdef([=[
+unsigned long long strtoull (const char *nptr, const char **endptr, int base);
+]=]);
+
+function tointeger(str, what, min, max) {
+   if( ! what ) { what = 'integer'; }
+   str = assert(str, 'missing value for '..what);
+   var start = 1;
+   var is_negative;
+   var base = 10;
+   if( str->match('^-') ) { start, is_negative = 2, true;
+   } else if( str->match('^+') ) { start = 2; }
+   if( str->match('^0x', start) ) { base, start = 16, start + 2;
+   } else if( str->match('^0', start) ) { base = 8; }
+   str = str->lower();
+   if( start > str->len() ) {
+      error('invalid numeric value for '..what..': '..str);
+   }
+   // FIXME: check that res did not overflow the 64-bit number
+   var res = ffi.C.strtoull(str->sub(start), null, base);
+   if( is_negative ) {
+      res = ffi.new('int64_t[1]', -1*res)[0];
+      if( res > 0 ) {
+         error('invalid numeric value for '..what..': '..str);
+      }
+      if( min && ! (min <= 0 && min <= res) ) {
+         error('invalid numeric value for '..what..': '..str);
+      }
+   } else {
+      // Only compare min and res if both are positive, otherwise if min
+      // is a negative int64_t then the comparison will treat it as a
+      // large uint64_t.
+      if( min && ! (min <= 0 || min <= res) ) {
+         error('invalid numeric value for '..what..': '..str);
+      }
+   }
+   if( max && res > max ) {
+      error('invalid numeric value for '..what..': '..str);
+   }
+   // Only return Lua numbers for values within int32 + uint32 range.
+   // The 0 <= res check is needed because res might be a uint64, in
+   // which case comparing to a negative Lua number will cast that Lua
+   // number to a uint64 :-((
+   if( (0 <= res || -0x8000000 <= res) && res <= 0xffffffff ) {
+      return tonumber(res);
+   }
+   return res;
+}
+
+function ffi_array(ptr, elt_t, count) {
+   var mt = {};
+   var size = count || ffi.sizeof(ptr)/ffi.sizeof(elt_t);
+   function mt::__len() { return size; }
+   function mt::__index(idx) {
+      assert(1 <= idx && idx <= size);
+      return ptr[idx-1];
+   }
+   function mt::__newindex(idx, val) {
+      assert(1 <= idx && idx <= size);
+      ptr[idx-1] = val;
+   }
+   function mt::__ipairs() {
+      var idx = -1;
+      return function() {
+         ++idx    ;
+         if( idx >= size ) { return; }
+         return idx+1, ptr[idx];
+      };
+   }
+   return ffi.metatype(ffi.typeof('struct { $* ptr; }', elt_t), mt)(ptr);
+}
+
+// The yang modules represent IPv4 addresses as host-endian uint32
+// values in Lua.  See https://github.com/snabbco/snabb/issues/1063.
+function ipv4_pton(str) {
+   return lib.ntohl(ffi.cast('uint32_t*', assert(ipv4->pton(str)))[0]);
+}
+
+function ipv4_ntop(addr) {
+   return ipv4->ntop(ffi.new('uint32_t[1]', lib.htonl(addr)));
+}
+
+ffi.cdef ([=[
+void* malloc (size_t);
+void free (void*);
+]=]);
+
+function string_io_file() {
+   var function alloc(n) {
+      return ffi.gc(ffi.cast('char*', ffi.C.malloc(n)), ffi.C.free);
+   }
+
+   var file = {};
+   var size = 1024;
+   var buf = alloc(size);
+   var written = 0;
+   var read = 0;
+   function file::write(str) {
+      while( size - written < #str ) {
+         if( 0 < read ) {
+            ffi.copy(buf, buf + read, written - read);
+            read, written = 0, written - read;
+         } else {
+            var old_buf, old_written = buf, written;
+            size *=   2;
+            buf = alloc(size);
+            ffi.copy(buf, old_buf, written);
+         }
+      }
+      ffi.copy(buf + written, str, #str);
+      written = written + #str;
+   }
+   function file::peek() {
+      return buf + read, written - read;
+   }
+   function file::flush() {
+      var ptr, len = buf + read, written - read;
+      return ffi.string(ptr, len);
+   }
+   function file::clear(str) {
+      size, written, read = 1024, 0, 0;
+      buf = alloc(size);
+   }
+   return file;
+}
+
+function memoize(f, max_occupancy) {
+   var cache = {};
+   var occupancy = 0;
+   var argc = 0;
+   max_occupancy = max_occupancy || 10;
+   return function(...) {
+      var args = {...};
+      if( #args == argc ) {
+         var walk = cache;
+         for( i=1,#args ) {
+            if( walk == null ) { break; }
+            walk = walk[args[i]];
+         }
+         if( walk != null ) { return unpack(walk); }
+      } else {
+         cache, occupancy, argc = {}, 0, #args;
+      }
+      var ret = {f(...)};
+      if( occupancy >= max_occupancy ) {
+         cache = {};
+         occupancy = 0;
+      }
+      var walk = cache;
+      for( i=1,#args-1 ) {
+         if( ! walk[args[i]] ) { walk[args[i]] = {}; }
+         walk = walk[args[i]];
+      }
+      walk[args[#args]] = ret;
+      ++occupancy    ;
+      return unpack(ret);
+   };
+}
+
+function timezone () {
+   var now = os.time();
+   var utctime = os.date("!*t", now);
+   var localtime = os.date("*t", now);
+   var timediff = os.difftime(os.time(localtime), os.time(utctime));
+   if( timediff != 0 ) {
+      var sign = timediff > 0 && "+" || "-";
+      var time = os.date("!*t", math.abs(timediff));
+      return sign..("%.2d:%.2d")->format(time.hour, time.min);
+   }
+}
+
+function format_date_as_iso_8601 (time) {
+   var ret = {};
+   time = time || os.time();
+   var utctime = os.date("!*t", time);
+   table.insert(ret, ("%.4d-%.2d-%.2dT%.2d:%.2d:%.2dZ")->format(
+      utctime.year, utctime.month, utctime.day, utctime.hour, utctime.min, utctime.sec));
+   table.insert(ret, timezone() || "");
+   return table.concat(ret, "");
+}
+
+// XXX: ISO 8601 can be more complex. We asumme date is the format returned
+// by 'format_date_as_iso8601'.
+function parse_date_as_iso_8601 (date) {
+   assert(type(date) == 'string');
+   var gmtdate = "(%d%d%d%d)-(%d%d)-(%d%d)T(%d%d):(%d%d):(%d%d)Z";
+   var year, month, day, hour, min, sec = assert(date->match(gmtdate));
+   var tz_sign, tz_hour, tz_min = date->match("Z([+-]?)(%d%d):(%d%d)");
+   return {year=year, month=month, day=day, hour=hour, min=min, sec=sec, tz_sign=tz_sign, tz_hour=tz_hour, tz_min=tz_min};
+}
+
+function selftest() {
+   print('selftest: lib.yang.util');
+   assert(tointeger('0') == 0);
+   assert(tointeger('-0') == 0);
+   assert(tointeger('10') == 10);
+   assert(tostring(tointeger('10')) == '10');
+   assert(tointeger('-10') == -10);
+   assert(tointeger('010') == 8);
+   assert(tointeger('-010') == -8);
+   assert(tointeger('0xffffffff') == 0xffffffff);
+   assert(tointeger('0xffffffffffffffff') == 0xffffffffffffffffULL);
+   assert(tointeger('0x7fffffffffffffff') == 0x7fffffffffffffffULL);
+   assert(tointeger('0xffffffffffffffff') == 0xffffffffffffffffULL);
+   assert(tointeger('-0x7fffffffffffffff') == -0x7fffffffffffffffLL);
+   assert(tointeger('-0x8000000000000000') == -0x8000000000000000LL);
+   assert(ipv4_pton('255.0.0.1') == 255 * 2**24 + 1);
+   assert(ipv4_ntop(ipv4_pton('255.0.0.1')) == '255.0.0.1');
+   print('selftest: ok');
+}

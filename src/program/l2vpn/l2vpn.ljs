@@ -1,0 +1,828 @@
+// This program provisions a complete endpoint for one or more L2 VPNs.
+//
+// Each VPN provides essentially a multi-point L2 VPN over IPv6,
+// a.k.a. Virtual Private LAN Service (VPLS). A point-to-point VPN,
+// a.k.a. Virtual Private Wire Service (VPWS) is provided as a
+// degenerate case of a VPLS with exactly two endpoints (i.e. a single
+// pseudowire).  The general framework is described in RFC4664.
+//
+// The configuration is split into two parts.  The first part defines
+// the interfaces which are available for uplinks and attachment
+// circuits as well as their L2 and L3 properties.
+//
+// The second part defines the actual VPN endpoints which contain
+// references to the interfaces defined in the first part.
+//
+// See the README.md for details about the configuration.
+//
+// The module constructs a network of apps from such a specification
+// as follows.
+//
+// For each interface, the corresponding driver is instantiated with
+// the given configuration.  In non-trunking mode and without a L3
+// configuration, initialization is finished and other apps can link
+// directly to the driver.  For a L3 interface, the nd_light app is
+// attached to the driver and other apps attach to nd_light instead.
+//
+// If the interface is in trunking mode, an instance of the VlanMux
+// app from apps.vlan.vlan is instantiated and its "trunk" port is
+// connected to the interface.  For each sub-interface that contains a
+// L3 configuration, an instance of the nd_light app is attached to
+// the appropriate "vlan" link of the VlanMux app (for vlan = 0, the
+// corresponding VlanMux link is called "native").
+//
+// Each uplink of the VPLS configuration must reference a
+// L3-(sub-)interface of a previously defined physical interface.  For
+// each VPLS, the "uplink" link of the pseudowire-dispatch app is
+// connected to the "north" link of the ND module of its uplink
+// interface.
+//
+// The dispatch app provides the demultiplexing of incoming packets
+// based on the source and destination IPv6 addresses, which uniquely
+// identify a single pseudowire within one of the VPLS instances.
+//
+// An instance of apps.bridge.learning or apps.bridge.flooding is
+// created for every VPLS, depending on the selected bridge type.  The
+// bridge connects all pseudowires and attachment circuits of the
+// VPLS.  The pseudowires are assigned to a split horizon group,
+// i.e. packets arriving on any of those links are only forwarded to
+// the attachment circuits and not to any of the other pseudowires
+// (this is a consequence of the full-mesh topology of the pseudowires
+// of a VPLS).  All attachment circuits defined for a VPLS must
+// reference a L2 interface or sub-interface.  In non-trunking mode,
+// the interface driver is connected directly to the bridge module.
+// In trunking mode, the corresponding "vlan" links of the VlanMux app
+// are connected to the bridge instead.
+//
+// Every pseudowire can have its own tunnel configuration or it can
+// inherit a default configuration for the entire VPLS instance.
+//
+// Finally, all pseudowires of the VPLS instance are connected to the
+// dispatcher on the "ac" side.
+//
+// If a VPLS consists of a single PW and a single AC, the resulting
+// two-port bridge is optimized away by creating a direct link between
+// the two.  The VPLS thus turns into a VPWS.
+
+// config = {
+//   [ shmem_dir = <shmem_dir> , ]
+//   [ snmp = { enable = true | false,
+//              interval = <interval> }, ]
+//   interfaces = {
+//     {
+//       name = <name>,
+//       [ description = <description>, ]
+//       driver = {
+//         path = <path>,
+//         name = <name>,
+//         config = {
+//           pciaddr = <pciaddress>,
+//         },
+//         [ extra_config = <extra_config>, ]
+//       },
+//       [ mirror = {
+//           [ rx = true | false | <rx_name>, ]
+//           [ tx = true | false | <tx_name>, ]
+//           [ type = 'tap' | 'pcap', ]
+//         }, ]
+//       mtu = <mtu>,
+//       [ -- only allowed if trunk.enable == false
+//         afs = {
+//           ipv6 = {
+//             address = <address>,
+//             next_hop = <next_hop>,
+//             [ next_hop_mac = <neighbor_mac> ]
+//           }
+//         }, ]
+//       [ trunk = {
+//           enable = true | false,
+//           encapsulation = "dot1q" | "dot1ad" | <number>,
+//           vlans = {
+//             {
+//               [ description = <description>, ]
+//               vid = <vid>,
+//               [ afs = {
+//                   ipv6 = {
+//                     address = <address>,
+//                     next_hop = <next_hop>,
+//                     [ next_hop_mac = <next_hop_mac> ]
+//                   }
+//                 } ]
+//              },
+//              ...
+//           }
+//         } ]
+//     }
+//   },
+//   vpls = {
+//     <vpls1> = {
+//       [ description = <description> ,]
+//       vc_id = <vc_id>,
+//       mtu = <mtu>,
+//       address = <ipv6-address>,
+//       uplink = <int>,
+//       bridge = {
+//         type = "flooding"|"learning",
+//         [ config = <bridge-config> ]
+//       },
+//       [ tunnel = <tunnel-config>, ]
+//       [ cc = <cc-config>, ]
+//       ac = {
+//         <ac1> = <int>
+//         <ac2> = ...
+//       },
+//       pw = {
+//         <pw1> = {
+//            address = <ipv6-address>,
+//            [ tunnel = <tunnel-config> ],
+//            [ cc = <cc-config> ]
+//         },
+//         <pw2> = ...
+//       },
+//     },
+//     <vpls2> = ...
+//   }
+// }
+module(...,package.seeall);
+
+var ffi = require("ffi");
+var C = ffi.C;
+var usage_msg = require("program.l2vpn.README_inc");
+var lib = require("core.lib");
+var counter = require("core.counter");
+var macaddress = require("lib.macaddress");
+var shm = require("core.shm");
+var const = require("syscall.linux.constants");
+var S = require("syscall");
+var app_graph = require("core.config");
+var leader = require("apps.config.leader").Leader;
+var ipv6 = require("lib.protocol.ipv6");
+var dipatch = require("program.l2vpn.dispatch").dispatch;
+var Tap = require("apps.tap.tap").Tap;
+var Tee = require("apps.basic.basic_apps").Tee;
+var PcapWriter = require("apps.pcap.pcap").PcapWriter;
+var Sink = require("apps.basic.basic_apps").Sink;
+var VlanMux = require("apps.vlan.vlan").VlanMux;
+var nd_light = require("apps.ipv6.nd_light").nd_light;
+var dispatch = require("program.l2vpn.dispatch").dispatch;
+var pseudowire = require("program.l2vpn.pseudowire").pseudowire;
+var ifmib = require("lib.ipc.shmem.iftable_mib");
+
+var bridge_types = { flooding = true, learning = true };
+
+function usage () {
+   print(usage_msg);
+   main.exit(0);
+}
+
+var state;
+var function clear_state () {
+   state =  {
+      apps = {},
+      links = {},
+      intfs = {},
+      nds = {},
+   };
+}
+
+var App = {};
+function App::new (name, class, initial_arg) {
+   // assert(not state.apps[name], "Duplicate app "..name)
+   var self = setmetatable({}, { __index = App });
+   state.apps[name] = self;
+   self._name = name;
+   self._class = class;
+   self->arg(initial_arg);
+   return self;
+}
+
+function App::name () {
+   return this._name;
+}
+
+function App::class () {
+   return this._class;
+}
+
+function App::arg (arg) {
+   if( arg == null ) { return this._arg; }
+   this._arg = arg;
+}
+
+function App::connector (input, output) {
+   assert(input);
+   output = output || input;
+   return {
+      input = function () {
+         return this->name()..'.'..input;
+      },
+      output = function () {
+         return this->name()..'.'..output;
+      }
+   };
+}
+
+var function connect (from, to) {
+   table.insert(state.links, from.output()..' -> '..to.input());
+}
+
+var function connect_duplex (from, to) {
+   connect(from, to);
+   connect(to, from);
+}
+
+var function normalize_name (name) {
+   return string.gsub(name, '[/%.]', '_');
+}
+
+// Helper functions to abstract from driver-specific behaviour.  The
+// key into this table is the full path to the module used to create
+// the driver object. For each driver, the following functions must be
+// defined
+//   link_names ()
+//     Return the name of the links used for input and ouput
+//   stats_path (driver)
+//     This function is called after the driver has been created
+//     and receives the driver object as input.  It returns the
+//     path to the shm frame where the driver stores its stats counters.
+var driver_helpers = {
+   ['apps.intel_mp.intel_mp.Intel'] = {
+      link_names = function () {
+         return 'input', 'output';
+      },
+      stats_path = function (intf) {
+         return 'pci/'..intf.pci_address;
+      }
+   },
+   ['apps.tap.tap.Tap'] = {
+      link_names = function () {
+         return 'input', 'output';
+      },
+      stats_path = function (intf) {
+         return 'apps/'..intf.app->name();
+      }
+   },
+};
+
+function parse_intf(config) {
+   assert(config.name, "Missing interface name");
+   print("Setting up interface "..config.name);
+   print("  Description: "..(config.description || "<none>"));
+   var intf = {
+      description = config.description,
+      name = config.name,
+      // The normalized name is used in app and link names
+      nname = normalize_name(config.name),
+   };
+
+   // NIC driver
+   assert(config.driver, "Missing driver configuration");
+   var drv_c = config.driver;
+   assert(drv_c.path && drv_c.name &&
+             drv_c.config, "Incomplete driver configuration");
+   if( type(drv_c.config) == "table" ) {
+      if( (drv_c.config.pciaddr) ) {
+         print("  PCI address: "..drv_c.config.pciaddr);
+	 intf.pci_address = drv_c.config.pciaddr;
+      }
+      drv_c.config.mtu = config.mtu;
+      if( drv_c.extra_config ) {
+         // If present, extra_config must be a table, whose elements
+         // are merged with the regular config.  This feature allows
+         // for more flexibility when the configuration is created by
+         // a Lua-agnostic layer on top, e.g. by a NixOS module
+         assert(type(drv_c.extra_config) == "table",
+                "Driver extra configuration must be a table");
+         for( k, v in pairs(drv_c.extra_config) ) {
+            drv_c.config[k] = v;
+         }
+      }
+   }
+   intf.app = App->new('intf_'..intf.nname,
+                      require(drv_c.path)[drv_c.name], drv_c.config);
+   var driver_helper = driver_helpers[drv_c.path.."."..drv_c.name];
+   assert(driver_helper,
+          "Unsupported driver (missing driver helper)"
+             ..drv_c.path.."."..drv_c.name);
+   intf.driver_helper = driver_helper;
+   intf.connector = intf.app->connector(driver_helper.link_names());
+
+   // L2 configuration
+   print("  L2 configuration");
+   assert(config.mtu, "Missing MTU");
+   print("    MTU: "..config.mtu);
+   intf.mtu = config.mtu;
+
+   // Port mirror configuration
+   if( config.mirror ) {
+      var mirror = config.mirror;
+      var mtype = mirror.type || 'tap';
+      assert(type(mtype) == "string", "Mirror type must be a string");
+      for( _, dir in ipairs({ 'rx', 'tx' }) ) {
+         var mirror_connector;
+         if( mirror[dir] ) {
+            if( mtype == "pcap" ) {
+               var file;
+               if( type(mirror[dir]) == "string" ) {
+                  file = mirror[dir];
+               } else {
+                  file = '/tmp/'..string.gsub(config.name, "/", "-")
+                     .."_"..dir..".pcap";
+               }
+               var xmirror = App->new('tap_'..intf.nname..'_pcap_'..dir, //DADBUG
+                                      PcapWriter, file);
+               mirror_connector = xmirror->connector('input');
+               print("    "..dir.." port-mirror on pcap file "..file);
+            } else if( mtype == "tap" ) {
+               var tap_name;
+               if( type(mirror[dir]) == "string" ) {
+                  tap_name = mirror[dir];
+               } else {
+                  tap_name = string.gsub(config.name, "/", "-");
+                  tap_name = string.sub(tap_name, 0, const.IFNAMSIZ-3).."_"..dir;
+               }
+               var xmirror = App->new('tap_'..intf.nname..'_'..dir, //DADBUG
+                                      Tap, { name = tap_name, mtu = config.mtu});
+               mirror_connector = xmirror->connector('input', 'output');
+               var sink = App->new('sink_'..intf.nname..'_tap_'..dir,
+                                    Sink);
+               connect(mirror_connector, sink->connector('input'));
+               print("    "..dir.." port-mirror on tap interface "..tap_name);
+            } else {
+               error("Illegal mirror type: "..mtype);
+            }
+            var tee = App->new('tee_'..intf.nname..'_'..dir, Tee);
+            connect(tee->connector('mirror'), mirror_connector);
+            if( dir == "rx" ) {
+               connect(intf.connector, tee->connector('input'));
+               intf.connector.output = tee->connector('pass').output;
+            } else {
+               connect(tee->connector('pass'), intf.connector);
+               intf.connector.input = tee->connector('input').input;
+            }
+         }
+      }
+   }
+
+   var afs_procs = {
+      ipv6 = function (config, vid, connector, indent) {
+         assert(config.address, "Missing address");
+         assert(config.next_hop, "Missing next-hop");
+         // FIXME: check fo uniqueness of subnet
+         print(indent.."    Address: "..config.address.."/64");
+         print(indent.."    Next-Hop: "..config.next_hop);
+         if( config.next_hop_mac ) {
+            print(indent.."    Next-Hop MAC address: "
+                     ..config.next_hop_mac);
+         }
+         var nd = App->new('nd_'..intf.nname..((vid && "_"..vid) || ''),
+                            nd_light,
+                            { local_ip  = config.address,
+                              local_mac = "00:00:00:00:00:00",
+                              remote_mac = config.next_hop_mac,
+                              next_hop = config.next_hop,
+                              quiet = true });
+         state.nds[nd->name()] = { app = nd, intf = intf };
+         connect_duplex(nd->connector('south'), connector);
+         return nd->connector('north');
+      }
+   };
+
+   var function process_afs (afs, vid, connector, indent) {
+      print(indent.."  Address family configuration");
+      var config = afs.ipv6;
+      assert(config, "IPv6 configuration missing");
+      print(indent.."    IPv6");
+      return afs_procs.ipv6(config, vid, connector, indent.."  ");
+   }
+
+   var trunk = config.trunk || { enable = false };
+   assert(type(trunk) == "table", "Trunk configuration must be a table");
+   if( trunk.enable ) {
+      // The interface is configured as a VLAN trunk. Attach an
+      // instance of the VLAN multiplexer.
+      print("    Trunking mode: enabled");
+      intf.subintfs = {};
+      assert(! config.afs,
+             "Address family configuration not allowed in trunking mode");
+      var encap = trunk.encapsulation || "dot1q";
+      assert(encap == "dot1q" || encap == "dot1ad" ||
+                (type(encap) == "number"),
+             "Illegal encapsulation mode "..encap);
+      print("      Encapsulation "..
+               (type(encap) == "string" && encap
+                   || string.format("ether-type 0x%04x", encap)));
+      var vmux = App->new('vmux_'..intf.nname, VlanMux,
+                           { encapsulation = encap });
+      connect_duplex(vmux->connector('trunk'), intf.connector);
+
+      // Process VLANs and create sub-interfaces
+      assert(trunk.vlans, "Missing VLAN configuration on trunk port");
+      print("  Sub-Interfaces");
+      for( n, vlan in ipairs(trunk.vlans) ) {
+         var vid = vlan.vid;
+         assert(vid, "Missing VLAN ID for sub-interface #"..n);
+         assert(type(vid) == "number" && vid >= 0 && vid < 4095,
+                "Invalid VLAN ID "..vid.." for sub-interface #"..n);
+         var name = config.name..'.'..vid;
+         assert(! intf.subintfs[name], "Duplicate VID: "..vid);
+         var subintf = {
+            name = name,
+            // The normalized name is used in app and link names
+            nname = normalize_name(name),
+            description = vlan.description,
+            vlan = true,
+            phys_intf = intf,
+            // The effective MTU of the VLAN port
+            mtu = intf.mtu-4,
+         };
+         intf.subintfs[name] = subintf;
+         print("    "..config.name.."."..vid);
+         print("      Description: "..(vlan.description || '<none>'));
+         print("      L2 configuration");
+         print("        VLAN ID: "..(vid > 0 && vid || "<untagged>"));
+         var connector = vmux->connector((vid == 0 && 'native') || 'vlan'..vid);
+         if( vlan.afs ) {
+            subintf.connector = process_afs(vlan.afs, vid, connector
+                                            , "    ");
+            subintf.l3 = true;
+         } else {
+            subintf.connector = connector;
+            subintf.l3 = false;
+         }
+
+         // Store a copy of the vmux connector to find the proper shm
+         // frame for the interface counters later on
+         subintf.vmux_connector = connector;
+      }
+   } else {
+      print("    Trunking mode: disabled");
+      if( config.afs ) {
+         intf.connector = process_afs(config.afs, null, intf.connector, "");
+         intf.l3 = true;
+      } else {
+         intf.l3 = false;
+      }
+   }
+
+   return intf;
+}
+
+function parse_config (main_config) {
+   var intfs_config = main_config.interfaces;
+   assert(intfs_config, "Missing interfaces configuration");
+   var intfs = state.intfs;
+   for( _, config in ipairs(intfs_config) ) {
+      var intf = parse_intf(config);
+      assert(! intfs[intf.name], "Duplicate interface name: "..intf.name);
+      intfs[intf.name] = intf;
+      for( name, subintf in pairs(intf.subintfs || {}) ) {
+         intfs[name] = subintf;
+      }
+   }
+
+   var vpls_config = main_config.vpls;
+   assert(vpls_config, "Missing VPLS configuration");
+
+   var dispatchers = {};
+   var bridge_groups = {};
+   for( vpls_name, vpls in pairs(vpls_config) ) {
+      var function assert_vpls (cond, msg) {
+         assert(cond, "VPLS "..vpls_name..": "..msg);
+      }
+
+      print("Creating VPLS instance "..vpls_name
+            .." ("..(vpls.description || "<no description>")..")");
+      assert_vpls(vpls.vc_id, "Missing VC ID");
+      print("  VC ID: "..vpls.vc_id);
+      assert_vpls(vpls.mtu, "Missing MTU");
+      print("  MTU: "..vpls.mtu);
+      assert_vpls(vpls.address, "Mssing address");
+      print("  Address: "..vpls.address);
+
+      assert_vpls(vpls.ac, "Missing ac configuration");
+      assert_vpls(vpls.pw, "Missing pseudowire configuration");
+
+      var uplink = vpls.uplink;
+      assert_vpls(uplink, "missing uplink");
+      assert(type(uplink) == "string",
+             "Uplink interface specifier must be a string");
+      var intf = intfs[uplink];
+      assert_vpls(intf, "Uplink interface "..uplink.." does not exist");
+      assert_vpls(intf.l3, "Uplink interface "..uplink
+                     .." is L2 when L3 is expected");
+      print("  Uplink is on "..uplink);
+      intf.used = true;
+      var tunnel = vpls.tunnel;
+      var cc = vpls.cc;
+
+      var dispatcher = dispatchers[uplink];
+      if( ! dispatcher ) {
+         dispatcher = App->new('disp_'..normalize_name(uplink),
+                              dispatch, {});
+         dispatchers[uplink] = dispatcher;
+         var south = dispatcher->connector('south');
+         connect(intf.connector, south);
+         connect(south, intf.connector);
+      }
+      var bridge_group = {
+         config = vpls.bridge || { type = 'flooding' },
+         pws = {},
+         acs = {}
+      };
+      assert(bridge_types[bridge_group.config.type],
+             "Invalid bridge type: "..bridge_group.config.type);
+      bridge_groups[vpls_name] = bridge_group;
+      print("  Creating pseudowires");
+      for( name, pw in pairs(vpls.pw) ) {
+         print("    "..name);
+         assert(tunnel || pw.tunnel,
+                "Missing tunnel configuration for pseudowire"
+                   .." and no default specified");
+         assert(pw.address, "Missing remote address configuration");
+         print("      Address: "..pw.address);
+         var link_name = vpls_name..'_'..name;
+         dispatcher->arg()[link_name] = { source = ipv6->pton(pw.address),
+                                         destination = ipv6->pton(vpls.address) };
+         var app = App->new('pw_'..vpls_name..'_'..name,
+                             pseudowire,
+                             { name = vpls_name..'_'..name,
+                               vc_id = vpls.vc_id,
+                               mtu = vpls.mtu,
+                               shmem_dir = main_config.shmem_dir,
+                               description = vpls.description,
+                               transport = { type = 'ipv6',
+                                             src = vpls.address,
+                                             dst = pw.address },
+                               tunnel = pw.tunnel || tunnel,
+                               cc = pw.cc || cc || null });
+         connect_duplex(dispatcher->connector(link_name), app->connector('uplink'));
+         table.insert(bridge_group.pws, app);
+      }
+
+      print("  Creating attachment circuits");
+      for( name, ac in pairs(vpls.ac) ) {
+         print("    "..name);
+         assert(type(ac) == "string",
+                "AC interface specifier must be a string");
+         print("      AC is on "..ac);
+         var xintf = intfs[ac];
+         assert_vpls(xintf, "AC interface "..ac.." does not exist");
+         assert_vpls(! xintf.l3, "AC interface "..ac
+                        .." is L3 when L2 is expected");
+         table.insert(bridge_group.acs, xintf);
+         xintf.used = true;
+         // Note: if the AC is the native VLAN on a trunk, the actual packets
+         // can carry frames which exceed the nominal MTU by 4 bytes.
+         assert(vpls.mtu == xintf.mtu, "MTU mismatch between "
+                   .."VPLS ("..vpls.mtu..") and interface "
+                   ..ac.." ("..xintf.mtu..")");
+      }
+   }
+
+   for( vpls_name, bridge_group in pairs(bridge_groups) ) {
+      if( #bridge_group.pws == 1 && #bridge_group.acs == 1 ) {
+         // No bridge needed for a p2p VPN
+         var pw, ac = bridge_group.pws[1], bridge_group.acs[1];
+         var pw_connector = pw->connector('ac');
+         connect_duplex(pw->connector('ac'), ac.connector);
+         // For a p2p VPN, pass the name of the AC
+         // interface so the PW module can set up the
+         // proper service-specific MIB
+         pw->arg().interface = bridge_group.acs[1].name;
+      } else {
+         var bridge =
+            App->new('bridge_'..vpls_name,
+                    require("apps.bridge."..bridge_group.config.type).bridge,
+                    { ports = {},
+                      split_horizon_groups = { pw = {} },
+                      config = bridge_group.config.config });
+         for( _, pw in ipairs(bridge_group.pws) ) {
+            connect_duplex(pw->connector('ac'),
+                           bridge->connector(pw->name()));
+            table.insert(bridge->arg().split_horizon_groups.pw, pw->name());
+         }
+         for( _, ac in ipairs(bridge_group.acs) ) {
+            var ac_name = normalize_name(ac.name);
+            connect_duplex(ac.connector,
+                           bridge->connector(ac_name));
+            table.insert(bridge->arg().ports, ac_name);
+         }
+      }
+   }
+
+   // Create sinks for interfaces not used as uplink or AC
+   for( name, intf in pairs(intfs) ) {
+      if( ! intf.used && ! intf.subintfs ) {
+         var sink = App->new('sink_'..intf.nname,
+                              Sink, {});
+         connect_duplex(intf.connector, sink->connector('input'));
+      }
+   }
+}
+
+var function setup_shm_and_snmp (main_config) {
+   // For each interface, attach to the shm frame that stores
+   // the statistics counters
+   for( _, intf in pairs(state.intfs) ) {
+      if( ! intf.vlan ) {
+         var stats_path = intf.driver_helper.stats_path(intf);
+         intf.stats = shm.open_frame(stats_path);
+      }
+   }
+   // Commit all counters to the backing store to make them available
+   // immediately through the read-only frames we just created
+   counter.commit();
+
+   var snmp = main_config.snmp || { enable = false };
+   if( snmp.enable ) {
+      for( name, intf in pairs(state.intfs) ) {
+         if( ! intf.vlan ) {
+            // Set up SNMP for physical interfaces
+            var stats = intf.stats;
+            if( stats ) {
+               ifmib.init_snmp( { ifDescr = name,
+                                  ifName = name,
+                                  ifAlias = intf.description, },
+                  string.gsub(name, '/', '-'), stats,
+                  main_config.shmem_dir, snmp.interval || 5);
+            } else {
+               print("Can't enable SNMP for interface "..name
+                        ..": no statistics counters available");
+            }
+         } else {
+            // Set up SNMP for sub-interfaces
+            counter_t = ffi.typeof("struct counter");
+            var counters = {};
+            var function map (c) {
+               return (c && ffi.cast("struct counter *", c)) || null;
+            }
+            counters.type = counter_t();
+            if( intf.l3 ) {
+               counters.type.c = 0x1003ULL; // l3ipvlan
+            } else {
+               counters.type.c = 0x1002ULL; // l2vlan
+            }
+            // Inherit the operational status, MAC address, MTU, speed
+            // from the physical interface
+            var stats = intf.phys_intf.stats;
+            counters.status = map(stats.status);
+            counters.macaddr = map(stats.macaddr);
+            counters.mtu = map(stats.mtu);
+            counters.speed = map(stats.speed);
+
+            // Create mappings to the counters of the relevant VMUX
+            // link The VMUX app replaces the physical network for a
+            // sub-interface.  Hence, its output is what the
+            // sub-interface receives and its input is what the
+            // sub-interface transmits to the "virtual wire".
+            var function find_linkspec (pattern) {
+               pattern = string.gsub(pattern, '%.', '%%.');
+               for( _, linkspec in ipairs(state.links) ) {
+                  if( string.match(linkspec, pattern) ) {
+                     return linkspec;
+                  }
+               }
+               error("No links match pattern: "..pattern);
+            }
+            var tstats = shm.open_frame(
+               find_linkspec('^'..intf.vmux_connector.output()));
+            var rstats = shm.open_frame(
+               find_linkspec(intf.vmux_connector.input()..'$'));
+            counters.rxpackets = map(tstats.txpackets);
+            counters.rxbytes = map(tstats.txbytes);
+            counters.rxdrop = map(tstats.txdrop);
+            counters.txpackets = map(rstats.rxpackets);
+            counters.txbytes = map(rstats.rxbytes);
+            ifmib.init_snmp( { ifDescr = name,
+                               ifName = name,
+                               ifAlias = intf.description, },
+               string.gsub(name, '/', '-'), counters,
+               main_config.shmem_dir, snmp.interval || 5);
+         }
+      }
+   }
+}
+
+var function create_app_graph () {
+   var graph = app_graph.new();
+   for( name, app in pairs(state.apps) ) {
+      app_graph.app(graph, app->name(), app->class(), app->arg());
+   }
+   for( _, linkspec in ipairs(state.links) ) {
+      app_graph.link(graph, linkspec);
+   }
+   return graph;
+}
+
+var long_opts = {
+   duration = "D",
+   reconfig = "r",
+   logfile = "l",
+   debug = "d",
+   jit = "j",
+   help = "h",
+};
+
+function run (parameters) {
+   var duration = 0;
+   var reconfig = false;
+   var jit_conf = {};
+   var jit_opts = {};
+   var opt = {};
+   function opt.D (arg) {
+      if( arg->match("^[0-9]+$") ) {
+         duration = tonumber(arg);
+      } else {
+         usage();
+      }
+   }
+   function opt.l (arg) {
+      var logfh = assert(io.open(arg, "a"));
+      lib.logger_default.fh = logfh;
+   }
+   function opt.h (arg) { usage(); }
+   function opt.d (arg) { _G.developer_debug = true; }
+   function opt.j (arg) {
+      if( arg->match("^v") ) {
+         var file = arg->match("^v=(.*)");
+         if( file == '' ) { file = null; }
+         require("jit.v").start(file);
+      } else if( arg->match("^p") ) {
+         jit_conf.p = {};
+         var p = jit_conf.p;
+         p.opts, p.file = arg->match("^p=([^,]*),?(.*)");
+         if( p.file == '' ) { p.file = null; }
+      } else if( arg->match("^dump") ) {
+         jit_conf.dump = {};
+         var dump = jit_conf.dump;
+         dump.opts, dump.file = arg->match("^dump=([^,]*),?(.*)");
+         if( dump.file == '' ) { dump.file = null; }
+      } else if( arg->match("^opt") ) {
+         var opt = arg->match("^opt=(.*)");
+         table.insert(jit_opts, opt);
+      }
+   }
+   function opt.r (arg) { reconfig = true; }
+
+   // Parse command line arguments
+   parameters = lib.dogetopt(parameters, opt, "hdj:D:l:r", long_opts);
+   if( (reconfig && ! (duration > 0)) ) {
+      print("--reconfig requires --duration > 0 to take effect");
+      usage();
+   }
+
+   // Defaults: sizemcode=32, maxmcode=512
+   require("jit.opt").start('sizemcode=256', 'maxmcode=2048');
+   if( #jit_opts ) {
+      require("jit.opt").start(unpack(jit_opts));
+   }
+   if( #parameters != 1 ) { usage (); }
+
+   var file = table.remove(parameters, 1);
+
+   var engine_opts = { no_report = true };
+   if( duration != 0 ) { engine_opts.duration = duration; }
+   if( jit_conf.p ) {
+      require("jit.p").start(jit_conf.p.opts, jit_conf.p.file);
+   }
+   if( jit_conf.dump ) {
+      require("jit.dump").start(jit_conf.dump.opts, jit_conf.dump.file);
+   }
+   var mtime = 0;
+   var loop = true;
+   while( loop ) {
+      var stat, err = S.stat(file);
+      if( ! stat ) {
+         error("Can't stat "..file..": "..tostring(err));
+      }
+      if( mtime != stat.mtime ) {
+         // This is a very crude and disruptive way to pick up changes
+         // of the configuration while the system is running. It
+         // requires setting -D to a reasonable non-zero value. By
+         // default, the configuration is instantiated only once and
+         // engine.main() runs indefinitely.  The proper way to do
+         // this is to write a YANG schema and use core.config.
+         print("Instantiating configuration");
+         clear_state();
+         var main_config = assert(loadfile(file))();
+         parse_config(main_config);
+         engine.configure(create_app_graph());
+         setup_shm_and_snmp(main_config);
+         // Reconfigure ND apps with proper MAC addresses from the
+         // interfaces to which they are attached
+         for( name, nd in pairs(state.nds) ) {
+            nd.app->arg().local_mac =
+               macaddress->new(counter.read(nd.intf.stats.macaddr)).bytes;
+         }
+         engine.configure(create_app_graph());
+         jit.flush();
+      }
+      mtime = stat.mtime;
+      engine.main(engine_opts);
+      loop = reconfig;
+   }
+   if( jit_conf.p ) {
+      require("jit.p").stop();
+   }
+}

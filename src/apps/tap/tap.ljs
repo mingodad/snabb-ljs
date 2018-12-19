@@ -1,0 +1,256 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+module(..., package.seeall);
+
+var S = require("syscall");
+var link = require("core.link");
+var packet = require("core.packet");
+var counter = require("core.counter");
+var ethernet = require("lib.protocol.ethernet");
+var macaddr = require("lib.macaddress");
+var ffi = require("ffi");
+var C = ffi.C;
+var const = require("syscall.linux.constants");
+var os = require("os");
+var lib = require("core.lib");
+var band, bor, bnot = bit.band, bit.bor, bit.bnot;
+
+var t = S.types.t;
+
+Tap = { };
+// The original version of this driver expected the name of the tap
+// device as only configuration option.  To be backwards compatible,
+// we don't use the automatic arg checking capability of core.config,
+// hence the name _config instead of config for this table.
+Tap._config = {
+   name = { required = true },
+   mtu = { default = 1514 },
+   mtu_fixup = { default = true },
+   mtu_offset = { default = 14 },
+   mtu_set = { default = null },
+};
+
+// Get or set the MTU of a tap device.  Return the current value.
+var function _mtu (sock, ifr, mtu) {
+   var op = "SIOCGIFMTU";
+   if( mtu ) {
+      op = "SIOCSIFMTU";
+      ifr.ivalue = mtu;
+   }
+   var ok, err = sock->ioctl(op, ifr);
+   if( ! ok ) {
+      error(op.." failed for tap device " .. ifr.name
+               .. ": " ..tostring(err));
+   }
+   return ifr.ivalue;
+}
+
+// Get or set the operational status of a tap device.  Return the
+// current status.
+var function _status (sock, ifr, status) {
+   var ok, err = sock->ioctl("SIOCGIFFLAGS", ifr);
+   if( ! ok ) {
+      error("Error getting flags for tap device " .. ifr.name
+               .. ": " .. tostring(err));
+   }
+   if( status != null ) {
+      if( status == 1 ) {
+         // up
+         ifr.flags = bor(ifr.flags, const.IFF.UP);
+      } else {
+         // down
+         ifr.flags = band(ifr.flags, bnot(const.IFF.UP));
+      }
+      ok, err = sock->ioctl("SIOCSIFFLAGS", ifr);
+      if( ! ok ) {
+         error("Error setting flags for tap device " .. ifr.name
+                  .. ": " .. tostring(err));
+      }
+   } else {
+      if( band(ifr.flags, const.IFF.UP) != 0 ) {
+         return 1; // up
+      } else {
+         return 2; // down
+      }
+   }
+}
+
+// Get the MAC address of a tap device as a int64_t
+var function _macaddr (sock, ifr) {
+   var ok, err = sock->ioctl("SIOCGIFHWADDR", ifr);
+   if( ! ok ) {
+      error("Error getting MAC address for tap device "
+               .. ifr.name ..": " .. tostring(err));
+   }
+   var sa = ifr.hwaddr;
+   if( sa.sa_family != const.ARPHRD.ETHER ) {
+      error("Tap interface " .. ifr.name
+               .. " is not of type ethernet: " .. sa.sa_family);
+   } else {
+      return macaddr->new(ffi.cast("uint64_t*", sa.sa_data)[0]).bits;
+   }
+}
+
+function Tap::new (conf) {
+   // Backwards compatibility
+   if( type(conf) == "string" ) {
+      conf = { name = conf };
+   }
+   conf = lib.parse(conf, this._config);
+
+   var ephemeral = ! S.stat('/sys/class/net/'..conf.name);
+   var fd, err = S.open("/dev/net/tun", "rdwr, nonblock");
+   assert(fd, "Error opening /dev/net/tun: " .. tostring(err));
+   var ifr = t.ifreq();
+   ifr.flags = "tap, no_pi";
+   ifr.name = conf.name;
+   var ok;
+   ok, err = fd->ioctl("TUNSETIFF", ifr);
+   if( ! ok ) {
+      fd->close();
+      error("ioctl(TUNSETIFF) failed on /dev/net/tun: " .. tostring(err));
+   }
+
+   // A dummy socket to perform SIOC{G,S}IF* ioctl() calls. Any
+   // PF/type would do.
+   var sock;
+   sock, err = S.socket(const.AF.PACKET, const.SOCK.RAW, 0);
+   if( ! sock ) {
+      fd->close();
+      error("Error creating ioctl socket for tap device: " .. tostring(err));
+   }
+
+   if( ephemeral ) {
+      // Set status to "up"
+      _status(sock, ifr, 1);
+   }
+   var mtu_eff = conf.mtu - (conf.mtu_fixup && conf.mtu_offset) || 0;
+   var mtu_set = conf.mtu_set;
+   if( mtu_set == null ) {
+      mtu_set = ephemeral;
+   }
+   if( mtu_set ) {
+      _mtu(sock, ifr, mtu_eff);
+   } else {
+      var mtu_configured = _mtu(sock, ifr);
+      assert(mtu_configured == mtu_eff,
+             "Mismatch of IP MTU on tap device " .. conf.name
+                .. ": expected " .. mtu_eff .. ", configured "
+                .. mtu_configured);
+   }
+
+   return setmetatable({fd = fd,
+                        sock = sock,
+                        ifr = ifr,
+                        name = conf.name,
+                        status_timer = lib.throttle(0.001),
+                        pkt = packet.allocate(),
+                        shm = { rxbytes   = {counter},
+                                rxpackets = {counter},
+                                rxmcast   = {counter},
+                                rxbcast   = {counter},
+                                txbytes   = {counter},
+                                txpackets = {counter},
+                                txmcast   = {counter},
+                                txbcast   = {counter},
+                                type      = {counter, 0x1001}, // propVirtual
+                                status    = {counter, _status(sock, ifr)},
+                                mtu       = {counter, conf.mtu},
+                                speed     = {counter, 0},
+                                macaddr   = {counter, _macaddr(sock, ifr)} }},
+      {__index = Tap});
+}
+
+function Tap::status() {
+   counter.set(this.shm.status, _status(this.sock, this.ifr));
+}
+
+function Tap::pull () {
+   var l = this.output.output;
+   if( l == null ) { return; }
+   if( this.status_timer() ) {
+      this->status();
+   }
+   for( i=1,engine.pull_npackets ) {
+      var len, err = S.read(this.fd, this.pkt.data, C.PACKET_PAYLOAD_SIZE);
+      // errno == EAGAIN indicates that the read would have blocked as there is no
+      // packet waiting. It is not a failure.
+      if( ! len && err.errno == const.E.AGAIN ) {
+         return;
+      }
+      if( ! len ) {
+         error("Failed read on " .. this.name .. ": " .. tostring(err));
+      }
+      this.pkt.length = len;
+      link.transmit(l, this.pkt);
+      counter.add(this.shm.rxbytes, len);
+      counter.add(this.shm.rxpackets);
+      if( ethernet->is_mcast(this.pkt.data) ) {
+         counter.add(this.shm.rxmcast);
+      }
+      if( ethernet->is_bcast(this.pkt.data) ) {
+         counter.add(this.shm.rxbcast);
+      }
+      this.pkt = packet.allocate();
+   }
+}
+
+function Tap::push () {
+   var l = this.input.input;
+   while( ! link.empty(l) ) {
+      // The write might have blocked so don't dequeue the packet from the link
+      // until the write has completed.
+      var p = link.front(l);
+      var len, err = S.write(this.fd, p.data, p.length);
+      // errno == EAGAIN indicates that the write would of blocked
+      if( ! len && err.errno != const.E.AGAIN || len && len != p.length ) {
+         error("Failed write on " .. this.name .. tostring(err));
+      }
+      if( len != p.length && err.errno == const.E.AGAIN ) {
+         return;
+      }
+      counter.add(this.shm.txbytes, len);
+      counter.add(this.shm.txpackets);
+      if( ethernet->is_mcast(p.data) ) {
+         counter.add(this.shm.txmcast);
+      }
+      if( ethernet->is_bcast(p.data) ) {
+         counter.add(this.shm.txbcast);
+      }
+      // The write completed so dequeue it from the link and free the packet
+      link.receive(l);
+      packet.free(p);
+   }
+}
+
+function Tap::stop() {
+   this.fd->close();
+   this.sock->close();
+}
+
+function selftest() {
+   // tapsrc and tapdst are bridged together in linux. Packets are sent out of tapsrc and they are expected
+   // to arrive back on tapdst.
+
+   // The linux bridge does mac address learning so some care must be taken with the preparation of selftest.cap
+   // A mac address should appear only as the source address or destination address
+
+   // This test should only be run from inside apps/tap/selftest.sh
+   if( ! os.getenv("SNABB_TAPTEST") ) { os.exit(engine.test_skipped_code); }
+   var Synth = require("apps.test.synth").Synth;
+   var Match = require("apps.test.match").Match;
+   var c = config.new();
+   config.app(c, "tap_in", Tap, "tapsrc");
+   config.app(c, "tap_out", Tap, "tapdst");
+   config.app(c, "match", Match, {fuzzy=true,modest=true});
+   config.app(c, "comparator", Synth, {dst="00:50:56:fd:19:ca",
+                                       src="00:0c:29:3e:ca:7d"});
+   config.app(c, "source", Synth, {dst="00:50:56:fd:19:ca",
+                                   src="00:0c:29:3e:ca:7d"});
+   config.link(c, "comparator.output->match.comparator");
+   config.link(c, "source.output->tap_in.input");
+   config.link(c, "tap_out.output->match.rx");
+   engine.configure(c);
+   engine.main({duration = 0.01, report = {showapps=true,showlinks=true}});
+   assert(#engine.app_table.match->errors() == 0);
+}

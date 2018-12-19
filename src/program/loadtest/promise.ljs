@@ -1,0 +1,75 @@
+module(..., package.seeall);
+
+Promise = {};
+Promise.__index = Promise;
+
+var function is_promise(val) {
+   return type(val) == 'table' && val.and_then;
+}
+
+var function curry(f, ...) {
+   var curried_args = { ... };
+   if( #curried_args == 0 ) { return f; }
+   return function(...) {
+      var args = { ... };
+      // Prepend the curried args to the passed ones, in the correct order:
+      // if curried_args == (A, B), args == (C, D) -> (B, C, D) -> (A, B, C, D)
+      for( i=#curried_args, 1, -1 ) {
+         table.insert(args, 1, curried_args[i]);
+      }
+      return f(unpack(args));
+   };
+}
+
+function new(transform, ...) {
+   if( transform ) {
+      transform = curry(transform, ...);
+   } else {
+      transform = function(...) { return ...; };
+   }
+   
+   var ret = {
+      resolved = false,
+      next = null,
+      transform = transform
+   };
+   return setmetatable(ret, Promise);
+}
+
+function Promise::dispatch_next() {
+   assert(this.next);
+   assert(this.resolved);
+   this.next->resolve(unpack(this.vals));
+}
+
+function Promise::resolve(...) {
+   assert(! this.resolved);
+   this.resolved = true;
+   this.vals = { this.transform(...) };
+   if( #this.vals == 1 && is_promise(this.vals[1]) ) {
+      var new_next, old_next = this.vals[1], this.next;
+      this.next = null;
+      if( old_next ) { new_next->chain(old_next); }
+   } else if( this.next ) {
+      this->dispatch_next();
+   }
+}
+
+function Promise::chain(next) {
+   assert(next);
+   assert(! next.resolved);
+   assert(! this.next);
+   this.next = next;
+   if( this.resolved ) { this->dispatch_next(); }
+   return next;
+}
+
+function Promise::and_then(f, ...) {
+   return this->chain(new(f, ...));
+}
+
+function Wait(s) {
+   var p = new();
+   timer.activate(timer.new("wait", function() { p->resolve(); }, s * 1e9));
+   return p;
+}

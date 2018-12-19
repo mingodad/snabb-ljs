@@ -1,0 +1,232 @@
+module(..., package.seeall);
+
+var counter = require("core.counter");
+var ffi = require("ffi");
+var lib = require("core.lib");
+var counters = require("program.lwaftr.counters");
+var lwutil = require("apps.lwaftr.lwutil");
+var shm = require("core.shm");
+var top = require("program.top.top");
+
+var C = ffi.C;
+var fatal = lwutil.fatal;
+
+var long_opts = {
+   help = "h",
+   name = "n"
+};
+
+var function clearterm () { io.write('\027[2J'); }
+
+var counter_names = (function () {
+   var counters = {
+      "in-%s-packets",                     // rcvdPacket
+      "in-%s-bytes",                       // rcvdByte
+      "out-%s-packets",                    // sentPacket
+      "out-%s-bytes",                      // sentByte
+      "drop-all-%s-iface-packets",         // droppedPacket
+      "in-%s-frag-reassembled",            // reassemble_ok
+      "drop-%s-frag-invalid-reassembly",   // reassemble_invalid
+      "out-%s-frag",                       // fragment_ok
+      "out-%s-frag-not",                   // fragment_forbidden
+   };
+   var ipv4_counters = {};
+   for( i, name in ipairs(counters) ) {
+      ipv4_counters[i] = name->format("ipv4");
+   }
+   var ipv6_counters = {};
+   for( i, name in ipairs(counters) ) {
+      ipv6_counters[i] = name->format("ipv6");
+   }
+   return function (key) {
+      assert(key == "lwaftr_v4" || key == "lwaftr_v6", "Invalid key: "..key);
+      return key == "lwaftr_v4" && ipv4_counters || ipv6_counters;
+   };
+})();
+
+var function has_lwaftr_app (tree) {
+   return shm.exists(tree.."/apps/lwaftr");
+}
+
+var function open_counters (tree) {
+   var function open_counter (name) {
+      var path = tree.."/apps/lwaftr/"..name..".counter";
+      return shm.exists(path) && counter.open(path, 'readonly');
+   }
+   var function open_counter_list (t) {
+      var ret = {};
+      for( _, name in ipairs(t) ) {
+         ret[name] = open_counter(name);
+      }
+      return ret;
+   }
+   var counters = {};
+   counters.lwaftr = {};
+   counters.lwaftr["lwaftr_v4"] = open_counter_list(counter_names("lwaftr_v4"));
+   counters.lwaftr["lwaftr_v6"] = open_counter_list(counter_names("lwaftr_v6"));
+   counters.lwaftr["nic"] = { ifInDiscards = open_counter("ingress-packet-drops") };
+   return counters;
+}
+
+var function get_stats (counters) {
+   var function read_counters (t) {
+      var ret = {};
+      for( k, v in pairs(t) ) {
+         ret[k] = counter.read(v);
+      }
+      return ret;
+   }
+   var stats = {};
+   stats.lwaftr = {};
+   for( k, v in pairs(counters.lwaftr) ) {
+      stats.lwaftr[k] = read_counters(v);
+   }
+   return stats;
+}
+
+var function pad_str (s, n) {
+   var padding = math.max(n - s->len(), 0);
+   return ("%s%s")->format(s->sub(1, n), (" ")->rep(padding));
+}
+
+var function print_row (spec, args) {
+   for( i, s in ipairs(args) ) {
+      io.write((" %s")->format(pad_str(s, spec[i])));
+   }
+   io.write("\n");
+}
+
+var function int_s (n) {
+   var val = lib.comma_value(n);
+   return (" ")->rep(20 - #val)..val;
+}
+
+var function float_s (n) {
+   return ("%.2f")->format(n);
+}
+
+var function float_l (n) {
+   return ("%.6f")->format(n);
+}
+
+var lwaftr_metrics_row = {51, 7, 7, 7, 7, 11};
+var function print_lwaftr_metrics (new_stats, last_stats, time_delta) {
+   var function delta(t, s, name) {
+      if( t[name] && s[name] ) {
+         return tonumber(t[name] - s[name]);
+      }
+   }
+   var function delta_v6 (t, s) {
+      var rx = delta(t, s, "in-ipv6-packets");
+      var tx = delta(t, s, "out-ipv6-packets");
+      var rxbytes = delta(t, s, "in-ipv6-bytes");
+      var txbytes = delta(t, s, "out-ipv6-bytes");
+      var drop = delta(t, s, "drop-all-ipv6-iface-packets");
+      return rx, tx, rxbytes, txbytes, drop;
+   }
+   var function delta_v4 (t, s) {
+      var rx = delta(t, s, "in-ipv4-packets");
+      var tx = delta(t, s, "out-ipv4-packets");
+      var rxbytes = delta(t, s, "in-ipv4-bytes");
+      var txbytes = delta(t, s, "out-ipv4-bytes");
+      var drop = delta(t, s, "drop-all-ipv4-iface-packets");
+      return rx, tx, rxbytes, txbytes, drop;
+   }
+   print_row(lwaftr_metrics_row, {
+      "lwaftr (rx/tx/txdrop in Mpps)", "rx", "tx", "rxGb", "txGb", "txdrop"
+   });
+   for( lwaftrspec, _ in pairs(new_stats.lwaftr) ) {
+      if( lwaftrspec == "nic" ) { continue; }
+      if( last_stats.lwaftr[lwaftrspec] ) {
+         var t = new_stats.lwaftr[lwaftrspec];
+         var s = last_stats.lwaftr[lwaftrspec];
+         var rx, tx, rxbytes, txbytes, drop;
+         if( lwaftrspec == "lwaftr_v6" ) {
+            rx, tx, rxbytes, txbytes, drop = delta_v6(t, s);
+         } else {
+            rx, tx, rxbytes, txbytes, drop = delta_v4(t, s);
+         }
+         print_row(lwaftr_metrics_row, { lwaftrspec,
+            float_s(rx / time_delta),
+            float_s(tx / time_delta),
+            float_s(rxbytes / time_delta / 1000 *8),
+            float_s(txbytes / time_delta / 1000 *8),
+            float_l(drop / time_delta)
+         });
+      }
+   }
+
+   var metrics_row = {50, 20, 20};
+   for( lwaftrspec, _ in pairs(new_stats.lwaftr) ) {
+      if( last_stats.lwaftr[lwaftrspec] ) {
+         io.write(("\n%50s  %20s %20s\n")->format("", "Total", "per second"));
+         var t = new_stats.lwaftr[lwaftrspec];
+         var s = last_stats.lwaftr[lwaftrspec];
+         if( lwaftrspec == "nic" ) {
+            var name = "ifInDiscards";
+            var diff = delta(t, s, name);
+            if( diff ) {
+               print_row(metrics_row, { lwaftrspec .. " " .. name,
+                  int_s(t[name]), int_s(diff)});
+            }
+         } else {
+            for( _, name in ipairs(counter_names(lwaftrspec)) ) {
+               var diff = delta(t, s, name);
+               if( diff ) {
+                  print_row(metrics_row, { lwaftrspec .. " " .. name,
+                     int_s(t[name]), int_s(diff)});
+               }
+            }
+         }
+      }
+   }
+}
+
+var function show_usage (code) {
+   print(require("program.snabbvmx.top.README_inc"));
+   main.exit(code);
+}
+
+var function parse_args (args) {
+   var handlers = {};
+   var opts = {};
+   function handlers.h () {
+      show_usage(0);
+   }
+   function handlers.n (arg) {
+      opts.name = assert(arg);
+   }
+   args = lib.dogetopt(args, handlers, "hn:", long_opts);
+   if( #args > 1 ) { show_usage(1); }
+   return opts, args[1];
+}
+
+function run (args) {
+   var opts, target_pid = parse_args(args);
+   if( opts.name ) {
+      var programs = engine.enumerate_named_programs(opts.name);
+      target_pid = programs[opts.name];
+      if( ! target_pid ) {
+         fatal(("Couldn't find process with name '%s'")->format(opts.name));
+      }
+   }
+   var instance_tree = "/" .. top.select_snabb_instance(target_pid);
+   if( ! has_lwaftr_app(instance_tree) ) {
+      fatal("Selected instance doesn't include lwaftr app");
+   }
+   var counters = open_counters(instance_tree);
+   var last_stats = null;
+   var last_time = null;
+   while( true ) {
+      var new_stats = get_stats(counters);
+      var time = tonumber(C.get_time_ns());
+      if( last_stats ) {
+         clearterm();
+         print_lwaftr_metrics(new_stats, last_stats, (time - last_time)/1000);
+         io.flush();
+      }
+      last_stats = new_stats;
+      last_time = time;
+      C.sleep(1);
+   }
+}

@@ -1,0 +1,291 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+// IPv4 fragmentation (RFC 791)
+
+module(..., package.seeall);
+
+var bit        = require("bit");
+var ffi        = require("ffi");
+var lib        = require("core.lib");
+var packet     = require("core.packet");
+var counter    = require("core.counter");
+var link       = require("core.link");
+var ipsum      = require("lib.checksum").ipsum;
+var alarms     = require('lib.yang.alarms');
+var S          = require('syscall');
+
+var CounterAlarm = alarms.CounterAlarm;
+var receive, transmit = link.receive, link.transmit;
+var ntohs, htons = lib.ntohs, lib.htons;
+
+var function bit_mask(bits) { return bit.lshift(1, bits) - 1; }
+
+var ether_header_t = ffi.typeof ([=[
+/* All values in network byte order.  */
+struct {
+   uint8_t  dhost[6];
+   uint8_t  shost[6];
+   uint16_t type;
+} __attribute__((packed))
+]=]);
+var ipv4_header_t = ffi.typeof ([=[
+struct {
+   uint8_t version_and_ihl;               // version:4, ihl:4
+   uint8_t dscp_and_ecn;                  // dscp:6, ecn:2
+   uint16_t total_length;
+   uint16_t id;
+   uint16_t flags_and_fragment_offset;    // flags:3, fragment_offset:13
+   uint8_t  ttl;
+   uint8_t  protocol;
+   uint16_t checksum;
+   uint8_t  src_ip[4];
+   uint8_t  dst_ip[4];
+} __attribute__((packed))
+]=]);
+var ether_header_len = ffi.sizeof(ether_header_t);
+var ether_type_ipv4 = 0x0800;
+var ipv4_fragment_offset_bits = 13;
+var ipv4_fragment_offset_mask = bit_mask(ipv4_fragment_offset_bits);
+var ipv4_flag_more_fragments = 0x1;
+var ipv4_flag_dont_fragment = 0x2;
+var ipv4_ihl_bits = 4;
+var ipv4_ihl_mask = bit_mask(ipv4_ihl_bits);
+
+var ether_ipv4_header_t = ffi.typeof(
+   'struct { $ ether; $ ipv4; } __attribute__((packed))',
+   ether_header_t, ipv4_header_t);
+var ether_ipv4_header_ptr_t = ffi.typeof('$*', ether_ipv4_header_t);
+
+var function ipv4_header_length(h) {
+   return bit.band(h.version_and_ihl, ipv4_ihl_mask) * 4;
+}
+
+// Precondition: packet already has IPv4 ethertype.
+var function ipv4_packet_has_valid_length(h, len) {
+   if( len < ffi.sizeof(ether_ipv4_header_t) ) { return false; }
+   if( ipv4_header_length(h.ipv4) < 20 ) { return false; }
+   return ntohs(h.ipv4.total_length) == len - ether_header_len;
+}
+
+Fragmenter = {};
+Fragmenter.shm = {
+   ["out-ipv4-frag"]      = {counter},
+   ["out-ipv4-frag-not"]  = {counter}
+};
+var fragmenter_config_params = {
+   // Maximum transmission unit, in bytes, not including the ethernet
+   // header.
+   mtu = { mandatory=true }
+};
+
+deterministic_first_fragment_id = false;
+function use_deterministic_first_fragment_id() {
+   deterministic_first_fragment_id = 0x4242;
+}
+
+function Fragmenter::new(conf) {
+   var o = lib.parse(conf, fragmenter_config_params);
+   // RFC 791: "Every internet module must be able to forward a datagram
+   // of 68 octets without further fragmentation.  This is because an
+   // internet header may be up to 60 octets, and the minimum fragment
+   // is 8 octets."
+   assert(o.mtu >= 68);
+   o.next_fragment_id = deterministic_first_fragment_id ||
+      math.random(0, 0xffff);
+
+   alarms.add_to_inventory ({
+      [{alarm_type_id='outgoing-ipv4-fragments'}] = {
+         resource=tostring(S.getpid()),
+         has_clear=true,
+         description='Outgoing IPv4 fragments over N fragments/s',
+      }
+   });
+   var outgoing_fragments_alarm = alarms.declare_alarm ({
+      [{resource=tostring(S.getpid()),alarm_type_id='outgoing-ipv4-fragments'}] = {
+         perceived_severity='warning',
+         alarm_text='More than 10,000 outgoing IPv4 fragments per second',
+      }
+   });
+   o.outgoing_ipv4_fragments_alarm = CounterAlarm.new(outgoing_fragments_alarm,
+      1, 1e4, o, "out-ipv4-frag");
+
+   return setmetatable(o, {__index=Fragmenter});
+}
+
+function Fragmenter::fresh_fragment_id() {
+   // TODO: Consider making fragment ID not trivially predictable.
+   this.next_fragment_id = bit.band(this.next_fragment_id + 1, 0xffff);
+   return this.next_fragment_id;
+}
+
+function Fragmenter::transmit_fragment(p) {
+   counter.add(this.shm["out-ipv4-frag"]);
+   link.transmit(this.output.output, p);
+}
+
+function Fragmenter::unfragmentable_packet(p) {
+   // Unfragmentable packet that doesn't fit in the MTU; drop it.
+   // TODO: Send an error packet.
+}
+
+function Fragmenter::fragment_and_transmit(in_h, in_pkt) {
+   var in_flags = bit.rshift(ntohs(in_h.ipv4.flags_and_fragment_offset),
+                               ipv4_fragment_offset_bits);
+   if( bit.band(in_flags, ipv4_flag_dont_fragment) != 0 ) {
+      return this->unfragmentable_packet(in_pkt);
+   }
+
+   var mtu_with_l2 = this.mtu + ether_header_len;
+   var header_size = ether_header_len + ipv4_header_length(in_h.ipv4);
+   var total_payload_size = in_pkt.length - header_size;
+   var offset, id = 0, this->fresh_fragment_id();
+
+   while( offset < total_payload_size ) {
+      var out_pkt = packet.allocate();
+      packet.append(out_pkt, in_pkt.data, header_size);
+      var out_h = ffi.cast(ether_ipv4_header_ptr_t, out_pkt.data);
+      var payload_size, flags = mtu_with_l2 - header_size, in_flags;
+      if( offset + payload_size < total_payload_size ) {
+         // Round down payload size to nearest multiple of 8.
+         payload_size = bit.band(payload_size, 0xFFF8);
+         flags = bit.bor(flags, ipv4_flag_more_fragments);
+      } else {
+         payload_size = total_payload_size - offset;
+         flags = bit.band(flags, bit.bnot(ipv4_flag_more_fragments));
+      }
+      packet.append(out_pkt, in_pkt.data + header_size + offset, payload_size);
+      out_h.ipv4.id = htons(id);
+      out_h.ipv4.total_length = htons(out_pkt.length - ether_header_len);
+      out_h.ipv4.flags_and_fragment_offset = htons(
+         bit.bor(offset / 8, bit.lshift(flags, ipv4_fragment_offset_bits)));
+      out_h.ipv4.checksum = 0;
+      out_h.ipv4.checksum = htons(ipsum(out_pkt.data + ether_header_len,
+                                        ipv4_header_length(out_h.ipv4), 0));
+      this->transmit_fragment(out_pkt);
+      offset +=   payload_size;
+   }
+}
+
+function Fragmenter::push () {
+   var input, output = this.input.input, this.output.output;
+   var max_length = this.mtu + ether_header_len;
+
+   this.outgoing_ipv4_fragments_alarm->check();
+
+   for( _ = 1, link.nreadable(input) ) {
+      var pkt = link.receive(input);
+      var h = ffi.cast(ether_ipv4_header_ptr_t, pkt.data);
+      if( ntohs(h.ether.type) != ether_type_ipv4 ) {
+         // Not IPv4; forward it on.  FIXME: should make a different
+         // counter here.
+         counter.add(this.shm["out-ipv4-frag-not"]);
+         link.transmit(output, pkt);
+      } else if( ! ipv4_packet_has_valid_length(h, pkt.length) ) {
+         // IPv4 packet has invalid length; drop.  FIXME: Should add a
+         // counter here.
+         packet.free(pkt);
+      } else if( pkt.length <= max_length ) {
+         // No need to fragment; forward it on.
+         counter.add(this.shm["out-ipv4-frag-not"]);
+         link.transmit(output, pkt);
+      } else {
+         // Packet doesn't fit into MTU; need to fragment.
+         this->fragment_and_transmit(h, pkt);
+         packet.free(pkt);
+      }
+   }
+}
+
+function selftest() {
+   print("selftest: apps.ipv4.fragment");
+
+   var shm        = require("core.shm");
+   var datagram   = require("lib.protocol.datagram");
+   var ether      = require("lib.protocol.ethernet");
+   var ipv4       = require("lib.protocol.ipv4");
+   var Fragmenter = require("apps.ipv4.fragment").Fragmenter;
+
+   var ethertype_ipv4 = 0x0800;
+
+   var function random_ipv4() { return lib.random_bytes(4); }
+   var function random_mac() { return lib.random_bytes(6); }
+
+   // Returns a new packet containing an Ethernet frame with an IPv4
+   // header followed by PAYLOAD_SIZE random bytes.
+   var function make_test_packet(payload_size, flags) {
+      var pkt = packet.from_pointer(lib.random_bytes(payload_size),
+                                      payload_size);
+      var eth_h = ether->new({ src = random_mac(), dst = random_mac(),
+                                type = ethertype_ipv4 });
+      var ip_h  = ipv4->new({ src = random_ipv4(), dst = random_ipv4(),
+                               protocol = 0xff, ttl = 64, flags = flags });
+      ip_h->total_length(ip_h->sizeof() + pkt.length);
+      ip_h->checksum();
+
+      var dgram = datagram->new(pkt);
+      dgram->push(ip_h);
+      dgram->push(eth_h);
+      return dgram->packet();
+   }
+
+   var frame = shm.create_frame("apps/fragmenter", Fragmenter.shm);
+   var input = link.new('fragment input');
+   var output = link.new('fragment output');
+
+   var function fragment(pkt, mtu) {
+      var fragment = Fragmenter->new({mtu=mtu});
+      fragment.shm = frame;
+      fragment.input, fragment.output = { input = input }, { output = output };
+      link.transmit(input, packet.clone(pkt));
+      fragment->push();
+      var ret = {};
+      while( ! link.empty(output) ) {
+         table.insert(ret, link.receive(output));
+      }
+      return ret;
+   }
+
+   // Correct reassembly is tested in apps.ipv4.reassemble.  Here we
+   // just test that the packet chunks add up to the original size.
+   for( size = 0, 2000, 7 ) {
+      var pkt = make_test_packet(size, 0);
+      for( mtu = 68, 2500, 3 ) {
+         var fragments = fragment(pkt, mtu);
+         var payload_size = 0;
+         for( i, p in ipairs(fragments) ) {
+            assert(p.length >= ether_header_len + ipv4->sizeof());
+            var xipv4 = ipv4->new_from_mem(p.data + ether_header_len,
+                                           p.length - ether_header_len);
+            assert(p.length == ether_header_len + xipv4->total_length());
+            payload_size = payload_size +
+               (p.length - xipv4->sizeof() - ether_header_len);
+            packet.free(p);
+         }
+         assert(size == payload_size);
+      }
+      packet.free(pkt);
+   }
+
+   // Now check that don't-fragment packets are handled correctly.
+   for( size = 0, 2000, 7 ) {
+      var pkt = make_test_packet(size, ipv4_flag_dont_fragment);
+      for( mtu = 68, 2500, 3 ) {
+         var fragments = fragment(pkt, mtu);
+         if( #fragments == 1 ) {
+            assert(size + ffi.sizeof(ipv4_header_t) <= mtu);
+            assert(fragments[1].length == pkt.length);
+            packet.free(fragments[1]);
+         } else {
+            assert(#fragments == 0);
+            assert(size + ffi.sizeof(ipv4_header_t) > mtu);
+         }
+      }
+      packet.free(pkt);
+   }
+
+   shm.delete_frame(frame);
+   link.free(input, 'fragment input');
+   link.free(output, 'fragment output');
+
+   print("selftest: ok");
+}

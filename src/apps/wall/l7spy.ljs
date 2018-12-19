@@ -1,0 +1,36 @@
+module(..., package.seeall);
+
+var util = require("apps.wall.util");
+var link = require("core.link");
+var now  = require("core.app").now;
+var C    = require("ffi").C;
+
+
+L7Spy = setmetatable({}, util.SouthAndNorth);
+L7Spy.__index = L7Spy;
+
+function L7Spy::new (s) {
+   if( s.scanner == null ) {
+      s.scanner = "ndpi";
+   }
+
+   var scanner = s.scanner;
+   if( type(scanner) == "string" ) {
+      scanner = require("apps.wall.scanner." .. scanner)->new();
+   }
+
+   return setmetatable({ scanner = scanner }, this);
+}
+
+function L7Spy::push () {
+   this.time = now();
+   this->push_northbound();
+   this->push_southbound();
+}
+
+function L7Spy::on_southbound_packet (p) {
+   this.scanner->scan_packet(p, this.time);
+   return p;
+}
+
+L7Spy.on_northbound_packet = L7Spy.on_southbound_packet;

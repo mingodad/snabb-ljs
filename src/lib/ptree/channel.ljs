@@ -1,0 +1,232 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+module(...,package.seeall);
+
+// A channel is a ring buffer used by the manager to send updates to a
+// worker.  Each worker has its own ring buffer and is the only reader
+// to the buffer.  The manager is the only writer to these buffers also.
+// The ring buffer is just bytes; putting a message onto the buffer will
+// write a header indicating the message size, then the bytes of the
+// message.  The channel ring buffer is mapped into shared memory.
+// Access to a channel will never block or cause a system call.
+
+var ffi = require('ffi');
+var S = require("syscall");
+var lib = require('core.lib');
+var shm = require('core.shm');
+
+var ring_buffer_t = ffi.typeof([=[struct {
+   uint32_t read;
+   uint32_t write;
+   uint32_t size;
+   uint8_t buf[?];
+}]=]);
+
+// Q: Why not just use shm.map?
+// A: We need a variable-sized mapping.
+var function create_ring_buffer (name, size) {
+   var path = shm.resolve(name);
+   shm.mkdir(lib.dirname(path));
+   path = shm.root..'/'..path;
+   var fd, err = S.open(path, "creat, rdwr, excl", '0664');
+   if( ! fd ) {
+      err = tostring(err || "unknown error");
+      error('error creating file "'..path..'": '..err);
+   }
+   var len = ffi.sizeof(ring_buffer_t, size);
+   assert(fd->ftruncate(len), "ring buffer: ftruncate failed");
+   var mem;
+   mem, err = S.mmap(null, len, "read, write", "shared", fd, 0);
+   fd->close();
+   if( mem == null ) { error("mmap failed: " .. tostring(err)); }
+   mem = ffi.cast(ffi.typeof("$*", ring_buffer_t), mem);
+   ffi.gc(mem, function (ptr) { S.munmap(ptr, len); });
+   mem.size = size;
+   return mem;
+}
+
+var function open_ring_buffer (name) {
+   var path = shm.resolve(name);
+   path = shm.root..'/'..path;
+   var fd, err = S.open(path, "rdwr");
+   if( ! fd ) {
+      err = tostring(err || "unknown error");
+      error('error opening file "'..path..'": '..err);
+   }
+   var stat = S.fstat(fd);
+   var len = stat && stat.size;
+   if( len < ffi.sizeof(ring_buffer_t, 0) ) {
+      error("unexpected size for ring buffer");
+   }
+   var mem;
+   mem, err = S.mmap(null, len, "read, write", "shared", fd, 0);
+   fd->close();
+   if( mem == null ) { error("mmap failed: " .. tostring(err)); }
+   mem = ffi.cast(ffi.typeof("$*", ring_buffer_t), mem);
+   ffi.gc(mem, function (ptr) { S.munmap(ptr, len); });
+   if( len != ffi.sizeof(ring_buffer_t, mem.size) ) {
+      error("unexpected ring buffer size: "..tostring(len));
+   }
+   return mem;
+}
+
+var function to_uint32 (num) {
+   var buf = ffi.new('uint32_t[1]');
+   buf[0] = num;
+   return buf[0];
+}
+
+var function read_avail (ring) {
+   lib.compiler_barrier();
+   return to_uint32(ring.write - ring.read);
+}
+
+var function write_avail (ring) {
+   return ring.size - read_avail(ring);
+}
+
+Channel = {};
+
+// Messages typically encode up to 3 or 4 strings like app names, link
+// names, module names, or the like.  All of that and the length headers
+// probably fits within 256 bytes per message certainly.  So make room
+// for around 4K messages, why not.
+var default_buffer_size = 1024*1024;
+function create(name, size) {
+   var ret = {};
+   size = size || default_buffer_size;
+   ret.ring_buffer = create_ring_buffer(name, size);
+   return setmetatable(ret, {__index=Channel});
+}
+
+function open(name) {
+   var ret = {};
+   ret.ring_buffer = open_ring_buffer(name);
+   return setmetatable(ret, {__index=Channel});
+}
+
+// The coordination needed between the reader and the writer is that:
+//
+//  1. If the reader sees a a bumped write pointer, that the data written
+//     to the ring buffer will be available to the reader, i.e. the writer
+//     has done whatever is needed to synchronize the data.
+//
+//  2. It should be possible for the reader to update the read pointer
+//     without stompling other memory, notably the write pointer.
+//
+//  3. It should be possible for the writer to update the write pointer
+//     without stompling other memory, notably the read pointer.
+//
+//  4. Updating a write pointer or a read pointer should eventually be
+//     visible to the reader or writer, respectively.
+//
+// The full memory barrier after updates to the read or write pointer
+// ensures (1).  The x86 memory model, and the memory model of C11,
+// guarantee (2) and (3).  For (4), the memory barrier on the writer
+// side ensures that updates to the read or write pointers are
+// eventually visible to other CPUs, but we also have to insert a
+// compiler barrier before reading them to prevent LuaJIT from caching
+// their value somewhere else, like in a register.  See
+// https://www.kernel.org/doc/Documentation/memory-barriers.txt for more
+// discussion on memory models, and
+// http://www.freelists.org/post/luajit/Compiler-loadstore-barrier-volatile-pointer-barriers-in-general,3
+// for more on compiler barriers in LuaJIT.
+//
+// If there are multiple readers or writers, they should serialize their
+// accesses through some other mechanism.
+//
+
+// Put some bytes onto the channel, but without updating the write
+// pointer.  Precondition: the caller has checked that COUNT bytes are
+// indeed available for writing.
+function Channel::put_bytes(bytes, count, offset) {
+   offset = offset || 0;
+   var ring = this.ring_buffer;
+   var start = (ring.write + offset) % ring.size;
+   if( start + count > ring.size ) {
+      var head = ring.size - start;
+      ffi.copy(ring.buf + start, bytes, head);
+      ffi.copy(ring.buf, bytes + head, count - head);
+   } else {
+      ffi.copy(ring.buf + start, bytes, count);
+   }
+}
+
+// Peek some bytes into the channel.  If the COUNT bytes are contiguous,
+// return a pointer into the channel.  Otherwise allocate a buffer for
+// those bytes and return that.  Precondition: the caller has checked
+// that COUNT bytes are indeed available for reading.
+function Channel::peek_bytes(count, offset) {
+   offset = offset || 0;
+   var ring = this.ring_buffer;
+   var start = (ring.read + offset) % ring.size;
+   var len;
+   if( start + count > ring.size ) {
+      var buf = ffi.new('uint8_t[?]', count);
+      var head_count = ring.size - start;
+      var tail_count = count - head_count;
+      ffi.copy(buf, ring.buf + start, head_count);
+      ffi.copy(buf + head_count, ring.buf, tail_count);
+      return buf;
+   } else {
+      return ring.buf + start;
+   }
+}
+
+function Channel::put_message(bytes, count) {
+   var ring = this.ring_buffer;
+   if( write_avail(ring) < count + 4 ) { return false; }
+   this->put_bytes(ffi.cast('uint8_t*', ffi.new('uint32_t[1]', count)), 4);
+   this->put_bytes(bytes, count, 4);
+   ring.write = ring.write + count + 4;
+   ffi.C.full_memory_barrier();
+   return true;
+}
+
+function Channel::peek_payload_len() {
+   var ring = this.ring_buffer;
+   var avail = read_avail(ring);
+   var count = 4;
+   if( avail < count ) { return null; }
+   var len = ffi.cast('uint32_t*', this->peek_bytes(4))[0];
+   if( avail < count + len ) { return null; }
+   return len;
+}
+
+function Channel::peek_message() {
+   var payload_len = this->peek_payload_len();
+   if( ! payload_len ) { return null, null; }
+   return this->peek_bytes(payload_len, 4), payload_len;
+}
+
+function Channel::discard_message(payload_len) {
+   var ring = this.ring_buffer;
+   ring.read = ring.read + payload_len + 4;
+   ffi.C.full_memory_barrier();
+}
+
+function selftest() {
+   print('selftest: lib.ptree.channel');
+   var msg_t = ffi.typeof('struct { uint8_t a; uint8_t b; }');
+   var ch = create('test/config-channel', (4+2)*16 + 1);
+   var function put(i) {
+      return ch->put_message(ffi.new('uint8_t[2]', {i, i+16}), 2);
+   }
+   for( _=1,4 ) {
+      for( i=1,16 ) { assert(put(i)); }
+      assert(! put(17));
+      var function assert_pop(i) {
+         var msg, len = ch->peek_message();
+         assert(msg);
+         assert(len == 2);
+         assert(msg[0] == i);
+         assert(msg[1] == i + 16);
+         ch->discard_message(len);
+      }
+      assert_pop(1);
+      assert(put(17));
+      for( i=2,17 ) { assert_pop(i); }
+      assert(! ch->peek_message());
+   }
+   print('selftest: channel ok');
+}

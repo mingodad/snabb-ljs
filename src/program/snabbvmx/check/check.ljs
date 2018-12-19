@@ -1,0 +1,51 @@
+module(..., package.seeall);
+
+var config = require("core.config");
+var lib = require("core.lib");
+var util = require("program.lwaftr.check.util");
+var counters = require("program.lwaftr.counters");
+var setup = require("program.snabbvmx.lwaftr.setup");
+
+var function show_usage(code) {
+   print(require("program.snabbvmx.check.README_inc"));
+   main.exit(code);
+}
+
+var function parse_args (args) {
+   var handlers = {};
+   var opts = {};
+   function handlers.h() { show_usage(0); }
+   function handlers.r() { opts.r = true; }
+   args = lib.dogetopt(args, handlers, "hrD:",
+      { help="h", regen="r", duration="D" });
+   if( #args != 5 && #args != 6 ) { show_usage(1); }
+   if( ! opts.duration ) { opts.duration = 0.10; }
+   return opts, args;
+}
+
+function run(args) {
+   var opts;
+   opts, args = parse_args(args);
+   var conf_file, inv4_pcap, inv6_pcap, outv4_pcap, outv6_pcap, counters_path =
+      unpack(args);
+
+   var c = config.new();
+   setup.load_check(c, conf_file, inv4_pcap, inv6_pcap, outv4_pcap, outv6_pcap);
+   engine.configure(c);
+   if( counters_path ) {
+      var initial_counters = counters.read_counters(c);
+      engine.main({duration=opts.duration});
+      var final_counters = counters.read_counters(c);
+      var counters_diff = util.diff_counters(final_counters,
+                                               initial_counters);
+      if( opts.r ) {
+         util.regen_counters(counters_diff, counters_path);
+      } else {
+         var req_counters = util.load_requested_counters(counters_path);
+         util.validate_diff(counters_diff, req_counters);
+      }
+   } else {
+      engine.main({duration=opts.duration});
+   }
+   print("done");
+}

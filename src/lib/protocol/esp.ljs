@@ -1,0 +1,50 @@
+module(..., package.seeall);
+var ffi = require("ffi");
+var header = require("lib.protocol.header");
+var lib = require("core.lib");
+var ntohl, htonl = lib.ntohl, lib.htonl;
+
+var esp = subClass(header);
+
+// Class variables
+esp._name = "esp";
+esp->init(
+   {
+      [1] = ffi.typeof([=[
+            struct {
+               uint32_t spi;
+               uint32_t seq_no;
+            } __attribute__((packed))
+      ]=])
+   });
+
+// Class methods
+
+function esp::new (config) {
+   var o = esp->superClass().new(this);
+   o->spi(config.spi);
+   o->seq_no(config.seq_no);
+   return o;
+}
+
+// Instance methods
+
+function esp::spi (spi) {
+   var h = this->header();
+   if( spi != null ) {
+      h.spi = htonl(spi);
+   } else {
+      return(ntohl(h.spi));
+   }
+}
+
+function esp::seq_no (seq_no) {
+   var h = this->header();
+   if( seq_no != null ) {
+      h.seq_no = htonl(seq_no);
+   } else {
+      return(ntohl(h.seq_no));
+   }
+}
+
+return esp;

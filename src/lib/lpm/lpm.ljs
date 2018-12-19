@@ -1,0 +1,140 @@
+module(..., package.seeall);
+
+var ffi = require("ffi");
+var C = ffi.C;
+var lib = require("core.lib");
+
+ffi.cdef([=[
+void free(void *ptr);
+void *malloc(int size);
+]=]);
+
+LPM = {};
+
+function LPM::new() {
+  return setmetatable({ alloc_map = {} }, { __index = this });
+}
+function LPM::alloc (name, ctype, count, idx) {
+    idx = idx || 0;
+    --idx    ; //DADBUG can be negative
+    var heap = {};
+    count = count || 0;
+
+    var function realloc (size) {
+      if( size == 0 ) { size = 1; }
+      var bytes = ffi.sizeof(ctype) * size;
+      var ptr_t = ffi.typeof("$*", ctype);
+      var ptr = assert(C.malloc(bytes));
+      ffi.fill(ptr, bytes);
+      ptr = ffi.cast(ptr_t, ptr);
+      if( this[name] ) {
+        ffi.copy(ptr, this[name], ffi.sizeof(ctype) * count);
+      }
+      this[name] = ffi.gc(ptr, C.free);
+      count = size;
+    }
+
+    this[name .. "_type"] = function() { return ctype; };
+    this[name .. "_length"] = function() { return count; };
+    this[name .. "_free"] = function(this, idx) { table.insert(heap, idx); };
+    this[name .. "_grow"] = function(this, factor) { realloc(count * (factor || 2)); };
+    this[name .. "_load"] = function(this, ptr, bytelength) {
+      count = bytelength / ffi.sizeof(ctype);
+      this[name] = ptr;
+      realloc(count);
+    };
+    this[name .. "_store"] = function(this, ptr) {
+      var bytes = ffi.sizeof(ctype) * count;
+      ffi.copy(ptr, this[name], bytes);
+      return bytes;
+    };
+
+    this[name .. "_new"] = function() {
+      if( table.getn(heap) == 0 ) {
+        if( idx + 1 == count ) {
+          realloc(count * 2);
+        }
+        ++idx    ;
+        return idx;
+      } else {
+        return table.remove(heap);
+      }
+    };
+
+    if( count > 0 ) {
+      realloc(count);
+    }
+    return this;
+}
+function LPM::alloc_store(bytes) {
+  bytes = ffi.cast("uint8_t *", bytes);
+  for( _,k in pairs(this.alloc_storable) ) {
+    var lenptr = ffi.cast("uint64_t *", bytes);
+    lenptr[0] = this[k .. "_store"](this, bytes + ffi.sizeof("uint64_t"));
+    bytes = bytes + lenptr[0] + ffi.sizeof("uint64_t");
+  }
+}
+function LPM::alloc_load(bytes) {
+  bytes = ffi.cast("uint8_t *", bytes);
+  for( _,k in pairs(this.alloc_storable) ) {
+    var lenptr = ffi.cast("uint64_t *", bytes);
+    this[k .. "_load"](this, bytes + ffi.sizeof("uint64_t"), lenptr[0]);
+    bytes = bytes + lenptr[0] + ffi.sizeof("uint64_t");
+  }
+}
+function selftest () {
+  var s = LPM->new();
+  s->alloc("test", ffi.typeof("uint64_t"), 2);
+  assert(s->test_new() == 0);
+  assert(s->test_new() == 1);
+  assert(s->test_new() == 2);
+  assert(s->test_new() == 3);
+  assert(s->test_new() == 4);
+  assert(s->test_new() == 5);
+  assert(s->test_new() == 6);
+  s->test_free(4);
+  s->test_free(3);
+  s->test_free(2);
+  s->test_free(5);
+  assert(s->test_new() == 5);
+  assert(s->test_new() == 2);
+  assert(s->test_new() == 3);
+  assert(s->test_new() == 4);
+  assert(s->test_new() == 7);
+  assert(s->test_type() == ffi.typeof("uint64_t"));
+  assert(s->test_length() == 8);
+  for( i = 0, 7 ) { s.test[i] = i; }
+  s->test_grow();
+  for( i =0,7 ) { assert(s.test[i] == i); }
+  assert(s->test_length() == 16);
+  s->test_grow(3);
+  assert(s->test_length() == 48);
+
+  var ptr = C.malloc(1024 * 1024);
+  var tab = {};
+  var ents = { "t1", "t2", "t3", "t4" };
+  for( i=1,3 ) {
+    tab[i] = LPM->new();
+    tab[i].alloc_storable = ents;
+    tab[i]->alloc("t1", ffi.typeof("uint8_t"), 16);
+    tab[i]->alloc("t2", ffi.typeof("uint16_t"), 16);
+    tab[i]->alloc("t3", ffi.typeof("uint32_t"), 16);
+    tab[i]->alloc("t4", ffi.typeof("uint64_t"), 16);
+  }
+  for( _, t in pairs(ents) ) {
+    for( j=0,127 ) {
+      tab[1][t][ tab[1][t.."_new"]() ] = math.random(206);
+    }
+  }
+
+  tab[1]->alloc_store(ptr);
+  tab[2]->alloc_load(ptr);
+  for( _, t in pairs(ents) ) {
+    for( j=0,127 ) {
+      assert(tab[1][t][j] == tab[2][t][j]);
+    }
+  }
+
+  C.free(ptr);
+
+}

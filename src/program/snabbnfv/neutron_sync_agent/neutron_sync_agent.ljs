@@ -1,0 +1,44 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+module(..., package.seeall);
+
+var lib  = require("core.lib");
+var syscall = require("syscall");
+var usage = require("program.snabbnfv.neutron_sync_agent.README_inc");
+var script = require("program.snabbnfv.neutron_sync_agent.neutron_sync_agent_sh_inc");
+
+var long_opts = {
+   ["neutron-dir"] = "d",
+   ["snabb-dir"]   = "s",
+   ["tmp-dir"]     = "t",
+   ["sync-host"]   = "h",
+   ["sync-port"]   = "P",
+   ["sync-path"]   = "p",
+   ["interval"]    = "i",
+   ["help"]        = "H"
+};
+
+function run (args) {
+   var conf = {
+      ["NEUTRON_DIR"]   = os.getenv("NEUTRON_DIR"),
+      ["SNABB_DIR"]     = os.getenv("SNABB_DIR"),
+      ["TMP_DIR"]       = os.getenv("TMP_DIR"),
+      ["NEUTRON2SNABB"] = os.getenv("NEUTRON2SNABB"),
+      ["SYNC_HOST"]     = os.getenv("SYNC_HOST"),
+      ["SYNC_PORT"]     = os.getenv("SYNC_PORT"),
+      ["SYNC_PATH"]     = os.getenv("SYNC_PATH"),
+      ["SYNC_INTERVAL"] = os.getenv("SYNC_INTERVAL")
+   };
+   var opt = {};
+   function opt.d (arg) { conf["NEUTRON_DIR"]   = arg; }
+   function opt.s (arg) { conf["SNABB_DIR"]     = arg; }
+   function opt.t (arg) { conf["TMP_DIR"]       = arg; }
+   function opt.h (arg) { conf["SYNC_HOST"]     = arg; }
+   function opt.P (arg) { conf["SYNC_PORT"]     = arg; }
+   function opt.p (arg) { conf["SYNC_PATH"]     = arg; }
+   function opt.i (arg) { conf["SYNC_INTERVAL"] = arg; }
+   function opt.H (arg) { print(usage); main.exit(1);   }
+   args = lib.dogetopt(args, opt, "d:s:t:h:P:p:i:H", long_opts);
+   for( key, value in pairs(conf) ) { S.setenv(key, value, true); }
+   lib.execv("/bin/bash", {"/bin/bash", "-c", script});
+}

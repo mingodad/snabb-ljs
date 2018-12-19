@@ -1,0 +1,105 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+module(..., package.seeall);
+
+var S = require("syscall");
+var lib = require("core.lib");
+var numa = require("lib.numa");
+var ingress_drop_monitor = require("lib.timers.ingress_drop_monitor");
+
+var function fatal (msg) {
+   print(msg);
+   main.exit(1);
+}
+
+var scheduling_opts = {
+   cpu = {},                  // CPU index (integer).
+   real_time = {},            // Boolean.
+   ingress_drop_monitor = {}, // Action string: one of 'flush' or 'warn'.
+   busywait = {default=true}, // Boolean.
+   j = {},                    // Profiling argument string, e.g. "p" or "v".
+   eval = {}                  // String.
+};
+
+var sched_apply = {};
+
+function sched_apply.cpu (cpu) {
+   print(string.format('Binding data plane PID %s to CPU %s.',
+                       tonumber(S.getpid()), cpu));
+   numa.bind_to_cpu(cpu);
+}
+
+function sched_apply.ingress_drop_monitor (action) {
+   timer.activate(ingress_drop_monitor.new({action=action})->timer());
+}
+
+function sched_apply.real_time (real_time) {
+   if( real_time && ! S.sched_setscheduler(0, "fifo", 1) ) {
+      fatal('Failed to enable real-time scheduling.  Try running as root.');
+   }
+}
+
+function sched_apply.j (arg) {
+   if( arg->match("^v") ) {
+      var file = arg->match("^v=(.*)");
+      if( file == '' ) { file = null; }
+      require("jit.v").start(file);
+   } else if( arg->match("^p") ) {
+      var opts, file = arg->match("^p=([^,]*),?(.*)");
+      if( file == '' ) { file = null; }
+      var prof = require('jit.p');
+      prof.start(opts, file);
+      var function report() { prof.stop(); prof.start(opts, file); }
+      timer.activate(timer.new('p', report, 10e9, 'repeating'));
+   } else if( arg->match("^dump") ) {
+      var opts, file = arg->match("^dump=([^,]*),?(.*)");
+      if( file == '' ) { file = null; }
+      require("jit.dump").on(opts, file);
+   } else if( arg->match("^tprof") ) {
+      var prof = require('lib.traceprof.traceprof');
+      prof.start();
+      var function report() { prof.stop(); prof.start(); }
+      timer.activate(timer.new('tprof', report, 10e9, 'repeating'));
+   }
+}
+
+function sched_apply.busywait (busywait) {
+   engine.busywait = busywait;
+}
+
+function sched_apply.eval (str) {
+   loadstring(str)();
+}
+
+function apply (opts) {
+   opts = lib.parse(opts, scheduling_opts);
+   for( k, v in pairs(opts) ) { sched_apply[k](v); }
+}
+
+var function stringify (x) {
+   if( type(x) == 'string' ) { return string.format('%q', x); }
+   if( type(x) == 'number' ) { return tostring(x); }
+   if( type(x) == 'boolean' ) { return x && 'true' || 'false'; }
+   assert(type(x) == 'table');
+   var ret = {"{"};
+   var first = true;
+   for( k,v in pairs(x) ) {
+      if( first ) { first = false; } else { table.insert(ret, ","); }
+      table.insert(ret, string.format('[%s]=%s', stringify(k), stringify(v)));
+   }
+   table.insert(ret, "}");
+   return table.concat(ret);
+}
+
+function stage (opts) {
+   return string.format("require('lib.scheduling').apply(%s)",
+                        stringify(lib.parse(opts, scheduling_opts)));
+}
+
+function selftest () {
+   print('selftest: lib.scheduling');
+   loadstring(stage({}))();
+   loadstring(stage({busywait=false}))();
+   loadstring(stage({eval='print("lib.scheduling: eval test")'}))();
+   print('selftest: ok');
+}

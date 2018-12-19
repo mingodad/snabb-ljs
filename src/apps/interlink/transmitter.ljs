@@ -1,0 +1,58 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+module(...,package.seeall);
+
+var shm = require("core.shm");
+var interlink = require("lib.interlink");
+
+var Transmitter = {name="apps.interlink.Transmitter"};
+
+function Transmitter::new (queue) {
+   packet.enable_group_freelist();
+   return setmetatable({attached=false, queue=queue}, {__index=Transmitter});
+}
+
+function Transmitter::link () {
+   var queue = this.queue || this.appname;
+   if( ! this.attached ) {
+      this.shm_name = "group/interlink/"..queue..".interlink";
+      this.backlink = "interlink/transmitter/"..queue..".interlink";
+      this.interlink = interlink.attach_transmitter(this.shm_name);
+      shm.alias(this.backlink, this.shm_name);
+      this.attached = true;
+   }
+}
+
+function Transmitter::push () {
+   var i, r = this.input.input, this.interlink;
+   while( ! (interlink.full(r) || link.empty(i)) ) {
+      var p = link.receive(i);
+      packet.account_free(p); // stimulate breathing
+      interlink.insert(r, p);
+   }
+   interlink.push(r);
+}
+
+function Transmitter::stop () {
+   if( this.attached ) {
+      interlink.detach_transmitter(this.interlink, this.shm_name);
+      shm.unlink(this.backlink);
+   }
+}
+
+// Detach transmitters to prevent leaking interlinks opened by pid.
+//
+// This is an internal API function provided for cleanup during
+// process termination.
+function Transmitter.shutdown (pid) {
+   for( _, queue in ipairs(shm.children("/"..pid.."/interlink/transmitter")) ) {
+      var backlink = "/"..pid.."/interlink/transmitter/"..queue..".interlink";
+      var shm_name = "/"..pid.."/group/interlink/"..queue..".interlink";
+      // Call protected in case /<pid>/group is already unlinked.
+      var ok, r = pcall(interlink.open, shm_name);
+      if( ok ) { interlink.detach_transmitter(r, shm_name); }
+      shm.unlink(backlink);
+   }
+}
+
+return Transmitter;

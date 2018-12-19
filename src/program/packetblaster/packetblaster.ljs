@@ -1,0 +1,76 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+module(..., package.seeall);
+
+var engine    = require("core.app");
+var timer     = require("core.timer");
+var lib       = require("core.lib");
+var pci       = require("lib.hardware.pci");
+var LoadGen   = require("apps.intel_mp.loadgen").LoadGen;
+var Intel82599 = require("apps.intel_mp.intel_mp").Intel82599;
+
+var function is_device_suitable (pcidev, patterns) {
+   if( ! pcidev.usable || ! pcidev.driver->match('intel') ) {
+      return false;
+   }
+   if( #patterns == 0 ) {
+      return true;
+   }
+   for( _, pattern in ipairs(patterns) ) {
+      if( pci.qualified(pcidev.pciaddress)->gmatch(pattern)() ) {
+         return true;
+      }
+   }
+}
+
+function run_loadgen (c, patterns, opts) {
+   assert(type(opts) == "table");
+   var use_loadgen = opts.loop == null || opts.loop;
+   var nics = 0;
+   pci.scan_devices();
+   for( _,device in ipairs(pci.devices) ) {
+      if( is_device_suitable(device, patterns) ) {
+         ++nics    ;
+         var name = "nic"..nics;
+         if( use_loadgen ) {
+            config.app(c, name, LoadGen, device.pciaddress);
+         } else {
+            config.app(c, name, Intel82599, {pciaddr = device.pciaddress});
+         }
+         config.link(c, "source."..tostring(nics).."->"..name..".input");
+      }
+   }
+   assert(nics > 0, "<PCI> matches no suitable devices.");
+   engine.busywait = true;
+   engine.configure(c);
+
+   var report = {};
+   if( use_loadgen ) {
+      var fn = function () {
+         print("Transmissions (last 1 sec):");
+         engine.report_apps();
+      };
+      var t = timer.new("report", fn, 1e9, 'repeating');
+      timer.activate(t);
+   } else {
+      report = {showlinks = true};
+   }
+
+   if( opts.duration ) { engine.main({duration=opts.duration, report=report});
+   } else {             engine.main(); }
+}
+
+var function show_usage(exit_code) {
+   print(require("program.packetblaster.README_inc"));
+   main.exit(exit_code);
+}
+
+function run(args) {
+   if( #args == 0 ) { show_usage(1); }
+   var command = string.gsub(table.remove(args, 1), "-", "_");
+   var modname = ("program.packetblaster.%s.%s")->format(command, command);
+   if( ! lib.have_module(modname) ) {
+      show_usage(1);
+   }
+   require(modname).run(args);
+}

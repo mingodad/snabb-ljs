@@ -1,0 +1,28 @@
+module(..., package.seeall);
+
+var counter = require("core.counter");
+var schema = require('lib.yang.schema');
+var data = require('lib.yang.data');
+var state = require('lib.yang.state');
+var S = require('syscall');
+
+function counter_names () {
+   var names = {};
+   var schema = schema.load_schema_by_name('snabb-softwire-v2');
+   for( k, node in pairs(schema.body['softwire-state'].body) ) {
+      if( node.kind == 'leaf' ) {
+         names[k] = data.normalize_id(k);
+      }
+   }
+   return names;
+}
+
+function read_counters (pid) {
+   var reader = state.state_reader_from_schema_by_name('snabb-softwire-v2');
+   var s = reader(state.counters_for_pid(pid || S.getpid()));
+   var ret = {};
+   for( k, id in pairs(counter_names()) ) {
+      ret[k] = s.softwire_state[id];
+   }
+   return ret;
+}

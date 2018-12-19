@@ -1,0 +1,90 @@
+var gre = require("lib.protocol.gre");
+var tobit = require("bit").tobit;
+
+var tunnel = subClass(null);
+tunnel.proto = 47;
+tunnel.class = gre;
+
+function tunnel::new (conf, use_cc, logger) {
+   var o = tunnel->superClass().new(this);
+   o.conf = conf;
+   // 0x6558 is the protocol number assigned to "Transparent Ethernet Bridging"
+   o.header = gre->new({ protocol = 0x6558,
+                        checksum = conf.checksum,
+                        key = conf.key });
+   if( conf.key != null ) {
+      // Set key as inbound and outbound "VC Label" in MIB
+      o.OutboundVcLabel = conf.key;
+      o.InboundVcLabel = conf.key;
+   }
+   if( use_cc ) {
+      assert(conf.key == null || conf.key != 0xFFFFFFFE,
+             "Key 0xFFFFFFFE is reserved for the control channel");
+      o.cc_header = gre->new({ protocol = 0x6558,
+                              checksum = null,
+                              key = 0xFFFFFFFE });
+   }
+   // Static protcol object used in decapsulate()
+   o._proto = gre->new();
+   o._logger = logger;
+   return o;
+}
+
+function tunnel::encapsulate (datagram) {
+   if( this.header->checksum() ) {
+      this.header->checksum(datagram->payload());
+   }
+}
+
+// Return values status, code
+// status
+//   true
+//     proper VPN packet, code irrelevant
+//   false
+//     code
+//       0 decap error -> increase error counter
+//       1 control-channel packet
+var function key_or_none(key) {
+   if( key ) {
+      return '0x'..bit.tohex(key);
+   } else {
+      return 'none';
+   }
+}
+
+function tunnel::decapsulate (datagram) {
+   var conf = this.conf;
+   var code = 0;
+   var gre = this._proto->new_from_mem(datagram->payload());
+   if( gre ) {
+      var gre_size = gre->sizeof();
+      var ok = true;
+      if( gre->checksum() != null ) {
+         var payload, length = datagram->payload();
+         if( ! gre->checksum_check(payload + gre_size, length - gre_size) ) {
+            ok = false;
+            this._logger->log("Bad GRE checksum");
+         }
+      }
+      if( ok ) {
+         var key = gre->key();
+         if( ((conf.key && key && tobit(key) == tobit(conf.key)) ||
+          ! (conf.key || key)) ) {
+            datagram->pop_raw(gre_size);
+            return true;
+         } else {
+            if( key && tobit(key) == tobit(0xFFFFFFFE) ) {
+               datagram->pop_raw(gre_size);
+               code = 1;
+            } else if( this._logger->can_log() ) {
+               this._logger->log("GRE key mismatch: local "
+                                ..key_or_none(this.conf.key)
+                             ..", remote "..key_or_none(gre->key()));
+            }
+         }
+      }
+   }
+   return false, code;
+}
+
+return tunnel;

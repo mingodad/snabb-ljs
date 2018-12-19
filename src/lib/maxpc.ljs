@@ -1,0 +1,583 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+// Max’s parser combinators (for Lua)
+module(..., package.seeall);
+
+
+// interface
+
+// use like this:
+//   local match, capture, combine = require("lib.maxpc").import()
+function import () {
+   var l_match, l_capture, l_combine = {}, {}, {};
+   for( key, value in pairs(match) ) {
+      l_match[key] = value;
+   }
+   for( key, value in pairs(capture) ) {
+      l_capture[key] = value;
+   }
+   for( key, value in pairs(combine) ) {
+      l_combine[key] = value;
+   }
+   return l_match, l_capture, l_combine;
+}
+
+// parse(str, parser) => result_value, was_successful, has_reached_eof
+function parse (str, parser) {
+   var rest, value = parser(input.new(str));
+   return value, rest && true, #str == 0 || (rest && input.empty(rest));
+}
+
+
+// input protocol
+
+input = {};
+
+function input.new (str) {
+   return { idx = 1, str = str };
+}
+
+function input.empty (s) {
+   return s.idx > #s.str;
+}
+
+function input.first (s, n) {
+   return s.str->sub(s.idx, s.idx + (n || 1) - 1);
+}
+
+function input.rest (s) {
+   return { idx = s.idx + 1, str = s.str };
+}
+
+function input.position (s) {
+   return s.idx;
+}
+
+
+// primitives
+
+capture, match, combine = {}, {}, {};
+
+function match.eof () {
+   return function (s) {
+      if( input.empty(s) ) {
+         return s;
+      }
+   };
+}
+
+function capture.element () {
+   return function (s) {
+      if( ! input.empty(s) ) {
+         return input.rest(s), input.first(s), true;
+      }
+   };
+}
+
+function match.fail (handler) {
+   return function (s) {
+      if( handler ) {
+         handler(input.position(s));
+      }
+   };
+}
+
+function match.satisfies (test, parser) {
+   parser = parser || capture.element();
+   return function (s) {
+      var rest, value = parser(s);
+      if( rest && test(value) ) {
+         return rest;
+      }
+   };
+}
+
+function capture.subseq (parser) {
+   return function (s) {
+      var rest = parser(s);
+      if( rest ) {
+         var diff = input.position(rest) - input.position(s);
+         return rest, input.first(s, diff), true;
+      }
+   };
+}
+
+function match.seq (...) {
+   var parsers = {...};
+   return function (s) {
+      for( _, parser in ipairs(parsers) ) {
+         s = parser(s);
+         if( ! s ) {
+            return;
+         }
+      }
+      return s;
+   };
+}
+
+function capture.seq (...) {
+   var parsers = {...};
+   return function (s) {
+      var seq = {};
+      for( _, parser in ipairs(parsers) ) {
+         var rest, value = parser(s);
+         if( rest ) {
+            table.insert(seq, value || false);
+            s = rest;
+         } else {
+            return;
+         }
+      }
+      return s, seq, true;
+   };
+}
+
+function combine.any (parser) {
+   return function (s) {
+      var seq = {};
+      while( true ) {
+         var rest, value, present = parser(s);
+         if( rest ) {
+            s = rest;
+         } else {
+            var value;  //DADBUG redefinition null
+            if( #seq > 0 ) {
+               value = seq;
+            }
+            return s, value, value != null; //DADBUG
+         }
+         if( present ) {
+            table.insert(seq, value || false);
+         }
+      }
+   };
+}
+
+function combine._or (...) {
+   var parsers = {...};
+   return function (s) {
+      for( _, parser in ipairs(parsers) ) {
+         var rest, value, present = parser(s);
+         if( rest ) {
+            return rest, value, present;
+         }
+      }
+   };
+}
+
+function combine._and (...) {
+   var parsers = {...};
+   return function (s) {
+      var rest, value, present;
+      for( _, parser in ipairs(parsers) ) {
+         rest, value, present = parser(s);
+         if( ! rest ) {
+            return;
+         }
+      }
+      return rest, value, present;
+   };
+}
+
+function combine.diff (parser, ...) {
+   var punion = combine._or(...);
+   return function (s) {
+      if( ! punion(s) ) {
+         return parser(s);
+      }
+   };
+}
+
+function capture.transform (parser, transform) {
+   return function (s) {
+      var rest, value = parser(s);
+      if( rest ) {
+         return rest, transform(value), true;
+      }
+   };
+}
+
+
+// built-in combinators
+
+function combine.maybe (parser) {
+   return combine._or(parser, match.seq());
+}
+
+function match._not (parser) {
+   var function constantly_true () { return true; }
+   return combine.diff(match.satisfies(constantly_true), parser);
+}
+
+function combine.some (parser) {
+   return combine._and(parser, combine.any(parser));
+}
+
+function match.equal (x, parser) {
+   var function is_equal_to_x (y) {
+      return x == y;
+   }
+   return match.satisfies(is_equal_to_x, parser);
+}
+
+function capture.unpack (parser, f) {
+   var function destructure (seq) {
+      return f(unpack(seq));
+   }
+   return capture.transform(parser, destructure);
+}
+
+
+// digit parsing
+
+function match.digit (radix) {
+   radix = radix || 10;
+   var digits = "0123456789abcdefghijklmnopqrstuvwxyz";
+   assert(radix >= 2 && radix <= 36);
+   return match.satisfies(
+      function (s) {
+         return digits->sub(1, radix)->find(s->lower(), 1, true);
+      }
+   );
+}
+
+function capture.natural_number (radix) {
+   return capture.transform(
+      capture.subseq(combine.some(match.digit(radix))),
+      function (s) { return tonumber(s, radix); }
+   );
+}
+
+function capture.sign () {
+   var function is_sign (s) { return s == "+" || s == "-"; }
+   return combine._and(match.satisfies(is_sign), capture.element());
+}
+
+function capture.integer_number (radix) {
+   return capture.unpack(
+      capture.seq(combine.maybe(capture.sign()),
+                  capture.natural_number(radix)),
+      function (sign, number) {
+         if( sign == "-" ) { number = -number; }
+         return number;
+      }
+   );
+}
+
+
+// backtracking combinators
+
+function match.plus (a, b) {
+   return function (s) {
+      var a_more, b_more, more;
+      a_more = function () { return a(s); };
+      more = function () {
+         if( b_more ) {
+            var rest;
+            rest, _, _, b_more = b_more();
+            if( rest ) {
+               return rest, null, null, more;
+            } else {
+               return more();
+            }
+         } else if( a_more ) {
+            var suffix;
+            suffix, _, _, a_more = a_more();
+            if( suffix ) {
+               b_more = function () { return b(suffix); };
+               return more();
+            }
+         }
+      };
+      return more();
+   };
+}
+
+function match.alternate (x, y) {
+   return function (s) {
+      var x_more, more;
+      x_more = function () {
+         return x(s);
+      };
+      more = function () {
+         var rest;
+         if( x_more ) {
+            rest, _, _, x_more = x_more();
+         }
+         if( rest ) {
+            return rest, null, null, more;
+         } else {
+            return y(s);
+         }
+      };
+      return more();
+   };
+}
+
+function match.optional (parser) {
+   return match.alternate(parser, match.seq());
+}
+
+function match.all (parser) {
+   return match.optional(
+      match.plus(parser, function (s) { return match.all(parser)(s); })
+   );
+}
+
+var function reduce (fun, tab) {
+   var acc;
+   for( _, val in ipairs(tab) ) {
+      if( ! acc ) { acc = val;
+      } else {            acc = fun(acc, val); }
+   }
+   return acc;
+}
+
+var function identity (...) { return ...; }
+var function constantly_nil () { }
+
+function match.path (...) {
+   var parsers = {...};
+   if( #parsers > 0 ) {
+      return reduce(match.plus, parsers);
+   } else {
+      return identity;
+   }
+}
+
+function match.either (...) {
+   var parsers = {...};
+   if( #parsers > 0 ) {
+      return reduce(match.alternate, parsers);
+   } else {
+      return constantly_nil;
+   }
+}
+
+
+// tests
+
+function selftest () {
+   var lib = require("core.lib");
+
+   // match.eof
+   var result, matched, eof = parse("", match.eof());
+   assert(! result); assert(matched); assert(eof);
+   result, matched, eof = parse("f", match.eof());
+   assert(! result); assert(! matched); assert(! eof);
+
+   // match.fail
+   result, matched, eof = parse("f", match.fail());
+   assert(! result); assert(! matched); assert(! eof);
+   result, matched, eof = parse("f", combine.maybe(match.fail()));
+   assert(! result); assert(matched); assert(! eof);
+   var success, err = pcall(parse, "", match.fail(
+                                 function (pos) {
+                                    error(pos .. ": fail");
+                                 }
+   ));
+   assert(! success); assert(err->find("1: fail", 1, true));
+
+   // capture.element
+   result, matched, eof = parse("foo", capture.element());
+   assert(result == "f"); assert(matched); assert(! eof);
+   result, matched, eof = parse("", capture.element());
+   assert(! result); assert(! matched); assert(eof);
+
+   var function is_digit (x) {
+      return ("01234567890")->find(x, 1, true);
+   }
+
+   // match.satisfied
+   result, matched, eof =
+      parse("123", capture.subseq(match.satisfies(is_digit)));
+   assert(result == "1"); assert(matched); assert(! eof);
+   result, matched, eof = parse("foo", match.satisfies(is_digit));
+   assert(! result); assert(! matched); assert(! eof);
+
+   // match.seq
+   result, matched, eof = parse("fo", match.seq(capture.element(),
+                                                      capture.element(),
+                                                      match.eof()));
+   assert(! result); assert(matched); assert(eof);
+   result, matched, eof = parse("foo", match.seq(capture.element(),
+                                                       capture.element(),
+                                                       match.eof()));
+   assert(! result); assert(! matched); assert(! eof);
+   result, matched, eof =
+      parse("fo", match.seq(match.seq(match.equal("f"), capture.element()),
+                            match.eof()));
+   assert(! result); assert(matched); assert(eof);
+   result, matched, eof = parse("", match.seq());
+   assert(! result); assert(matched); assert(eof);
+
+   // capture.seq
+   result, matched, eof = parse("fo", capture.seq(capture.element(),
+                                                        capture.element(),
+                                                        match.eof()));
+   assert(lib.equal(result, {"f", "o", false})); assert(matched); assert(eof);
+   result, matched, eof = parse("foo", capture.seq(capture.element(),
+                                                         capture.element(),
+                                                         match.eof()));
+   assert(! result); assert(! matched); assert(! eof);
+   result, matched, eof =
+      parse("fo", capture.seq(match.seq(match.equal("f"), capture.element()),
+                              match.eof()));
+   assert(result); assert(matched); assert(eof);
+   result, matched, eof = parse("", capture.seq());
+   assert(result); assert(matched); assert(eof);
+
+   // combine.any
+   result, matched, eof = parse("", combine.any(capture.element()));
+   assert(! result); assert(matched); assert(eof);
+   result, matched, eof =
+      parse("123foo", capture.subseq(combine.any(match.satisfies(is_digit))));
+   assert(result == "123"); assert(matched); assert(! eof);
+   result, matched, eof = parse("", combine.some(capture.element()));
+   assert(! result); assert(! matched); assert(eof);
+   result, matched, eof =
+      parse("foo", capture.seq(combine.some(capture.element()), match.eof()));
+   assert(lib.equal(result, {{"f","o","o"},false})); assert(matched); assert(eof);
+
+   // combine._or
+   var fo = combine._or(match.equal("f"), match.equal("o"));
+   result, matched, eof = parse("fo", capture.seq(fo, fo, match.eof()));
+   assert(result); assert(matched); assert(eof);
+   result, matched, eof = parse("x", fo);
+   assert(! result); assert(! matched); assert(! eof);
+   result, matched, eof = parse("", fo);
+   assert(! result); assert(! matched); assert(eof);
+
+   var function is_alphanumeric (x) {
+      return ("01234567890abcdefghijklmnopqrstuvwxyz")->find(x, 1, true);
+   }
+
+   // combine._and
+   var d = combine._and(match.satisfies(is_alphanumeric),
+                          match.satisfies(is_digit));
+   result, matched, eof = parse("12", capture.seq(d, d, match.eof()));
+   assert(result); assert(matched); assert(eof);
+   result, matched, eof = parse("f", capture.seq(d, match.eof()));
+   assert(! result); assert(! matched); assert(! eof);
+   result, matched, eof = parse("x1", capture.seq(d, d));
+   assert(! result); assert(! matched); assert(! eof);
+
+   // combine.diff
+   var ins = combine.diff(match.satisfies(is_alphanumeric), match.equal("c"));
+   result, matched, eof = parse("fo", capture.seq(ins, ins, match.eof()));
+   assert(result); assert(matched); assert(eof);
+   result, matched, eof = parse("c", capture.seq(ins));
+   assert(! result); assert(! matched); assert(! eof);
+   result, matched, eof = parse("ac", capture.seq(ins, ins));
+   assert(! result); assert(! matched); assert(! eof);
+   result, matched, eof =
+      parse("f", capture.seq(match._not(match.eof()), match.eof()));
+   assert(result); assert(matched); assert(eof);
+   result, matched, eof =
+      parse("foo", combine.any(match._not(match.eof())));
+   assert(! result); assert(matched); assert(eof);
+
+   // capture.transform
+   parse("foo", capture.transform(match.fail(), error));
+   var function constantly_true () { return true; }
+   result, matched, eof =
+      parse("", capture.transform(match.eof(), constantly_true));
+   assert(result); assert(matched); assert(eof);
+   parse("_abce", capture.unpack(combine.any(capture.element()),
+                                 function (_, a, b, c) {
+                                    assert(a == "a");
+                                    assert(b == "b");
+                                    assert(c == "c");
+                                 }
+   ));
+   parse(":a:b", capture.unpack(capture.seq(match.equal(":"),
+                                            capture.element(),
+                                            match.equal(":"),
+                                            capture.element()),
+                                function (_, a, _, b) {
+                                   assert(a == "a");
+                                   assert(b == "b");
+                                }
+   ));
+
+   // digits
+   result, matched, eof = parse("f", match.digit(16));
+   assert(! result); assert(matched); assert(eof);
+   result, matched, eof = parse("f423", capture.natural_number(16));
+   assert(result == 0xf423); assert(matched); assert(eof);
+   result, matched, eof = parse("f423", capture.integer_number(16));
+   assert(result == 0xf423); assert(matched); assert(eof);
+   result, matched, eof = parse("+f423", capture.integer_number(16));
+   assert(result == 0xf423); assert(matched); assert(eof);
+   result, matched, eof = parse("-f423", capture.integer_number(16));
+   assert(result == -0xf423); assert(matched); assert(eof);
+   result, matched, eof = parse("a1234", capture.integer_number());
+   assert(! result); assert(! matched); assert(! eof);
+   result, matched, eof = parse("1234a", capture.integer_number());
+   assert(result == 1234); assert(matched); assert(! eof);
+
+   // backtracking
+   result, matched, eof =
+      parse("a", match.either(match.equal("a"), match.equal("b")));
+   assert(! result); assert(matched); assert(eof);
+   result, matched, eof =
+      parse("b", match.either(match.equal("a"), match.equal("b")));
+   assert(! result); assert(matched); assert(eof);
+   result, matched, eof = parse(".", match.optional(match.equal(".")));
+   assert(! result); assert(matched);
+   result, matched, eof = parse("", match.optional(match.equal(".")));
+   assert(! result); assert(matched); assert(eof);
+   result, matched, eof = parse(
+      "0aaaaaaaa1",
+      match.path(match.equal("0"),
+                 match.all(match.satisfies(is_alphanumeric)),
+                 match.equal("1"))
+   );
+   assert(! result); assert(matched); assert(eof);
+   result, matched, eof = parse(
+      "aaac",
+      match.path(
+         match.all(
+            match.either(
+               match.seq(match.equal("a"), match.equal("a")),
+               match.seq(match.equal("a"), match.equal("a"), match.equal("a")),
+               match.equal("c")
+            )
+         ),
+         match.eof()
+      )
+   );
+   assert(! result); assert(matched); assert(eof);
+   var domain_like = match.either(
+      match.path(
+         match.path(
+            match.all(match.path(match.all(match.satisfies(is_alphanumeric)),
+                                 combine.diff(match.satisfies(is_alphanumeric),
+                                              match.satisfies(is_digit)),
+                                 match.equal(".")))
+         ),
+         match.path(match.all(match.satisfies(is_alphanumeric)),
+                    combine.diff(match.satisfies(is_alphanumeric),
+                                 match.satisfies(is_digit)),
+                    match.optional(match.equal("."))),
+         match.eof()
+      ),
+      match.seq(match.equal("."), match.eof())
+   );
+   result, matched, eof = parse(".", domain_like);
+   assert(! result); assert(matched); assert(eof);
+   result, matched, eof = parse("foo.", domain_like);
+   assert(! result); assert(matched); assert(eof);
+   result, matched, eof = parse("1foo.bar", domain_like);
+   assert(! result); assert(matched); assert(eof);
+   result, matched, eof = parse("foo.b2ar.baz", domain_like);
+   assert(! result); assert(matched); assert(eof);
+   result, matched, eof = parse("foo.bar.2baz.", domain_like);
+   assert(! result); assert(matched); assert(eof);
+   result, matched, eof = parse("foo2", domain_like);
+   assert(! result); assert(! matched); assert(! eof);
+   result, matched, eof = parse("..", domain_like);
+   assert(! result); assert(! matched); assert(! eof);
+   result, matched, eof = parse("123.456", domain_like);
+   assert(! result); assert(! matched); assert(! eof);
+}

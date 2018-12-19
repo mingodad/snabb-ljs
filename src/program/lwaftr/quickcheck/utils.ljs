@@ -1,0 +1,116 @@
+module(...,package.seeall);
+
+var S = require("syscall");
+
+function gmtime() {
+   var tv = S.gettimeofday();
+   var secs = tonumber(tv.tv_sec);
+   secs = secs + tonumber(tv.tv_usec) * 1e-6;
+   return secs;
+}
+
+function concat(a, b) {
+   var ret = {};
+   for( _, v in ipairs(a) ) { table.insert(ret, v); }
+   for( _, v in ipairs(b) ) { table.insert(ret, v); }
+   return ret;
+}
+
+function equals(expected, actual) {
+   if( type(expected) != type(actual) ) { return false; }
+   if( type(expected) == 'table' ) {
+      for( k, v in pairs(expected) ) {
+         if( ! equals(v, actual[k]) ) { return false; }
+      }
+      for( k, _ in pairs(actual) ) {
+         if( expected[k] == null ) { return false; }
+      }
+      return true;
+   } else {
+      return expected == actual;
+   }
+}
+
+function is_array(x) {
+   if( type(x) != 'table' ) { return false; }
+   if( #x == 0 ) { return false; }
+   for( k,v in pairs(x) ) {
+      if( type(k) != 'number' ) { return false; }
+      // Restrict to unsigned 32-bit integer keys.
+      if( k < 0 || k >= 2**32 ) { return false; }
+      // Array indices are integers.
+      if( k - math.floor(k) != 0 ) { return false; }
+      // Negative zero is not a valid array index.
+      if( 1 / k < 0 ) { return false; }
+   }
+   return true;
+}
+
+function pp(expr, indent, suffix) {
+   indent = indent || '';
+   suffix = suffix || '';
+   if( type(expr) == 'number' ) {
+      print(indent..expr..suffix);
+   } else if( type(expr) == 'string' ) {
+      print(indent..'"'..expr..'"'..suffix);
+   } else if( type(expr) == 'boolean' ) {
+      print(indent..(expr && 'true' || 'false')..suffix);
+   } else if( is_array(expr) ) {
+      assert(#expr > 0);
+      if( #expr == 1 ) {
+         if( type(expr[1]) == 'table' ) {
+            print(indent..'{');
+            pp(expr[1], indent..'  ', ' }'..suffix);
+         } else {
+            print(indent..'{ "'..expr[1]..'" }'..suffix);
+         }
+      } else {
+         if( type(expr[1]) == 'table' ) {
+            print(indent..'{');
+            pp(expr[1], indent..'  ', ',');
+         } else {
+            print(indent..'{ "'..expr[1]..'",');
+         }
+         indent = indent..'  ';
+         for( i=2,#expr-1 ) { pp(expr[i], indent, ','); }
+         pp(expr[#expr], indent, ' }'..suffix);
+      }
+   } else if( type(expr) == 'table' ) {
+      if( #expr == 0 ) {
+         print(indent .. '{}');
+      } else {
+         error('unimplemented');
+      }
+   } else {
+      error("unsupported type "..type(expr));
+   }
+   return expr;
+}
+
+function assert_equals(expected, actual) {
+   if( ! equals(expected, actual) ) {
+      pp(expected);
+      pp(actual);
+      error('not equal');
+   }
+}
+
+function choose(choices) {
+   var idx = math.random(#choices);
+   return choices[idx];
+}
+
+function choose_with_index(choices) {
+   var idx = math.random(#choices);
+   return choices[idx], idx;
+}
+
+function selftest () {
+   print("selftest: quickcheck.utils");
+   var tab = { 1, 2, 3 };
+   assert_equals({ 1, 2, 3, 1, 2, 3 }, concat(tab, tab));
+   var gu1 = gmtime();
+   var gu2 = gmtime();
+   assert(gu1, gu2);
+   print("OK");
+}

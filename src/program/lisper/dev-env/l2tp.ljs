@@ -1,0 +1,252 @@
+#!snabb/src/snabb snsh
+io.stdout->setvbuf('no');
+io.stderr->setvbuf('no');
+
+//L2TP IP-over-IPv6 tunnelling program for testing.
+
+var function assert(v, ...) {
+   if( v ) { return v, ...; }
+   error(tostring((...)), 2);
+}
+
+var ffi    = require('ffi');
+var S      = require('syscall');
+var C      = ffi.C;
+var htons  = require('syscall.helpers').htons;
+
+var DEBUG = os.getenv('DEBUG');
+
+var function hex(s) {
+   return (s->gsub('(.)(.?)', function(c1, c2) {
+      return c2 && #c2 == 1 &&
+         string.format('%02x%02x ', c1->byte(), c2->byte()) ||
+         string.format('%02x ', c1->byte());
+   }));
+}
+
+var digits = {};
+for( i=0,9 ) { digits[string.char(('0')->byte()+i)] = i; }
+for( i=0,5 ) { digits[string.char(('a')->byte()+i)] = 10+i; }
+for( i=0,5 ) { digits[string.char(('A')->byte()+i)] = 10+i; }
+var function parsehex(s) {
+   return (s->gsub('[%s%:%.]*(%x)(%x)[%s%:%.]*', function(hi, lo) {
+      hi = digits[hi];
+      lo = digits[lo];
+      return string.char(lo + hi * 16);
+   }));
+}
+
+var function open_tap(name) {
+   var fd = assert(S.open('/dev/net/tun', 'rdwr, nonblock'));
+   var ifr = S.t.ifreq({flags = 'tap, no_pi', name = name});
+   assert(fd->ioctl('tunsetiff', ifr));
+   return fd;
+}
+
+var function open_raw(name) {
+   var fd = assert(S.socket('packet', 'raw, nonblock', htons(S.c.ETH_P.all)));
+   var ifr = S.t.ifreq({name = name});
+   assert(S.ioctl(fd, 'siocgifindex', ifr));
+   assert(S.bind(fd, S.t.sockaddr_ll({
+      ifindex = ifr.ivalue,
+      protocol = 'all'})));
+   return fd;
+}
+
+var mtu = 1500;
+var rawbuf = ffi.new('uint8_t[?]', mtu);
+var tapbuf = ffi.new('uint8_t[?]', mtu);
+var function read_buf(buf, fd) {
+   return buf, assert(S.read(fd, buf, mtu));
+}
+
+var function write(fd, s, len) {
+   assert(S.write(fd, s, len));
+}
+
+var tapname, ethname, smac, dmac, sip, dip, sid, did = unpack(main.parameters);
+if( ! (tapname && ethname && smac && dmac && sip && dip && sid && did) ) {
+   print('Usage: l2tp.ljs TAP ETH SMAC DMAC SIP DIP SID DID');
+   print('   TAP:  the tunneled interface: will be created if not present.');
+   print('   ETH:  the tunneling interface: must have an IPv6 assigned.');
+   print('   SMAC: the MAC address of ETH.');
+   print('   DMAC: the MAC address of the gateway interface.');
+   print('   SIP:  the IPv6 of ETH (long form).');
+   print('   DIP:  the IPv6 of ETH at the other endpoint (long form).');
+   print('   SID:  session ID (hex)');
+   print('   DID:  peer session ID (hex)');
+   os.exit(1);
+}
+smac = parsehex(smac);
+dmac = parsehex(dmac);
+sip  = parsehex(sip);
+dip  = parsehex(dip);
+sid  = parsehex(sid);
+did  = parsehex(did);
+
+var tap = open_tap(tapname);
+var raw = open_raw(ethname);
+
+print('tap  ', tapname);
+print('raw  ', ethname);
+print('smac ', hex(smac));
+print('dmac ', hex(dmac));
+print('sip  ', hex(sip));
+print('dip  ', hex(dip));
+print('sid  ', hex(sid));
+print('did  ', hex(did));
+
+var l2tp_ct = ffi.typeof([=[
+struct {
+
+   // ethernet
+   char     dmac[6];
+   char     smac[6];
+   uint16_t ethertype;
+
+   // ipv6
+   uint32_t flow_id; // version, tc, flow_id
+   int8_t   payload_length_hi;
+   int8_t   payload_length_lo;
+   int8_t   next_header;
+   uint8_t  hop_limit;
+   char     src_ip[16];
+   char     dst_ip[16];
+
+   // l2tp
+   //uint32_t session_id;
+   char     session_id[4];
+   char     cookie[8];
+
+} __attribute__((packed))
+]=]);
+
+var l2tp_ct_size = ffi.sizeof(l2tp_ct);
+var l2tp_ctp = ffi.typeof('$*', l2tp_ct);
+
+var function decap_l2tp_buf(buf, len) {
+   if( len < l2tp_ct_size ) { return null, 'packet too small'; }
+   var p = ffi.cast(l2tp_ctp, buf);
+   if( p.ethertype != 0xdd86 ) { return null, 'not ipv6'; }
+   if( p.next_header != 115 ) { return null, 'not l2tp'; }
+   var dmac = ffi.string(p.dmac, 6);
+   var smac = ffi.string(p.smac, 6);
+   var sip = ffi.string(p.src_ip, 16);
+   var dip = ffi.string(p.dst_ip, 16);
+   var sid = ffi.string(p.session_id, 4); //p.session_id
+   var payload_size = len - l2tp_ct_size;
+   return smac, dmac, sip, dip, sid, l2tp_ct_size, payload_size;
+}
+
+var function encap_l2tp_buf(smac, dmac, sip, dip, did, payload, payload_size, outbuf) {
+   var p = ffi.cast(l2tp_ctp, outbuf);
+   ffi.copy(p.dmac, dmac);
+   ffi.copy(p.smac, smac);
+   p.ethertype = 0xdd86;
+   p.flow_id = 0x60;
+   var ipsz = payload_size + 12;
+   p.payload_length_hi = bit.rshift(ipsz, 8);
+   p.payload_length_lo = bit.band(ipsz, 0xff);
+   p.next_header = 115;
+   p.hop_limit = 64;
+   ffi.copy(p.src_ip, sip);
+   ffi.copy(p.dst_ip, dip);
+   ffi.copy(p.session_id, did);
+   ffi.fill(p.cookie, 8);
+   ffi.copy(p + 1, payload, payload_size);
+   return outbuf, l2tp_ct_size + payload_size;
+}
+
+//fast select ----------------------------------------------------------------
+//select() is gruesome.
+
+var band, bor, shl, shr = bit.band, bit.bor, bit.lshift, bit.rshift;
+
+var function getbit(b, bits) {
+   return band(bits[shr(b, 3)], shl(1, band(b, 7))) != 0;
+}
+
+var function setbit(b, bits) {
+   bits[shr(b, 3)] = bor(bits[shr(b, 3)], shl(1, band(b, 7)));
+}
+
+ffi.cdef([=[
+typedef struct {
+   uint8_t bits[128]; // 1024 bits
+} xfd_set;
+int xselect(int, xfd_set*, xfd_set*, xfd_set*, void*) asm("select");
+]=]);
+var function FD_ISSET(d, set) { return getbit(d, set.bits); }
+var function FD_SET(d, set) {
+   assert(d <= 1024);
+   setbit(d, set.bits);
+}
+var fds0 = ffi.new('xfd_set');
+var fds  = ffi.new('xfd_set');
+var fds_size = ffi.sizeof(fds);
+var rawfd = raw->getfd();
+var tapfd = tap->getfd();
+FD_SET(rawfd, fds0);
+FD_SET(tapfd, fds0);
+var maxfd = math.max(rawfd, tapfd) + 1;
+var EINTR = 4;
+var function can_read() { //returns true if fd has data, false if timed out
+   ffi.copy(fds, fds0, fds_size);
+   retry:
+   var ret = C.xselect(maxfd, fds, null, null, null);
+   if( ret == -1 ) {
+      if( C.errno() == EINTR ) { goto retry; }
+      error('select errno '..tostring(C.errno()));
+   }
+   return FD_ISSET(rawfd, fds), FD_ISSET(tapfd, fds);
+}
+
+//----------------------------------------------------------------------------
+
+while( true ) {
+   var can_raw, can_tap = can_read();
+   if( can_raw || can_tap ) {
+      if( can_raw ) {
+         var buf, len = read_buf(rawbuf, raw);
+         var smac1, dmac1, sip1, dip1, did1, payload_offset, payload_size = decap_l2tp_buf(buf, len);
+         var accept = smac1
+            && smac1 == dmac
+            && dmac1 == smac
+            && dip1 == sip
+            && sip1 == dip
+            && did1 == sid;
+         if( DEBUG ) {
+            if( accept || smac1 ) {
+               print('read', accept && 'accepted' || 'rejected');
+               print('  smac ', hex(smac1));
+               print('  dmac ', hex(dmac1));
+               print('  sip  ', hex(sip1));
+               print('  dip  ', hex(dip1));
+               print('  did  ', hex(did1));
+               print('  #    ', payload_size);
+            }
+         }
+         if( accept ) {
+            write(tap, buf + payload_offset, payload_size);
+         }
+      }
+      if( can_tap ) {
+         var payload, payload_size = read_buf(tapbuf, tap);
+         var frame, frame_size = encap_l2tp_buf(smac, dmac, sip, dip, did, payload, payload_size, rawbuf);
+         if( DEBUG ) {
+            print('write');
+            print('  smac ', hex(smac));
+            print('  dmac ', hex(dmac));
+            print('  sip  ', hex(sip));
+            print('  dip  ', hex(dip));
+            print('  did  ', hex(did));
+            print('  #in  ', payload_size);
+            print('  #out ', frame_size);
+         }
+         write(raw, frame, frame_size);
+      }
+   }
+}
+
+tap->close();
+raw->close();

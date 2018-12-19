@@ -1,0 +1,177 @@
+module(..., package.seeall);
+
+var S = require("syscall");
+var shm = require("core.shm");
+var timer = require("core.timer");
+var engine = require("core.app");
+var config = require("core.config");
+var counter = require("core.counter");
+
+CSVStatsTimer = {};
+
+var function open_link_counters(pid) {
+   var counters = {};
+   for( _, linkspec in ipairs(shm.children("/"..pid.."/links")) ) {
+      var fa, fl, ta, tl = config.parse_link(linkspec);
+      var link = shm.open_frame("/"..pid.."/links/"..linkspec);
+      if( ! counters[fa] ) { counters[fa] = {input={},output={}}; }
+      if( ! counters[ta] ) { counters[ta] = {input={},output={}}; }
+      counters[fa].output[fl] = link;
+      counters[ta].input[tl] = link;
+   }
+   return counters;
+}
+
+// A timer that monitors packet rate and bit rate on a set of links,
+// printing the data out to a CSV file.
+//
+// Standard mode example (default):
+//
+// Time (s),decap MPPS,decap Gbps,encap MPPS,encap Gbps
+// 0.999197,3.362784,13.720160,3.362886,15.872824
+// 1.999181,3.407569,13.902880,3.407569,16.083724
+//
+// Hydra mode example:
+//
+// benchmark,id,score,unit
+// decap_mpps,1,3.362784,mpps
+// decap_gbps,1,13.720160,gbps
+// encap_mpps,1,3.362886,mpps
+// encap_gbps,1,15.872824,gbps
+// decap_mpps,2,3.407569,mpps
+// decap_gbps,2,13.902880,gbps
+// encap_mpps,2,3.407569,mpps
+// encap_gbps,2,16.083724,gbps
+//
+function CSVStatsTimer::new(filename, hydra_mode, pid) {
+   var file = filename && io.open(filename, "w") || io.stdout;
+   var o = { hydra_mode=hydra_mode, link_data={}, file=file, period=1,
+      header = hydra_mode && "benchmark,id,score,unit" || "Time (s)"};
+   o.ready = false;
+   o.deferred_apps = {};
+   o.pid = pid || S.getpid();
+   return setmetatable(o, {__index = CSVStatsTimer});
+}
+
+function CSVStatsTimer::resolve_app(deferred) {
+   var id, links, link_names = unpack(assert(deferred));
+   this.links_by_app = open_link_counters(this.pid);
+   var app = this.links_by_app[id];
+   if( ! app ) { return false; }
+   var resolved_links = {};
+   for( _,name in ipairs(links) ) {
+      var link = app.input[name] || app.output[name];
+      // If we didn't find these links, allow a link name of "rx" to be
+      // equivalent to an input named "input", and likewise for "tx" and
+      // outputs named "output".  This papers over intel_mp versus
+      // intel10g differences, and is especially useful when accessing
+      // remote counters where you don't know what driver the data plane
+      // using.
+      if( ! link ) {
+         if( name == 'rx' ) { link = app.input.input; }
+         if( name == 'tx' ) { link = app.output.output; }
+      }
+      if( ! link ) { return false; }
+      table.insert(resolved_links, {name, link});
+   }
+   for( _, resolved_link in ipairs(resolved_links) ) {
+      var name, link = unpack(resolved_link);
+      var link_name = link_names[name] || name;
+      var data = {
+         link_name = link_name,
+         txpackets = link.txpackets,
+         txbytes = link.txbytes,
+      };
+      if( ! this.hydra_mode ) {
+         var h = (',%s MPPS,%s Gbps')->format(link_name, link_name);
+         this.header = this.header..h;
+      }
+      table.insert(this.link_data, data);
+   }
+   return true;
+}
+
+// Add links from an app whose identifier is ID to the CSV timer.  If
+// present, LINKS is an array of strings identifying a subset of links
+// to monitor.  The optional LINK_NAMES table maps link names to
+// human-readable names, for the column headers.
+function CSVStatsTimer::add_app(id, links, link_names) {
+   // Because we are usually measuring counters from another process and
+   // that process is probably spinning up as we are installing the
+   // counter, we defer the resolve operation and try to resolve it from
+   // inside the timer.
+   table.insert(this.deferred_apps, {id, links, link_names});
+}
+
+function CSVStatsTimer::set_period(period) { this.period = period; }
+
+// Activate the timer with a period of PERIOD seconds.
+function CSVStatsTimer::start() {
+   var function tick() { return this->tick(); }
+   this.tick_timer = timer.new('csv_stats', tick, this.period*1e9, 'repeating');
+   tick();
+   timer.activate(this.tick_timer);
+}
+
+function CSVStatsTimer::stop() {
+   this->tick(); // ?
+   timer.cancel(this.tick_timer);
+}
+
+function CSVStatsTimer::is_ready() {
+   if( this.ready ) { return true; }
+   for( i,data in ipairs(this.deferred_apps) ) {
+      if( ! data ) {
+         // pass
+      } else if( this->resolve_app(data) ) {
+         this.deferred_apps[i] = false;
+      } else {
+         return false;
+      }
+   }
+   // print header
+   this.file->write(this.header..'\n');
+   this.file->flush();
+   this.start = engine.now();
+   this.prev_elapsed = 0;
+   for( _,data in ipairs(this.link_data) ) {
+      data.prev_txpackets = counter.read(data.txpackets);
+      data.prev_txbytes = counter.read(data.txbytes);
+   }
+   this.ready = true;
+   // Return false for the last time, so that our first reading is
+   // legit.
+   return false;
+}
+
+function CSVStatsTimer::tick() {
+   if( ! this->is_ready() ) { return; }
+   var elapsed = engine.now() - this.start;
+   var dt = elapsed - this.prev_elapsed;
+   this.prev_elapsed = elapsed;
+   if( ! this.hydra_mode ) {
+      this.file->write(('%f')->format(elapsed));
+   }
+   for( _,data in ipairs(this.link_data) ) {
+      var txpackets = counter.read(data.txpackets);
+      var txbytes = counter.read(data.txbytes);
+      var diff_txpackets = tonumber(txpackets - data.prev_txpackets) / dt / 1e6;
+      var diff_txbytes = tonumber(txbytes - data.prev_txbytes) * 8 / dt / 1e9;
+      data.prev_txpackets = txpackets;
+      data.prev_txbytes = txbytes;
+      if( this.hydra_mode ) {
+         // Hydra reports seem to prefer integers for the X (time) axis.
+         this.file->write(('%s_mpps,%.f,%f,mpps\n')->format(
+            data.link_name,elapsed,diff_txpackets));
+         this.file->write(('%s_gbps,%.f,%f,gbps\n')->format(
+            data.link_name,elapsed,diff_txbytes));
+      } else {
+         this.file->write((',%f')->format(diff_txpackets));
+         this.file->write((',%f')->format(diff_txbytes));
+      }
+   }
+   if( ! this.hydra_mode ) {
+      this.file->write('\n');
+   }
+   this.file->flush();
+}

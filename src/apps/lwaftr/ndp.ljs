@@ -1,0 +1,509 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+// NDP address resolution (RFC 4861)
+
+// This app uses the neighbor discovery protocol to determine the
+// Ethernet address of an IPv6 next-hop.  It's a limited
+// implementation; if you need to route traffic to multiple IPv6
+// next-hops on the local network, probably you want to build a more
+// capable NDP app.
+//
+// All non-NDP traffic coming in on the "south" interface (i.e., from
+// the network card) is directly forwarded out the "north" interface
+// to be handled by the network function.  Incoming traffic on the
+// "north" inferface is dropped until the MAC address of the next-hop
+// is known.  Once we do have a MAC address for the next-hop, this app
+// sends all outgoing traffic there, overwriting the source and
+// destination Ethernet addresses on outgoing southbound traffic.
+
+module(..., package.seeall);
+
+var bit      = require("bit");
+var ffi      = require("ffi");
+var packet   = require("core.packet");
+var link     = require("core.link");
+var lib      = require("core.lib");
+var shm      = require("core.shm");
+var checksum = require("lib.checksum");
+var datagram = require("lib.protocol.datagram");
+var ethernet = require("lib.protocol.ethernet");
+var ipv6     = require("lib.protocol.ipv6");
+var alarms = require("lib.yang.alarms");
+var S = require("syscall");
+
+alarms.add_to_inventory ({
+   [{alarm_type_id='ndp-resolution'}] = {
+      resource=tostring(S.getpid()),
+      has_clear=true,
+      description='Raise up if NDP app cannot resolve IPv6 address'
+   }
+});
+var resolve_alarm = alarms.declare_alarm ({
+   [{resource=tostring(S.getpid()), alarm_type_id='ndp-resolution'}] = {
+      perceived_severity = 'critical',
+      alarm_text = 'Make sure you can NDP resolve IP addresses on NIC',
+   },
+});
+
+var htons, ntohs = lib.htons, lib.ntohs;
+var htonl, ntohl = lib.htonl, lib.ntohl;
+var receive, transmit = link.receive, link.transmit;
+
+var mac_t = ffi.typeof('uint8_t[6]');
+var ether_header_t = ffi.typeof ([=[
+/* All values in network byte order.  */
+struct {
+   uint8_t  dhost[6];
+   uint8_t  shost[6];
+   uint16_t type;
+} __attribute__((packed))
+]=]);
+var ipv6_header_t = ffi.typeof ([=[
+/* All values in network byte order.  */
+struct {
+   uint32_t v_tc_fl; // version, tc, flow_label
+   uint16_t payload_length;
+   uint8_t  next_header;
+   uint8_t  hop_limit;
+   uint8_t  src_ip[16];
+   uint8_t  dst_ip[16];
+} __attribute__((packed))
+]=]);
+var icmpv6_header_t = ffi.typeof ([=[
+/* All values in network byte order.  */
+struct {
+   uint8_t  type;
+   uint8_t  code;
+   uint16_t checksum;
+} __attribute__((packed))
+]=]);
+var na_header_t = ffi.typeof ([=[
+/* All values in network byte order.  */
+struct {
+   uint32_t flags;               /* Bit 31: Router; Bit 30: Solicited;
+                                    Bit 29: Override; Bits 28-0: Reserved. */
+   uint8_t  target_ip[16];
+   uint8_t  options[0];
+} __attribute__((packed))
+]=]);
+var ns_header_t = ffi.typeof ([=[
+/* All values in network byte order.  */
+struct {
+   uint32_t flags;               /* Bits 31-0: Reserved.  */
+   uint8_t  target_ip[16];
+   uint8_t  options[0];
+} __attribute__((packed))
+]=]);
+var option_header_t = ffi.typeof ([=[
+/* All values in network byte order.  */
+struct {
+   uint8_t  type;
+   uint8_t  length;
+} __attribute__((packed))
+]=]);
+var ether_option_header_t = ffi.typeof ([=[
+/* All values in network byte order.  */
+struct {
+   $ header;
+   uint8_t  addr[6];
+} __attribute__((packed))
+]=], option_header_t);
+var ipv6_pseudoheader_t = ffi.typeof ([=[
+struct {
+   char src_ip[16];
+   char dst_ip[16];
+   uint32_t ulp_length;
+   uint32_t next_header;
+} __attribute__((packed))
+]=]);
+var ndp_header_t = ffi.typeof([=[
+struct {
+   $ ether;
+   $ ipv6;
+   $ icmpv6;
+   uint8_t body[0];
+} __attribute__((packed))]=], ether_header_t, ipv6_header_t, icmpv6_header_t);
+
+var function ptr_to(t) { return ffi.typeof('$*', t); }
+var ether_header_ptr_t = ptr_to(ether_header_t);
+var ndp_header_ptr_t = ptr_to(ndp_header_t);
+var na_header_ptr_t = ptr_to(na_header_t);
+var ns_header_ptr_t = ptr_to(ns_header_t);
+var option_header_ptr_t = ptr_to(option_header_t);
+var ether_option_header_ptr_t = ptr_to(ether_option_header_t);
+
+var ndp_header_len = ffi.sizeof(ndp_header_t);
+
+var ether_type_ipv6 = 0x86DD;
+var proto_icmpv6 = 58;
+var icmpv6_ns = 135;
+var icmpv6_na = 136;
+var na_router_bit = 31;
+var na_solicited_bit = 30;
+var na_override_bit = 29;
+var option_source_link_layer_address = 1;
+var option_target_link_layer_address = 2;
+
+// Special addresses
+var ipv6_all_nodes_local_segment_addr = ipv6->pton("ff02::1");
+var ipv6_unspecified_addr = ipv6->pton("0::0"); // aka ::/128
+// Really just the first 13 bytes of the following...
+var ipv6_solicited_multicast = ipv6->pton("ff02:0000:0000:0000:0000:0001:ff00:00");
+
+var function checksum_pseudoheader_from_header(ipv6_fixed_header) {
+   var ph = ipv6_pseudoheader_t();
+   ph.src_ip = ipv6_fixed_header.src_ip;
+   ph.dst_ip = ipv6_fixed_header.dst_ip;
+   ph.ulp_length = htonl(ntohs(ipv6_fixed_header.payload_length));
+   ph.next_header = htonl(ipv6_fixed_header.next_header);
+   return checksum.ipsum(ffi.cast('char*', ph),
+                         ffi.sizeof(ipv6_pseudoheader_t), 0);
+}
+
+var function is_ndp(pkt) {
+   if( pkt.length < ndp_header_len ) { return false; }
+   var h = ffi.cast(ndp_header_ptr_t, pkt.data);
+   if( ntohs(h.ether.type) != ether_type_ipv6 ) { return false; }
+   if( h.ipv6.next_header != proto_icmpv6 ) { return false; }
+   return h.icmpv6.type >= 133 && h.icmpv6.type <= 137;
+}
+
+var function make_ndp_packet(src_mac, dst_mac, src_ip, dst_ip, message_type,
+                               message, option) {
+   var pkt = packet.allocate();
+
+   pkt.length = ndp_header_len;
+   var h = ffi.cast(ndp_header_ptr_t, pkt.data);
+   h.ether.dhost = dst_mac;
+   h.ether.shost = src_mac;
+   h.ether.type = htons(ether_type_ipv6);
+   h.ipv6.v_tc_fl = 0;
+   lib.bitfield(32, h.ipv6, 'v_tc_fl', 0, 4, 6);  // IPv6 Version
+   lib.bitfield(32, h.ipv6, 'v_tc_fl', 4, 8, 0);  // Traffic class
+   lib.bitfield(32, h.ipv6, 'v_tc_fl', 12, 20, 0); // Flow label
+   h.ipv6.payload_length = 0;
+   h.ipv6.next_header = proto_icmpv6;
+   h.ipv6.hop_limit = 255;
+   h.ipv6.src_ip = src_ip;
+   h.ipv6.dst_ip = dst_ip;
+   h.icmpv6.type = message_type;
+   h.icmpv6.code = 0;
+   h.icmpv6.checksum = 0;
+
+   packet.append(pkt, message, ffi.sizeof(message));
+   packet.append(pkt, option, ffi.sizeof(option));
+
+   // Now fix up lengths and checksums.
+   h.ipv6.payload_length = htons(pkt.length - ffi.sizeof(ether_header_t)
+   - ffi.sizeof(ipv6_header_t));
+   ptr = ffi.cast('char*', h.icmpv6);
+   var base_checksum = checksum_pseudoheader_from_header(h.ipv6);
+   h.icmpv6.checksum = htons(checksum.ipsum(ptr,
+                                            pkt.length - (ptr - pkt.data),
+                                            bit.bnot(base_checksum)));
+   return pkt;
+}
+
+// Respond to a neighbor solicitation for our own address.
+var function make_na_packet(src_mac, dst_mac, src_ip, dst_ip, is_router) {
+   var message = na_header_t();
+   var flags = bit.lshift(1, na_solicited_bit);
+   if( is_router ) {
+      flags = bit.bor(bit.lshift(1, na_router_bit), flags);
+   }
+   message.flags = htonl(flags);
+   message.target_ip = src_ip;
+
+   var option = ether_option_header_t();
+   option.header.type = option_target_link_layer_address;
+   option.header.length = 1; // One 8-byte unit.
+   option.addr = src_mac;
+
+   return make_ndp_packet(src_mac, dst_mac, src_ip, dst_ip, icmpv6_na,
+                          message, option);
+}
+
+// Solicit a neighbor's address.
+var function make_ns_packet(src_mac, src_ip, dst_ip) {
+   var message = ns_header_t();
+   message.flags = 0;
+   message.target_ip = dst_ip;
+
+   var option = ether_option_header_t();
+   option.header.type = option_source_link_layer_address;
+   option.header.length = 1; // One 8-byte unit.
+   option.addr = src_mac;
+
+   var broadcast_mac = ethernet->pton("ff:ff:ff:ff:ff:ff");
+   return make_ndp_packet(src_mac, broadcast_mac, src_ip, dst_ip, icmpv6_ns,
+                          message, option);
+}
+
+var function verify_icmp_checksum(pkt) {
+   var h = ffi.cast(ndp_header_ptr_t, pkt.data);
+   var ph_csum = checksum_pseudoheader_from_header(h.ipv6);
+   var icmp_length = ntohs(h.ipv6.payload_length);
+   var a = checksum.ipsum(ffi.cast('char*', h.icmpv6), icmp_length,
+                            bit.bnot(ph_csum));
+   return a == 0;
+}
+
+var function ipv6_eq(a, b) { return ffi.C.memcmp(a, b, 16) == 0; }
+
+// IPv6 multicast addresses start with FF.
+var function is_address_multicast(ipv6_addr) {
+   return ipv6_addr[0] == 0xff;
+}
+
+// Solicited multicast addresses have their first 13 bytes set to
+// ff02::1:ff00:0/104, aka ff02:0000:0000:0000:0000:0001:ff[UV:WXYZ].
+var function is_solicited_node_multicast_address(addr) {
+   return ffi.C.memcmp(addr, ipv6_solicited_multicast, 13) == 0;
+}
+
+var function random_locally_administered_unicast_mac_address() {
+   var mac = lib.random_bytes(6);
+   // Bit 0 is 0, indicating unicast.  Bit 1 is 1, indicating locally
+   // administered.
+   mac[0] = bit.lshift(mac[0], 2) + 2;
+   return mac;
+}
+
+NDP = {};
+var ndp_config_params = {
+   // Source MAC address will default to a random address.
+   self_mac  = { default=false },
+   // Source IP is required though.
+   self_ip   = { required=true },
+   // The next-hop MAC address can be statically configured.
+   next_mac  = { default=false },
+   // But if the next-hop MAC isn't configured, NDP will figure it out.
+   next_ip   = { default=false },
+   is_router = { default=true },
+   // Emit alarms if set.
+   alarm_notification = { default=false },
+   // This NDP resolver might be part of a set of peer processes sharing
+   // work via RSS.  In that case, a response will probably arrive only
+   // at one process, not all of them!  In that case we can arrange for
+   // the NDP app that receives the reply to write the resolved next-hop
+   // to a shared file.  RSS peers can poll that file.
+   shared_next_mac_key = {},
+};
+
+function NDP::new(conf) {
+   var o = lib.parse(conf, ndp_config_params);
+   if( ! o.self_mac ) {
+      o.self_mac = random_locally_administered_unicast_mac_address();
+   }
+   if( ! o.next_mac ) {
+      assert(o.next_ip, 'NDP needs next-hop IPv6 address to learn next-hop MAC');
+      this.ns_interval = 3; // Send a new NS every three seconds.
+   }
+   return setmetatable(o, {__index=NDP});
+}
+
+function NDP::ndp_resolving (ip) {
+   print(("NDP: Resolving '%s'")->format(ipv6->ntop(ip)));
+   if( this.alarm_notification ) {
+      resolve_alarm->raise();
+   }
+}
+
+function NDP::maybe_send_ns_request (output) {
+   if( this.next_mac ) { return; }
+   this.next_ns_time = this.next_ns_time || engine.now();
+   if( this.next_ns_time <= engine.now() ) {
+      this->ndp_resolving(this.next_ip);
+      transmit(this.output.south,
+               make_ns_packet(this.self_mac, this.self_ip, this.next_ip));
+      this.next_ns_time = engine.now() + this.ns_interval;
+   }
+}
+
+function NDP::ndp_resolved (ip, mac, provenance) {
+   print(("NDP: '%s' resolved (%s)")->format(ipv6->ntop(ip), ethernet->ntop(mac)));
+   if( this.alarm_notification ) {
+      resolve_alarm->clear();
+   }
+   this.next_mac = mac;
+   if( this.shared_next_mac_key ) {
+      if( provenance == 'remote' ) {
+         // If we are getting this information from a packet and not
+         // from the shared key, then update the shared key.
+         var ok, shared = pcall(shm.create, this.shared_next_mac_key, mac_t);
+         if( ! ok ) {
+            ok, shared = pcall(shm.open, this.shared_next_mac_key, mac_t);
+         }
+         if( ! ok ) {
+            print('warning: ndp: failed to update shared next MAC key!');
+         } else {
+            ffi.copy(shared, mac, 6);
+            shm.unmap(shared);
+         }
+      } else {
+         assert(provenance == 'peer');
+         // Pass.
+      }
+   }
+}
+
+function NDP::resolve_next_hop(next_mac) {
+   // It's possible for a NA packet to indicate the MAC address in
+   // more than one way (e.g. unicast ethernet source address and the
+   // link layer address in the NDP options).  Just take the first
+   // one.
+   if( this.next_mac ) { return; }
+   this->ndp_resolved(this.next_ip, next_mac, 'remote');
+}
+
+var function copy_mac(src) {
+   var dst = ffi.new('uint8_t[6]');
+   ffi.copy(dst, src, 6);
+   return dst;
+}
+
+function NDP::handle_ndp (pkt) {
+   var h = ffi.cast(ndp_header_ptr_t, pkt.data);
+   // Generic checks.
+   if( h.ipv6.hop_limit != 255 ) { return; }
+   if( h.icmpv6.code != 0 ) { return; }
+   if( ! verify_icmp_checksum(pkt) ) { return; }
+
+   if( h.icmpv6.type == icmpv6_na ) {
+      // Only process advertisements when we are looking for a
+      // next-hop MAC.
+      if( this.next_mac ) { return; }
+      // Drop packets that are too short.
+      if( pkt.length < ndp_header_len + ffi.sizeof(na_header_t) ) { return; }
+      var na = ffi.cast(na_header_ptr_t, h.body);
+      var solicited = bit.lshift(1, na_solicited_bit);
+      // Reject unsolicited advertisements.
+      if( bit.band(solicited, ntohl(na.flags)) != solicited ) { return; }
+      // We only are looking for the MAC of our next-hop; no others.
+      if( ! ipv6_eq(na.target_ip, this.next_ip) ) { return; }
+      // First try to get the MAC from the options.
+      var offset = na.options - pkt.data;
+      while( offset < pkt.length ) {
+         var option = ffi.cast(option_header_ptr_t, pkt.data + offset);
+         // Any option whose length is 0 or too large causes us to
+         // drop the packet.
+         if( option.length == 0 ) { return; }
+         if( offset + option.length*8 > pkt.length ) { return; }
+         offset = offset + option.length*8;
+         if( option.type == option_target_link_layer_address ) {
+            if( option.length != 1 ) { return; }
+            var ether = ffi.cast(ether_option_header_ptr_t, option);
+            this->resolve_next_hop(copy_mac(ether.addr));
+         }
+      }
+      // Otherwise, when responding to unicast solicitations, the
+      // option can be omitted since the sender of the solicitation
+      // has the correct link-layer address.  See 4.4. Neighbor
+      // Advertisement Message Format.
+      this->resolve_next_hop(copy_mac(h.ether.shost));
+   } else if( h.icmpv6.type == icmpv6_ns ) {
+      if( pkt.length < ndp_header_len + ffi.sizeof(ns_header_t) ) { return; }
+      var ns = ffi.cast(ns_header_ptr_t, h.body);
+      if( is_address_multicast(ns.target_ip) ) { return; }
+      if( ! ipv6_eq(ns.target_ip, this.self_ip) ) { return; }
+      var dst_ip;
+      if( ipv6_eq(h.ipv6.src_ip, ipv6_unspecified_addr) ) {
+         if( is_solicited_node_multicast_address(h.ipv6.dst_ip) ) { return; }
+         dst_ip = ipv6_all_nodes_local_segment_addr;
+      } else {
+         dst_ip = h.ipv6.src_ip;
+      }
+      // We don't need the options, but we do need to check them for
+      // validity.
+      var offset = ns.options - pkt.data;
+      while( offset < pkt.length ) {
+         var option = ffi.cast(option_header_ptr_t, pkt.data + offset);
+         // Any option whose length is 0 or too large causes us to
+         // drop the packet.
+         if( option.length == 0 ) { return; }
+         if( offset + option.length * 8 > pkt.length ) { return; }
+         offset = offset + option.length*8;
+         if( option.type == option_source_link_layer_address ) {
+            if( ipv6_eq(h.ipv6.src_ip, ipv6_unspecified_addr) ) {
+               return;
+            }
+         }
+      }
+      link.transmit(this.output.south,
+                    make_na_packet(this.self_mac, h.ether.shost,
+                                   this.self_ip, dst_ip, this.is_router));
+   } else {
+      // Unhandled NDP packet; silently drop.
+      return;
+   }
+}
+
+function NDP::push() {
+   var isouth, osouth = this.input.south, this.output.south;
+   var inorth, onorth = this.input.north, this.output.north;
+
+   // TODO: do unsolicited neighbor advertisement on start and on
+   // configuration reloads?
+   // This would be an optimization, not a correctness issue
+   this->maybe_send_ns_request(osouth);
+
+   for( _ = 1, link.nreadable(isouth) ) {
+      var p = receive(isouth);
+      if( is_ndp(p) ) {
+         this->handle_ndp(p);
+         packet.free(p);
+      } else {
+         transmit(onorth, p);
+      }
+   }
+
+   // Don't read southbound packets until the next hop's ethernet
+   // address is known.
+   if( this.next_mac ) {
+      for( _ = 1, link.nreadable(inorth) ) {
+         var p = receive(inorth);
+         var h = ffi.cast(ether_header_ptr_t, p.data);
+         h.shost = this.self_mac;
+         h.dhost = this.next_mac;
+         transmit(osouth, p);
+      }
+   } else if( this.shared_next_mac_key ) {
+      var ok, mac = pcall(shm.open, this.shared_next_mac_key, mac_t);
+      // Use the shared pointer directly, without copying; if it is ever
+      // updated, we will get its new value.
+      if( ok ) { this->ndp_resolved(this.next_ip, mac, 'peer'); }
+   }
+}
+
+function selftest() {
+   print("selftest: ndp");
+
+   var config = require("core.config");
+   var sink = require("apps.basic.basic_apps").Sink;
+   var c = config.new();
+   config.app(c, "nd1", NDP, { self_ip  = ipv6->pton("2001:DB8::1"),
+                               next_ip  = ipv6->pton("2001:DB8::2"),
+                               shared_next_mac_key = "foo" });
+   config.app(c, "nd2", NDP, { self_ip  = ipv6->pton("2001:DB8::2"),
+                               next_ip  = ipv6->pton("2001:DB8::1"),
+                               shared_next_mac_key = "bar" });
+   config.app(c, "sink1", sink);
+   config.app(c, "sink2", sink);
+   config.link(c, "nd1.south -> nd2.south");
+   config.link(c, "nd2.south -> nd1.south");
+   config.link(c, "sink1.tx -> nd1.north");
+   config.link(c, "nd1.north -> sink1.rx");
+   config.link(c, "sink2.tx -> nd2.north");
+   config.link(c, "nd2.north -> sink2.rx");
+   engine.configure(c);
+   engine.main({ duration = 0.1 });
+
+   var function mac_eq(a, b) { return ffi.C.memcmp(a, b, 6) == 0; }
+   var nd1, nd2 = engine.app_table.nd1, engine.app_table.nd2;
+   assert(nd1.next_mac);
+   assert(nd2.next_mac);
+   assert(mac_eq(nd1.next_mac, nd2.self_mac));
+   assert(mac_eq(nd2.next_mac, nd1.self_mac));
+
+   print("selftest: ok");
+}

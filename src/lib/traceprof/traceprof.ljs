@@ -1,0 +1,154 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+// traceprof.lua: Low-level trace profiler
+// 
+// Traceprof analyzes the time spent in JIT-compiled traces.  It is an
+// alternative to 'jit.p' with fewer features and based on a simpler
+// and (hopefully) more accurate sampling method.
+// 
+// API:
+//   start(): Start profiling.
+//   stop():  Stop profiling and print a report.
+// ... and start() has some undocumented optional parameters too.
+//
+// Here is an example report:
+//
+//     traceprof report (recorded 659/659 samples):
+//      50% TRACE  20      (14/4)   rate_limiter.lua:82
+//      13% TRACE  12:LOOP          basic_apps.lua:26
+//      10% TRACE  14               rate_limiter.lua:73
+//       3% TRACE  14:LOOP          rate_limiter.lua:73
+//       2% TRACE  18:LOOP          basic_apps.lua:82
+//       1% TRACE  22      (12/13)  basic_apps.lua:25
+//       1% TRACE  25      (20/5)   link.lua:70
+// 
+// The report includes some useful information:
+// 
+// * Which traces are hotspots? (Cross reference with -jdump)
+// * Where does each trace begin? (Source code line)
+// * How to traces connect? Side traces show (PARENT/EXIT).
+// * How much time is spent in the "LOOP" part of a trace vs outside?
+// 
+// Traceprof uses an interval timer to periodically write the CPU
+// Instruction Pointer value to a log (array). The timer fires every 1
+// millisecond (default) and invokes a tiny C signal handler to write
+// the next value.
+// 
+// This log is analyzed after measurement in a separate reporting
+// step. The logged Instruction Pointer values are compared with the
+// machine code addresses of all compiled traces (and their loop offsets).
+// 
+// Traceprof was originally written due to confusion about
+// interpreting the results of 'jit.p' and not understanding exactly
+// how its sampling method works.
+// 
+// Future work:
+// 
+// * Handle JIT "flush" event when existing traces are dropped.
+// * Dump annotated IR/mcode for hot traces (like -jdump).
+
+module(..., package.seeall);
+
+var ffi = require("ffi");
+var dump = require("jit.dump");
+var jutil = require("jit.util");
+
+require("lib.traceprof.traceprof_h");
+
+var log;
+var logsize;
+var starttime;
+
+function start (maxsamples, interval_usecs) {
+   // default: 1ms interval and 8MB (16 minute) buffer
+   maxsamples     = maxsamples || 1e6;
+   interval_usecs = interval_usecs || 1e3;
+   logsize = maxsamples;
+   log = ffi.new("uint64_t[?]", maxsamples);
+   ffi.C.traceprof_start(log, maxsamples, interval_usecs);
+}
+
+function stop () {
+   var total = ffi.C.traceprof_stop();
+   var nsamples = math.min(logsize, total);
+   print(("traceprof report (recorded %d/%d samples):")->format(nsamples, total));
+   report(log, nsamples);
+}
+
+function report (samples, nsamples) {
+   // Combine individual samples into a table of counts.
+   var counts = {};
+   for( i = 0, nsamples-1 ) {
+      var ip = tonumber(samples[i]);
+      counts[ip] = (counts[ip] || 0) + 1;
+   }
+   // Collect what is known about all existing traces.
+   var traces = {};
+   for( tracenr = 1, 1e5 ) {
+      var info = jutil.traceinfo(tracenr);
+      if( info ) { traces[tracenr] = info; } else { break; }
+      var extra = dump.info[tracenr];
+      if( extra ) { for( k,v in pairs(extra) ) { info[k] = v; } }
+   }
+   // Match samples up with traces.
+   var results = {};
+   for( ip, count in pairs(counts) ) {
+      for( trace, info in pairs(traces) ) {
+         if( ip >= info.mcode && ip <= info.mcode+info.szmcode ) {
+            var key;
+            if( info.mcloop > 0 && ip >= info.mcode + info.mcloop ) {
+               key = tostring(trace)..":LOOP";
+            } else {
+               key = tostring(trace);
+            }
+            results[key] = (results[key] || 0) + count;
+            break;
+         }
+      }
+   }
+   // Sort from most to least samples.
+   var order = {};
+   for( trace in pairs(results) ) {
+      table.insert(order, trace);
+   }
+   table.sort(order, function(a,b) { return results[a] > results[b]; });
+   for( _, trace in pairs(order) ) {
+      var tracenr = tonumber(string.match(trace, "^%d+")); // 123
+      var traceinfo = string.match(trace, ":.*") || "";    // ":LOOP"
+      var info = traces[tracenr];
+      // % of samples
+      var pct = results[trace]*100/nsamples;
+      // parent: show where side-traces originate (trace/exit)
+      var parent = "";
+      if( info.otr && info.oex ) {
+         parent = "("..info.otr.."/"..info.oex..")";
+      }
+      // link: show where the end of the trace branches to
+      var lnk = "";
+      var link, ltype = info.link, info.linktype;
+      if(     link == tracenr || link == 0 ) { lnk = "->"..ltype;
+      } else if( ltype == "root"              ) { lnk = "->"..link;
+      } else {                                     lnk = "->"..link.." "..ltype; }
+      // Show the source location where the trace starts
+      var loc = "";
+      if( info.func ) {
+         var fi = jutil.funcinfo(info.func, info.pc);
+         if( fi.loc ) { loc = fi.loc; }
+      }
+      var line = ("%3d%% TRACE %3d%-5s %-8s %-10s%s")->format(
+         pct, tracenr, traceinfo, parent, lnk, loc);
+      if( pct >= 1 ) {
+         print(line);
+      }
+   }
+}
+
+function selftest () {
+   var max, interval = 1000, 1000;
+   start(max, interval);
+   for( i = 1, 1e8 ) { 
+      for( xi = 1, 10 ) { } 
+   }
+   stop();
+}
+

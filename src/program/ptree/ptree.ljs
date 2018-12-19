@@ -1,0 +1,88 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+module(..., package.seeall);
+
+var engine    = require("core.app");
+var app_graph = require("core.config");
+var lib       = require("core.lib");
+var cpuset    = require("lib.cpuset");
+var yang      = require("lib.yang.yang");
+var ptree     = require("lib.ptree.ptree");
+
+var function fatal (msg, ...) {
+   print(string.format(msg, ...));
+   main.exit(1);
+}
+
+var function show_usage (exit_code) {
+   print(require("program.ptree.README_inc"));
+   if( exit_code ) { main.exit(exit_code); }
+}
+
+function parse_args (args) {
+   var opts = { verbosity = 1, cpuset = cpuset.new() };
+   var scheduling = { ingress_drop_monitor = 'flush' };
+   var handlers = {};
+   function handlers.n (arg) { opts.name = assert(arg); }
+   function handlers.v () { opts.verbosity = opts.verbosity + 1; }
+   function handlers.t (arg) { opts.trace = assert(arg); }
+   function handlers.D (arg) {
+      opts.duration = assert(tonumber(arg), "duration must be a number");
+      assert(opts.duration >= 0, "duration can't be negative");
+   }
+   function handlers.cpu (arg) {
+      opts.cpuset->add_from_string(arg);
+   }
+   handlers['real-time'] = function (arg) {
+      scheduling.real_time = true;
+   };
+   handlers["on-ingress-drop"] = function (arg) {
+      if( arg == 'flush' || arg == 'warn' ) {
+         scheduling.ingress_drop_monitor = arg;
+      } else if( arg == 'off' ) {
+         scheduling.ingress_drop_monitor = false;
+      } else {
+         fatal("invalid --on-ingress-drop argument: %s (valid values: %s)",
+               arg, "flush, warn, off");
+      }
+   };
+   function handlers.j (arg) { scheduling.j = arg; }
+   function handlers.h () { show_usage(0); }
+
+   args = lib.dogetopt(args, handlers, "vD:hn:j:t:",
+     { verbose = "v", duration = "D", help = "h", cpu = 1, trace = "t",
+       ["real-time"] = 0, ["on-ingress-drop"] = 1,
+       name="n" });
+
+   if( #args != 3 ) { show_usage(1); }
+
+   return opts, scheduling, unpack(args);
+}
+
+function run (args) {
+   var opts, scheduling, schema_file, setup_file, conf_file = parse_args(args);
+   var schema_name = yang.add_schema_file(schema_file);
+   var setup_thunk = loadfile(setup_file);
+   var conf = yang.load_configuration(conf_file, {schema_name=schema_name});
+
+   var setup_fn = setup_thunk();
+   if( ! type(setup_fn) ) {
+      fatal("Expected %s to evaluate to a function, instead got %s",
+            setup_file, tostring(setup_fn));
+   }
+
+   var manager = ptree.new_manager ({
+      name = opts.name,
+      setup_fn = setup_fn,
+      cpuset = opts.cpuset,
+      initial_configuration = conf,
+      schema_name = schema_name,
+      worker_default_scheduling = scheduling,
+      log_level = ({"WARN","INFO","DEBUG"})[opts.verbosity || 1] || "DEBUG",
+      rpc_trace_file = opts.trace,
+   });
+
+   manager->main(opts.duration);
+
+   manager->stop();
+}

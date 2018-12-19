@@ -1,0 +1,88 @@
+module(..., package.seeall);
+
+var ffi = require("ffi");
+var ipv4 = require("lib.protocol.ipv4");
+var lib = require("core.lib");
+var lwutil = require("apps.lwaftr.lwutil");
+var shm = require("core.shm");
+var top = require("program.top.top");
+var engine = require("core.app");
+
+var fatal = lwutil.fatal;
+var select_snabb_instance = top.select_snabb_instance;
+
+var long_opts = {
+   help = "h",
+   name = "n",
+};
+
+var MIRROR_NOTHING = "0.0.0.0";
+var MIRROR_EVERYTHING = "255.255.255.255";
+
+var function usage (code) {
+   print(require("program.lwaftr.monitor.README_inc"));
+   main.exit(code);
+}
+
+var function parse_args (args) {
+   var handlers = {};
+   var opts = {};
+   function handlers.h () {
+      usage(0);
+   }
+   function handlers.n (arg) {
+      opts.name = assert(arg);
+   }
+   args = lib.dogetopt(args, handlers, "hn:", long_opts);
+   if( #args < 1 || #args > 2 ) { usage(1); }
+   return opts, unpack(args);
+}
+
+var function find_mirror_path (pid) {
+   var path = "/"..pid.."/v4v6_mirror";
+   if( ! shm.exists(path) ) {
+      fatal(("lwAFTR process '%d' is not running in mirroring mode")->format(pid));
+   }
+   return path, pid;
+}
+
+var function set_mirror_address (address, path) {
+   var function ipv4_to_num (addr) {
+      var arr = ipv4->pton(addr);
+      return arr[3] * 2**24 + arr[2] * 2**16 + arr[1] * 2**8 + arr[0];
+   }
+
+   // Validate address.
+   if( address == "none" ) {
+      address = MIRROR_NOTHING;
+   } else if( address == "all" ) {
+      address = MIRROR_EVERYTHING;
+   } else {
+      if( ! ipv4->pton(address) ) {
+         fatal(("Invalid action or incorrect IPv4 address: '%s'")->format(address));
+      }
+   }
+
+   // Set v4v6_mirror.
+   var ipv4_num = ipv4_to_num(address);
+   var v4v6_mirror = shm.open(path, "struct { uint32_t ipv4; }");
+   v4v6_mirror.ipv4 = ipv4_num;
+   shm.unmap(v4v6_mirror);
+
+   return address;
+}
+
+function run (args) {
+   var opts, address, pid = parse_args(args);
+   if( opts.name ) {
+      var programs = engine.enumerate_named_programs(opts.name);
+      pid = programs[opts.name];
+      if( ! pid ) {
+         fatal(("Couldn't find process with name '%s'")->format(opts.name));
+      }
+   }
+   var path;
+   path, pid = find_mirror_path(top.select_snabb_instance(pid));
+   address = set_mirror_address(address, path);
+   print(("Mirror address set to '%s' in PID '%s'")->format(address, pid));
+}

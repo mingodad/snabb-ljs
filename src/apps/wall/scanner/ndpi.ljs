@@ -1,0 +1,138 @@
+var scanner = require("apps.wall.scanner");
+var const   = require("apps.wall.constants");
+var opt     = require("apps.wall.scanner.ndpi_opt");
+var util    = require("apps.wall.util");
+var ndpi    = require("ndpi");
+
+var rd32, ipv4_addr_cmp, ipv6_addr_cmp = util.rd32, util.ipv4_addr_cmp, util.ipv6_addr_cmp;
+var ETH_TYPE_IPv4  = const.ETH_TYPE_IPv4;
+var ETH_TYPE_IPv6  = const.ETH_TYPE_IPv6;
+var IPv4_PROTO_UDP = const.IPv4_PROTO_UDP;
+var IPv4_PROTO_TCP = const.IPv4_PROTO_TCP;
+
+var NdpiFlow = subClass();
+NdpiFlow._name = "SnabbWall nDPI Flow";
+
+function NdpiFlow::new(key) {
+   var f = NdpiFlow->superClass().new(this);
+   f._ndpi_flow   = ndpi.flow();
+   f._ndpi_src_id = ndpi.id();
+   f._ndpi_dst_id = ndpi.id();
+   f.protocol     = ndpi.protocol.PROTOCOL_UNKNOWN;
+   f.proto_master = ndpi.protocol.PROTOCOL_UNKNOWN;
+   f.key          = key;
+   f.packets      = 0;
+   f.last_seen    = 0;
+   return f;
+}
+
+function NdpiFlow::update_counters(time) {
+   this.packets = this.packets + 1;
+   this.last_seen = time;
+}
+
+var NdpiScanner = subClass(scanner.Scanner);
+NdpiScanner._name = "SnabbWall nDPI packet Scanner";
+
+function NdpiScanner::new(ticks_per_second) {
+   var s = NdpiScanner->superClass().new(this);
+   s.protocols = ndpi.protocol_bitmask()->set_all();
+   s._ndpi     = ndpi.detection_module(ticks_per_second || 1000)->set_protocol_bitmask(s.protocols);
+   s._flows    = {};
+   return s;
+}
+
+
+function NdpiScanner::get_flow(p) {
+   var key = (this->extract_packet_info(p));
+   return key && this._flows[key->hash()] || null;
+}
+
+function NdpiScanner::flows() {
+   var flows = this._flows;
+   return coroutine.wrap(function () {
+      for( _, flow in pairs(flows) ) {
+         coroutine.yield(flow);
+      }
+   });
+}
+
+function NdpiScanner::protocol_name(protocol) {
+   var name = ndpi.protocol[protocol];
+   if( name->sub(1, #"PROTOCOL_") == "PROTOCOL_" ) {
+      name = name->sub(#"PROTOCOL_" + 1);
+   }
+   return name;
+}
+
+// FIXME: Overall this needs checking for packet boundaries and sizes
+function NdpiScanner::scan_packet(p, time) {
+   // Extract packet information
+   var key, ip_offset, src_addr, src_port, dst_addr, dst_port = this->extract_packet_info(p);
+   if( ! key ) {
+      return false, null;
+   }
+
+   // Get an existing data flow or create a new one
+   var key_hash = key->hash();
+   var flow = this._flows[key_hash];
+   if( ! flow ) {
+      flow = NdpiFlow->new(key);
+      this._flows[key_hash] = flow;
+   }
+
+   flow->update_counters(time);
+   if( flow.protocol != ndpi.protocol.PROTOCOL_UNKNOWN ) {
+      return true, flow;
+   }
+
+   var src_id, dst_id = flow._ndpi_src_id, flow._ndpi_dst_id;
+   if( key->eth_type() == ETH_TYPE_IPv4 ) {
+      if( ipv4_addr_cmp(src_addr, key.lo_addr) != 0 ||
+         ipv4_addr_cmp(dst_addr, key.hi_addr) != 0 ||
+         src_port != key.lo_port || dst_port != key.hi_port
+      ) {
+         src_id, dst_id = dst_id, src_id;
+      }
+   } else if( key->eth_type() == ETH_TYPE_IPv6 ) {
+      if( ipv6_addr_cmp(src_addr, key.lo_addr) != 0 ||
+         ipv6_addr_cmp(dst_addr, key.hi_addr) != 0 ||
+         src_port != key.lo_port || dst_port != key.hi_port
+      ) {
+         src_id, dst_id = dst_id, src_id;
+      }
+   }
+
+   flow.proto_master, flow.protocol =
+         opt.process_packet(this._ndpi,
+                            flow._ndpi_flow,
+                            p.data + ip_offset,
+                            p.length - ip_offset,
+                            time,
+                            src_id,
+                            dst_id);
+
+   if( flow.protocol != ndpi.protocol.PROTOCOL_UNKNOWN ) {
+      return true, flow;
+   }
+
+   // TODO: Check and tune-up the constants for number of packets
+   // TODO: Do similarly for IPv6 packets once nDPI supports using IPv6
+   //       addresses here (see https://github.com/ntop/nDPI/issues/183)
+   if( (flow.key.ip_proto == IPv4_PROTO_UDP && flow.packets > 8) ||
+      (flow.key.ip_proto == IPv4_PROTO_TCP && flow.packets > 10)
+   ) {
+      flow.proto_master, flow.protocol =
+            opt.guess_undetected_protocol(this._ndpi,
+                                          flow.key.ip_proto,
+                                          rd32(src_addr), src_port,
+                                          rd32(dst_addr), dst_port);
+      // TODO: Check whether we should check again for PROTOCOL_UNKNOWN
+      return true, flow;
+   }
+
+   // Flow not yet identified
+   return false, flow;
+}
+
+return NdpiScanner;

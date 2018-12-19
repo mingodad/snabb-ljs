@@ -1,0 +1,178 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+module(...,package.seeall);
+
+var app = require("core.app");
+var packet = require("core.packet");
+var link = require("core.link");
+var ffi = require("ffi");
+var transmit, receive = link.transmit, link.receive;
+
+//- # `Source` app: generate synthetic packets
+
+Source = {};
+
+function Source::new(size) {
+   size = tonumber(size) || 60;
+   var data = ffi.new("char[?]", size);
+   var p = packet.from_pointer(data, size);
+   return setmetatable({size=size, packet=p}, {__index=Source});
+}
+
+function Source::pull () {
+   for( _, o in ipairs(this.output) ) {
+      for( i = 1, engine.pull_npackets ) {
+         transmit(o, packet.clone(this.packet));
+      }
+   }
+}
+
+function Source::stop () {
+   packet.free(this.packet);
+}
+
+//- # `Join` app: Merge multiple inputs onto one output
+
+Join = {};
+
+function Join::new() {
+   return setmetatable({}, {__index=Join});
+}
+
+function Join::push () {
+   for( _, inport in ipairs(this.input) ) {
+      while( ! link.empty(inport) ) {
+         transmit(this.output.output, receive(inport));
+      }
+   }
+}
+
+//- ### `Split` app: Split multiple inputs across multiple outputs
+
+// For each input port, push packets onto outputs. When one output
+// becomes full then continue with the next.
+Split = {};
+
+function Split::new () {
+   return setmetatable({}, {__index=Split});
+}
+
+function Split::push () {
+   for( _, i in ipairs(this.input) ) {
+      for( _, o in ipairs(this.output) ) {
+         for( _ = 1, link.nreadable(i) ) {
+            transmit(o, receive(i));
+         }
+      }
+   }
+}
+
+//- ### `Sink` app: Receive and discard packets
+
+Sink = {};
+
+function Sink::new () {
+   return setmetatable({}, {__index=Sink});
+}
+
+function Sink::push () {
+   for( _, i in ipairs(this.input) ) {
+      for( _ = 1, link.nreadable(i) ) {
+        var p = receive(i);
+        packet.free(p);
+      }
+   }
+}
+
+//- ### `Tee` app: Send inputs to all outputs
+
+Tee = {};
+
+function Tee::new () {
+   return setmetatable({}, {__index=Tee});
+}
+
+function Tee::push () {
+   var noutputs = #this.output;
+   if( noutputs > 0 ) {
+      for( _, i in ipairs(this.input) ) {
+         for( _ = 1, link.nreadable(i) ) {
+            var p = receive(i);
+            { var output = this.output;
+               for( k = 1, #output ) {
+                  transmit(output[k], k == #output && p || packet.clone(p));
+               }
+            }
+         }
+      }
+   }
+}
+
+//- ### `Repeater` app: Send all received packets in a loop
+
+Repeater = {};
+
+function Repeater::new () {
+   return setmetatable({index = 1, packets = {}},
+                       {__index=Repeater});
+}
+
+function Repeater::push () {
+   var i, o = this.input.input, this.output.output;
+   for( _ = 1, link.nreadable(i) ) {
+      var p = receive(i);
+      table.insert(this.packets, p);
+   }
+   var npackets = #this.packets;
+   if( npackets > 0 ) {
+      for( xi = 1, engine.pull_npackets ) {
+         assert(this.packets[this.index]);
+         transmit(o, packet.clone(this.packets[this.index]));
+         this.index = (this.index % npackets) + 1;
+      }
+   }
+}
+
+function Repeater::stop () {
+   for( i = 1, #this.packets ) {
+      packet.free(this.packets[i]);
+   }
+}
+
+//- # `Truncate` app: truncate or zero pad packet to length n
+
+Truncate = {};
+
+function Truncate::new (n) {
+   return setmetatable({n = n}, {__index=Truncate});
+}
+
+function Truncate::push () {
+   for( _ = 1, link.nreadable(this.input.input) ) {
+      var p = receive(this.input.input);
+      ffi.fill(p.data, math.min(0, this.n - p.length));
+      p.length = this.n;
+      transmit(this.output.output,p);
+   }
+}
+
+//- # `Sample` app: let through every nth packet
+
+Sample = {};
+
+function Sample::new (n) {
+   return setmetatable({n = n, seen = 1}, {__index=Sample});
+}
+
+function Sample::push () {
+   for( _ = 1, link.nreadable(this.input.input) ) {
+      var p = receive(this.input.input);
+      if( this.n == this.seen ) {
+         transmit(this.output.output, p);
+         this.seen = 1;
+      } else {
+         this.seen = this.seen + 1;
+         packet.free(p);
+      }
+   }
+}

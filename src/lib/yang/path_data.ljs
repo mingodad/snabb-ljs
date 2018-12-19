@@ -1,0 +1,529 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+module(..., package.seeall);
+
+var ffi = require("ffi");
+var lib = require("core.lib");
+var data = require("lib.yang.data");
+var value = require("lib.yang.value");
+var schema = require("lib.yang.schema");
+var parse_path = require("lib.yang.path").parse_path;
+var util = require("lib.yang.util");
+var normalize_id = data.normalize_id;
+
+var function table_keys(t) {
+   var ret = {};
+   for( k, v in pairs(t) ) { table.insert(ret, k); }
+   return ret;
+}
+
+function prepare_array_lookup(query) {
+   if( ! lib.equal(table_keys(query), {"position()"}) ) {
+      error("Arrays can only be indexed by position.");
+   }
+   var idx = tonumber(query["position()"]);
+   if( idx < 1 || idx != math.floor(idx) ) {
+      error("Arrays can only be indexed by positive integers.");
+   }
+   return idx;
+}
+
+function prepare_table_lookup(keys, ctype, query) {
+   var static_key = ctype && data.typeof(ctype)() || {};
+   for( k,_ in pairs(query) ) {
+      if( ! keys[k] ) { error("'"..k.."' is not a table key"); }
+   }
+   for( k,grammar in pairs(keys) ) {
+      var v = query[k] || grammar.default;
+      if( v == null ) {
+         error("Table query missing required key '"..k.."'");
+      }
+      var key_primitive_type = grammar.argument_type.primitive_type;
+      var parser = value.types[key_primitive_type].parse;
+      static_key[normalize_id(k)] = parser(v, 'path query value');
+   }
+   return static_key;
+}
+
+// Returns a resolver for a particular schema and *lua* path.
+function resolver(grammar, path_string) {
+   var function ctable_getter(key, getter) {
+      return function(data) {
+         data = getter(data)->lookup_ptr(key);
+         if( data == null ) { error("Not found"); }
+         return data.value;
+      };
+   }
+   var function table_getter(key, getter) {
+      return function(data) {
+         data = getter(data)[key];
+         if( data == null ) { error("Not found"); }
+         return data;
+      };
+   }
+   var function slow_table_getter(key, getter) {
+      return function(data) {
+         for( k,v in pairs(getter(data)) ) {
+            if( lib.equal(k, key) ) { return v; }
+         }
+         error("Not found");
+      };
+   }
+   var function compute_table_getter(grammar, key, getter) {
+      if( grammar.string_key ) {
+         return table_getter(key[normalize_id(grammar.string_key)], getter);
+      } else if( grammar.key_ctype && grammar.value_ctype ) {
+         return ctable_getter(key, getter);
+      } else if( grammar.key_ctype ) {
+         return table_getter(key, getter);
+      } else {
+         return slow_table_getter(key, getter);
+      }
+   }
+   var function handle_table_query(grammar, query, getter) {
+      var key = prepare_table_lookup(grammar.keys, grammar.key_ctype, query);
+      var child_grammar = {type="struct", members=grammar.values,
+                             ctype=grammar.value_ctype};
+      var child_getter = compute_table_getter(grammar, key, getter);
+      return child_getter, child_grammar;
+   }
+   var function handle_array_query(grammar, query, getter) {
+      var idx = prepare_array_lookup(query);
+      // Pretend that array elements are scalars.
+      var child_grammar = {type="scalar", argument_type=grammar.element_type,
+                             ctype=grammar.ctype};
+      var function child_getter(data) {
+         var array = getter(data);
+         if( idx > #array ) { error("Index out of bounds"); }
+         return array[idx];
+      }
+      return child_getter, child_grammar;
+   }
+   var function handle_query(grammar, query, getter) {
+      if( lib.equal(table_keys(query), {}) ) { return getter, grammar; }
+      if( grammar.type == 'array' ) {
+         return handle_array_query(grammar, query, getter);
+      } else if( grammar.type == 'table' ) {
+         return handle_table_query(grammar, query, getter);
+      } else {
+         error("Path query parameters only supported for structs and tables.");
+      }
+   }
+   var function compute_getter(grammar, name, query, getter) {
+      var child_grammar;
+      child_grammar = grammar.members[name];
+      if( ! child_grammar ) {
+         for( member_name, member in pairs(grammar.members) ) {
+            if( child_grammar ) { break; }
+            if( member.type == 'choice' ) {
+               for( case_name, case in pairs(member.choices) ) {
+                  if( child_grammar ) { break; }
+                  if( case[name] ) { child_grammar = case[name]; }
+               }
+            }
+         }
+      }
+      if( ! child_grammar ) {
+         error("Struct has no field named '"..name.."'.");
+      }
+      var id = normalize_id(name);
+      var function child_getter(data) {
+         var struct = getter(data);
+         var child = struct[id];
+         if( child == null ) {
+            error("Struct instance has no field named '"..name.."'.");
+         }
+         return child;
+      }
+      return handle_query(child_grammar, query, child_getter);
+   }
+   var getter = function(data) { return data; };
+   for( _, elt in ipairs(parse_path(path_string)) ) {
+      // All non-leaves of the path tree must be structs.
+      if( grammar.type != 'struct' ) { error("Invalid path."); }
+      getter, grammar = compute_getter(grammar, elt.name, elt.query, getter);
+   }
+   return getter, grammar;
+}
+resolver = util.memoize(resolver);
+
+var function printer_for_grammar(grammar, path, format, print_default) {
+   var getter, subgrammar = resolver(grammar, path);
+   var printer;
+   if( format == "xpath" ) {
+      printer = data.xpath_printer_from_grammar(subgrammar, print_default, path);
+   } else {
+      printer = data.data_printer_from_grammar(subgrammar, print_default);
+   }
+   return function(data, file) {
+      return printer(getter(data), file);
+   };
+}
+
+var function printer_for_schema(schema, path, is_config, format,
+                                  print_default) {
+   var grammar = data.data_grammar_from_schema(schema, is_config);
+   return printer_for_grammar(grammar, path, format, print_default);
+}
+
+function printer_for_schema_by_name(schema_name, path, is_config, format,
+                                    print_default) {
+   var schema = schema.load_schema_by_name(schema_name);
+   return printer_for_schema(schema, path, is_config, format, print_default);
+}
+printer_for_schema_by_name = util.memoize(printer_for_schema_by_name);
+
+var function parser_for_grammar(grammar, path) {
+   var getter, subgrammar = resolver(grammar, path);
+   return data.data_parser_from_grammar(subgrammar);
+}
+
+var function parser_for_schema(schema, path) {
+   var grammar = data.config_grammar_from_schema(schema);
+   return parser_for_grammar(grammar, path);
+}
+
+function parser_for_schema_by_name(schema_name, path) {
+   return parser_for_schema(schema.load_schema_by_name(schema_name), path);
+}
+parser_for_schema_by_name = util.memoize(parser_for_schema_by_name);
+
+var function setter_for_grammar(grammar, path) {
+   if( path == "/" ) {
+      return function(config, subconfig) { return subconfig; };
+   }
+   var head, tail = lib.dirname(path), lib.basename(path);
+   var tail_path = parse_path(tail);
+   var tail_name, query = tail_path[1].name, tail_path[1].query;
+   var getter;
+   if( lib.equal(query, {}) ) {
+      // No query; the simple case.
+      getter, grammar = resolver(grammar, head);
+      assert(grammar.type == 'struct');
+      var tail_id = data.normalize_id(tail_name);
+      return function(config, subconfig) {
+         getter(config)[tail_id] = subconfig;
+         return config;
+      };
+   }
+
+   // Otherwise the path ends in a query; it must denote an array or
+   // table item.
+   getter, grammar = resolver(grammar, head..'/'..tail_name);
+   if( grammar.type == 'array' ) {
+      var idx = prepare_array_lookup(query);
+      return function(config, subconfig) {
+         var array = getter(config);
+         assert(idx <= #array);
+         array[idx] = subconfig;
+         return config;
+      };
+   } else if( grammar.type == 'table' ) {
+      var key = prepare_table_lookup(grammar.keys, grammar.key_ctype, query);
+      if( grammar.string_key ) {
+         key = key[data.normalize_id(grammar.string_key)];
+         return function(config, subconfig) {
+            var tab = getter(config);
+            assert(tab[key] != null);
+            tab[key] = subconfig;
+            return config;
+         };
+      } else if( grammar.key_ctype && grammar.value_ctype ) {
+         return function(config, subconfig) {
+            getter(config)->update(key, subconfig);
+            return config;
+         };
+      } else if( grammar.key_ctype ) {
+         return function(config, subconfig) {
+            var tab = getter(config);
+            assert(tab[key] != null);
+            tab[key] = subconfig;
+            return config;
+         };
+      } else {
+         return function(config, subconfig) {
+            var tab = getter(config);
+            for( k,v in pairs(tab) ) {
+               if( lib.equal(k, key) ) {
+                  tab[k] = subconfig;
+                  return config;
+               }
+            }
+            error("Not found");
+         };
+      }
+   } else {
+      error('Query parameters only allowed on arrays and tables');
+   }
+}
+
+var function setter_for_schema(schema, path) {
+   var grammar = data.config_grammar_from_schema(schema);
+   return setter_for_grammar(grammar, path);
+}
+
+function setter_for_schema_by_name(schema_name, path) {
+   return setter_for_schema(schema.load_schema_by_name(schema_name), path);
+}
+setter_for_schema_by_name = util.memoize(setter_for_schema_by_name);
+
+var function adder_for_grammar(grammar, path) {
+   var top_grammar = grammar;
+   var getter;
+   getter, grammar = resolver(grammar, path);
+   if( grammar.type == 'array' ) {
+      if( grammar.ctype ) {
+         // It's an FFI array; have to create a fresh one, sadly.
+         var setter = setter_for_grammar(top_grammar, path);
+         var elt_t = data.typeof(grammar.ctype);
+         var array_t = ffi.typeof('$[?]', elt_t);
+         return function(config, subconfig) {
+            var cur = getter(config);
+            var new = array_t(#cur + #subconfig);
+            var i = 1;
+            for( _,elt in ipairs(cur) ) { new[i-1] = elt; ++i    ; }
+            for( _,elt in ipairs(subconfig) ) { new[i-1] = elt; ++i    ; }
+            return setter(config, util.ffi_array(new, elt_t));
+         };
+      }
+      // Otherwise we can add entries in place.
+      return function(config, subconfig) {
+         var cur = getter(config);
+         for( _,elt in ipairs(subconfig) ) { table.insert(cur, elt); }
+         return config;
+      };
+   } else if( grammar.type == 'table' ) {
+      // Invariant: either all entries in the new subconfig are added,
+      // or none are.
+      if( grammar.key_ctype && grammar.value_ctype ) {
+         // ctable.
+         return function(config, subconfig) {
+            var ctab = getter(config);
+            for( entry in subconfig->iterate() ) {
+               if( ctab->lookup_ptr(entry.key) != null ) {
+                  error('already-existing entry');
+               }
+            }
+            for( entry in subconfig->iterate() ) {
+               ctab->add(entry.key, entry.value);
+            }
+            return config;
+         };
+      } else if( grammar.string_key || grammar.key_ctype ) {
+         // cltable or string-keyed table.
+         var pairs = grammar.key_ctype && cltable.pairs || pairs;
+         return function(config, subconfig) {
+            var tab = getter(config);
+            for( k,_ in pairs(subconfig) ) {
+               if( tab[k] != null ) { error('already-existing entry'); }
+            }
+            for( k,v in pairs(subconfig) ) { tab[k] = v; }
+            return config;
+         };
+      } else {
+         // Sad quadratic loop.
+         return function(config, subconfig) {
+            var tab = getter(config);
+            for( key,val in pairs(tab) ) {
+               for( k,_ in pairs(subconfig) ) {
+                  if( lib.equal(key, k) ) {
+                     error('already-existing entry', key);
+                  }
+               }
+            }
+            for( k,v in pairs(subconfig) ) { tab[k] = v; }
+            return config;
+         };
+      }
+   } else {
+      error('Add only allowed on arrays and tables');
+   }
+}
+
+var function adder_for_schema(schema, path) {
+   var grammar = data.config_grammar_from_schema(schema);
+   return adder_for_grammar(grammar, path);
+}
+
+function adder_for_schema_by_name (schema_name, path) {
+   return adder_for_schema(schema.load_schema_by_name(schema_name), path);
+}
+adder_for_schema_by_name = util.memoize(adder_for_schema_by_name);
+
+var function remover_for_grammar(grammar, path) {
+   var top_grammar = grammar;
+   var head, tail = lib.dirname(path), lib.basename(path);
+   var tail_path = parse_path(tail);
+   var tail_name, query = tail_path[1].name, tail_path[1].query;
+   var head_and_tail_name = head..'/'..tail_name;
+   var getter;
+   getter, grammar = resolver(grammar, head_and_tail_name);
+   if( grammar.type == 'array' ) {
+      if( grammar.ctype ) {
+         // It's an FFI array; have to create a fresh one, sadly.
+         var idx = prepare_array_lookup(query);
+         var setter = setter_for_grammar(top_grammar, head_and_tail_name);
+         var elt_t = data.typeof(grammar.ctype);
+         var array_t = ffi.typeof('$[?]', elt_t);
+         return function(config) {
+            var cur = getter(config);
+            assert(idx <= #cur);
+            var new = array_t(#cur - 1);
+            for( i,elt in ipairs(cur) ) {
+               if( i < idx ) { new[i-1] = elt; }
+               if( i > idx ) { new[i-2] = elt; }
+            }
+            return setter(config, util.ffi_array(new, elt_t));
+         };
+      }
+      // Otherwise we can remove the entry in place.
+      return function(config) {
+         var cur = getter(config);
+         assert(i <= #cur);
+         table.remove(cur, i);
+         return config;
+      };
+   } else if( grammar.type == 'table' ) {
+      var key = prepare_table_lookup(grammar.keys, grammar.key_ctype, query);
+      if( grammar.string_key ) {
+         key = key[data.normalize_id(grammar.string_key)];
+         return function(config) {
+            var tab = getter(config);
+            assert(tab[key] != null);
+            tab[key] = null;
+            return config;
+         };
+      } else if( grammar.key_ctype && grammar.value_ctype ) {
+         return function(config) {
+            getter(config)->remove(key);
+            return config;
+         };
+      } else if( grammar.key_ctype ) {
+         return function(config) {
+            var tab = getter(config);
+            assert(tab[key] != null);
+            tab[key] = null;
+            return config;
+         };
+      } else {
+         return function(config) {
+            var tab = getter(config);
+            for( k,v in pairs(tab) ) {
+               if( lib.equal(k, key) ) {
+                  tab[k] = null;
+                  return config;
+               }
+            }
+            error("Not found");
+         };
+      }
+   } else {
+      error('Remove only allowed on arrays and tables');
+   }
+}
+
+var function remover_for_schema(schema, path) {
+   var grammar = data.config_grammar_from_schema(schema);
+   return remover_for_grammar(grammar, path);
+}
+
+function remover_for_schema_by_name (schema_name, path) {
+   return remover_for_schema(schema.load_schema_by_name(schema_name), path);
+}
+remover_for_schema_by_name = util.memoize(remover_for_schema_by_name);
+
+function selftest() {
+   print("selftest: lib.yang.path_data");
+   var schema_src = [=[module snabb-simple-router {
+      namespace snabb:simple-router;
+      prefix simple-router;
+
+      import ietf-inet-types {prefix inet;}
+
+      leaf active { type boolean; default true; }
+      leaf-list blocked-ips { type inet:ipv4-address; }
+
+      container routes {
+         list route {
+            key addr;
+            leaf addr { type inet:ipv4-address; mandatory true; }
+            leaf port { type uint8 { range 0..11; } mandatory true; }
+         }
+      }}]=];
+
+   var scm = schema.load_schema(schema_src, "xpath-test");
+   var grammar = data.config_grammar_from_schema(scm);
+
+   // Test resolving a key to a path.
+   var data_src = [=[
+      active true;
+
+      blocked-ips 8.8.8.8;
+      blocked-ips 8.8.4.4;
+
+      routes {
+         route { addr 1.2.3.4; port 2; }
+         route { addr 2.3.4.5; port 2; }
+         route { addr 255.255.255.255; port 7; }
+      }
+   ]=];
+
+   var d = data.load_config_for_schema(scm, data_src);
+
+   // Try resolving a path in a list (ctable).
+   var getter = resolver(grammar, "/routes/route[addr=1.2.3.4]/port");
+   assert(getter(d) == 2);
+
+   getter = resolver(grammar, "/routes/route[addr=255.255.255.255]/port");
+   assert(getter(d) == 7);
+
+   // Try resolving a leaf-list
+   getter = resolver(grammar, "/blocked-ips[position()=1]");
+   assert(getter(d) == util.ipv4_pton("8.8.8.8"));
+
+   // Try resolving a path for a list (non-ctable)
+   var fruit_schema_src = [=[module fruit-bowl {
+      namespace snabb:fruit-bowl;
+      prefix simple-router;
+
+      import ietf-inet-types {prefix inet;}
+
+      container bowl {
+         list fruit {
+            key name;
+            leaf name { type string; mandatory true; }
+            leaf rating { type uint8 { range 0..10; } mandatory true; }
+            choice C {
+               case A { leaf AA { type string; } }
+               case B { leaf BB { type string; } }
+            }
+         }
+      }}]=];
+   var fruit_data_src = [=[
+      bowl {
+         fruit { name "banana"; rating 10; }
+         fruit { name "pear"; rating 2; }
+         fruit { name "apple"; rating 6; }
+         fruit { name "kumquat"; rating 6; AA aa; }
+         fruit { name "tangerine"; rating 6; BB bb; }
+      }
+   ]=];
+
+   var fruit_scm = schema.load_schema(fruit_schema_src, "xpath-fruit-test");
+   var fruit_prod = data.config_grammar_from_schema(fruit_scm);
+   var fruit_data = data.load_config_for_schema(fruit_scm, fruit_data_src);
+
+   getter = resolver(fruit_prod, "/bowl/fruit[name=banana]/rating");
+   assert(getter(fruit_data) == 10);
+
+   getter = resolver(fruit_prod, "/bowl/fruit[name=apple]/rating");
+   assert(getter(fruit_data) == 6);
+
+   getter = resolver(fruit_prod, "/bowl/fruit[name=kumquat]/AA");
+   assert(getter(fruit_data) == 'aa');
+
+   getter = resolver(fruit_prod, "/bowl/fruit[name=tangerine]/BB");
+   assert(getter(fruit_data) == 'bb');
+
+   print("selftest: ok");
+}

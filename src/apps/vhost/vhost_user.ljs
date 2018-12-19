@@ -1,0 +1,474 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+//
+// See http://www.virtualopensystems.com/en/solutions/guides/snabbswitch-qemu/
+
+module(...,package.seeall);
+
+var basic_apps= require("apps.basic.basic_apps");
+var pcap      = require("apps.pcap.pcap");
+var app       = require("core.app");
+var config    = require("core.config");
+var lib       = require("core.lib");
+var link      = require("core.link");
+var main      = require("core.main");
+var memory    = require("core.memory");
+var pci       = require("lib.hardware.pci");
+var net_device= require("lib.virtio.net_device");
+var timer     = require("core.timer");
+var ffi       = require("ffi");
+var C         = ffi.C;
+var syscall   = require("syscall"); // for FFI vhost structs
+
+require("apps.vhost.vhost_h");
+require("apps.vhost.vhost_user_h");
+
+assert(ffi.sizeof("struct vhost_user_msg") == 276, "ABI error");
+
+VhostUser = {};
+
+function VhostUser::new (args) {
+   var o = { state = 'init',
+      dev = null,
+      msg = ffi.new("struct vhost_user_msg"),
+      nfds = ffi.new("int[1]"),
+      fds = ffi.new("int[?]", C.VHOST_USER_MEMORY_MAX_NREGIONS),
+      socket_path = args.socket_path,
+      mem_table = {},
+      // process qemu messages timer
+      process_qemu_timer = timer.new(
+         "process qemu timer",
+         function () { this->process_qemu_requests(); },
+         5e8,// 500 ms
+         'non-repeating'
+      )
+   };
+   this = setmetatable(o, {__index = VhostUser});
+   this.dev = net_device.VirtioNetDevice->new(this,
+                                             args.disable_mrg_rxbuf,
+                                             args.disable_indirect_desc);
+   if( args.is_server ) {
+      this.listen_socket = C.vhost_user_listen(this.socket_path);
+      assert(this.listen_socket >= 0);
+      this.qemu_connect = this.server_connect;
+   } else {
+      this.qemu_connect = this.client_connect;
+   }
+   return this;
+}
+
+function VhostUser::stop() {
+   // set state
+   this.connected = false;
+   this.vhost_ready = false;
+   // close the socket
+   if( this.socket ) {
+      C.close(this.socket);
+      this.socket = null;
+   }
+   // clear the mmap-ed memory
+   this->free_mem_table();
+
+   if( this.link_down_proc ) { this.link_down_proc(); }
+}
+
+function VhostUser::pull () {
+   if( ! this.connected ) {
+      this->connect();
+   } else {
+      if( this.vhost_ready ) {
+         this.dev->poll_vring_receive();
+      }
+   }
+}
+
+function VhostUser::push () {
+   if( this.vhost_ready ) {
+      this.dev->poll_vring_transmit();
+   }
+}
+
+// Try to connect to QEMU.
+function VhostUser::client_connect () {
+   return C.vhost_user_connect(this.socket_path);
+}
+
+function VhostUser::server_connect () {
+   return C.vhost_user_accept(this.listen_socket);
+}
+
+function VhostUser::connect () {
+   var res = this->qemu_connect();
+   if( res >= 0 ) {
+      this.socket = res;
+      this.connected = true;
+      // activate the process timer once
+      timer.activate(this.process_qemu_timer);
+   }
+}
+
+// vhost_user protocol request handlers.
+
+// Table of request code -> name of handler method
+handler_names = {
+   [C.VHOST_USER_NONE]                  = 'none',
+   [C.VHOST_USER_GET_FEATURES]          = 'get_features',
+   [C.VHOST_USER_SET_FEATURES]          = 'set_features',
+   [C.VHOST_USER_SET_OWNER]             = 'set_owner',
+   [C.VHOST_USER_RESET_OWNER]           = 'reset_owner',
+   [C.VHOST_USER_SET_MEM_TABLE]         = 'set_mem_table',
+   [C.VHOST_USER_SET_LOG_BASE]          = 'set_log_base',
+   [C.VHOST_USER_SET_LOG_FD]            = 'set_log_fd',
+   [C.VHOST_USER_SET_VRING_NUM]         = 'set_vring_num',
+   [C.VHOST_USER_SET_VRING_ADDR]        = 'set_vring_addr',
+   [C.VHOST_USER_SET_VRING_BASE]        = 'set_vring_base',
+   [C.VHOST_USER_GET_VRING_BASE]        = 'get_vring_base',
+   [C.VHOST_USER_SET_VRING_KICK]        = 'set_vring_kick',
+   [C.VHOST_USER_SET_VRING_CALL]        = 'set_vring_call',
+   [C.VHOST_USER_SET_VRING_ERR]         = 'set_vring_err',
+   [C.VHOST_USER_GET_PROTOCOL_FEATURES] = 'get_protocol_features',
+   [C.VHOST_USER_SET_PROTOCOL_FEATURES] = 'set_protocol_features',
+   [C.VHOST_USER_GET_QUEUE_NUM]         = 'get_queue_num',
+   [C.VHOST_USER_SET_VRING_ENABLE]      = 'set_vring_enable'
+};
+
+// Process all vhost_user requests from QEMU.
+function VhostUser::process_qemu_requests () {
+   var msg = this.msg;
+   var stop = false;
+
+   if( ! this.connected ) { return; }
+
+   do {
+      var ret = C.vhost_user_receive(this.socket, msg, this.fds, this.nfds);
+
+      if( ret > 0 ) {
+         assert(msg.request >= 0 && msg.request <= C.VHOST_USER_MAX);
+         debug("vhost_user: request", handler_names[msg.request], msg.request);
+         var method = this[handler_names[msg.request]];
+         if( method ) {
+            method(this, msg, this.fds, this.nfds[0]);
+         } else {
+            error(string.format("vhost_user: unrecognized request: %d", msg.request));
+         }
+         msg.request = -1;
+      } else {
+         stop = true;
+         if( ret == 0 ) {
+            print("vhost_user: Connection went down: "..this.socket_path);
+            this->stop();
+         }
+      }
+   } while(!( stop) );
+
+   // if we're still connected activate the timer once again
+   if( this.connected ) { timer.activate(this.process_qemu_timer); }
+}
+
+function VhostUser::none (msg) {
+   error(string.format("vhost_user: unrecognized request: %d", msg.request));
+}
+
+function VhostUser::get_features (msg) {
+   msg.u64 = this.dev->get_features();
+   msg.size = ffi.sizeof("uint64_t");
+   // In future add TSO4/TSO6/UFO/ECN and control channel
+   this->reply(msg);
+}
+
+function VhostUser::set_features (msg) {
+   // Check if we have an up-to-date feature to override with
+   var features = this->update_features(tonumber(msg.u64));
+   this.dev->set_features(features);
+}
+
+function VhostUser::get_protocol_features (msg) {
+   msg.u64 = 0ULL; // no extensions supported for now
+   msg.size = ffi.sizeof("uint64_t");
+   this->reply(msg);
+}
+
+function VhostUser::set_protocol_features (msg) {
+   // ignore protocol features for now (FIXME)
+}
+
+function VhostUser::get_queue_num (msg) {
+   // ignore for now (FIXME)
+}
+
+// Handle VHOST_USER_SET_VRING_ENABLE, which explicitly enables/disables the
+// ring (this msg is only used if VHOST_USER_F_PROTOCOL_FEATURES is used)
+function VhostUser::set_vring_enable (msg) {
+   this.vhost_ready = msg.u64 != 0;
+}
+
+// Feature cache: A kludge to be compatible with a "QEMU reconnect" patch.
+//
+// QEMU upstream (circa 2015) does not support the vhost-user device
+// (Snabb) reconnecting to QEMU. That is unfortunate because being
+// able to reconnect after a restart of either the Snabb process or
+// simply a vhost-user app is very practical.
+//
+// Reconnect support can however be enabled in QEMU with a small patch
+// [1]. Caveat: Feature negotiation does not work reliably on the new
+// connections and may provide an invalid feature list. Workaround:
+// Cache the most recently negotiated features for each vhost-user
+// socket and reuse those when available.
+//
+// This is far from perfect but it is better than nothing.
+// Reconnecting to QEMU VMs is very practical and enables faster
+// development, restart of the Snabb process for recovery or upgrade,
+// and stop/start of vhost-user app instances e.g. due to
+// configuration changes.
+//
+// QEMU upstream seem to be determined to solve the reconnect problem
+// by requiring changes to the guest drivers so that the device could
+// request a reset. However, this has the undesirable properties that
+// it will not be transparent to the guest and nor will it work on
+// existing guest drivers.
+//
+// And so for now we have this cache for people who want to patch
+// reconnect support into their QEMU...
+//
+// 1: QEMU patch:
+//   https://github.com/SnabbCo/qemu/commit/f393aea2301734647fdf470724433f44702e3fb9.patch
+
+// Consider using virtio-net feature cache to override negotiated features.
+function VhostUser::update_features (features) {
+   var stat = syscall.stat(this.socket_path);
+   var mtime = ("%d.%d")->format(tonumber(stat.st_mtime),
+                                  tonumber(stat.st_mtime_nsec));
+   var cachepath = "/tmp/vhost_features_"..string.gsub(this.socket_path, "/", "__");
+   var f = io.open(cachepath, 'r');
+   // Use cached features when:
+   //   Negotiating features for the first time for this app instance
+   //   Cache is populated
+   //   QEMU vhost-user socket file has same timestamp as cache
+   if( ! this.have_negotiated_features && f ) {
+      var file_features, file_mtime = f->read('*a')->match("features:(.*) mtime:(.*)\n");
+      f->close();
+      if( file_mtime == mtime ) {
+         print(("vhost_user: Read cached features (0x%s) from %s")->format(
+               bit.tohex(file_features), cachepath));
+         return tonumber(file_features);
+      } else {
+         print(("vhost_user: Skipped old feature cache in %s")->format(cachepath));
+      }
+   }
+   // Features are now negotiated for this app instance. If they are
+   // negotiated again it will presumably be due to guest driver
+   // restart and in that case we should trust the new features rather
+   // than overriding them with the cache.
+   this.have_negotiated_features = true;
+   // Cache features after they are negotiated
+   f = io.open(cachepath, 'w');
+   if( f ) {
+      print(("vhost_user: Caching features (0x%s) in %s")->format(
+            bit.tohex(features), cachepath));
+      f->write(("features:%s mtime:%s\n")->format("0x"..bit.tohex(features), mtime));
+      f->close();
+   } else {
+      print(("vhost_user: Failed to open cache file - %s")->format(cachepath));
+   }
+   io.flush();
+   return features;
+}
+
+function VhostUser::set_owner (msg) {
+}
+
+function VhostUser::reset_owner (msg) {
+   // Disable vhost processing until the guest reattaches.
+   this.vhost_ready = false;
+}
+
+function VhostUser::set_vring_num (msg) {
+   this.dev->set_vring_num(msg.state.index, msg.state.num);
+}
+
+function VhostUser::set_vring_call (msg, fds, nfds) {
+   var idx = tonumber(bit.band(msg.u64, C.VHOST_USER_VRING_IDX_MASK));
+   var validfd = bit.band(msg.u64, C.VHOST_USER_VRING_NOFD_MASK) == 0;
+
+   assert(idx<42);
+   if( validfd ) {
+      assert(nfds == 1);
+      this.dev->set_vring_call(idx, fds[0]);
+   }
+}
+
+function VhostUser::set_vring_kick (msg, fds, nfds) {
+   var idx = tonumber(bit.band(msg.u64, C.VHOST_USER_VRING_IDX_MASK));
+   var validfd = bit.band(msg.u64, C.VHOST_USER_VRING_NOFD_MASK) == 0;
+
+   // Kick enables processing in vhost-user protocol
+   this.vhost_ready = true;
+   // Compile a new optimized fast-path for the vring processing
+   this.dev->rejit();
+
+   assert(idx < 42);
+   if( validfd ) {
+      assert(nfds == 1);
+      this.dev->set_vring_kick(idx, fds[0]);
+   } else {
+      print("vhost_user: Should start polling on virtq "..tonumber(idx));
+   }
+}
+
+function VhostUser::set_vring_addr (msg) {
+   var desc  = this.dev->map_from_qemu(msg.addr.desc_user_addr);
+   var used  = this.dev->map_from_qemu(msg.addr.used_user_addr);
+   var avail = this.dev->map_from_qemu(msg.addr.avail_user_addr);
+   var ring = { desc  = ffi.cast("struct vring_desc *", desc),
+      used  = ffi.cast("struct vring_used *", used),
+      avail = ffi.cast("struct vring_avail *", avail) };
+
+   this.dev->set_vring_addr(msg.addr.index, ring);
+
+   if( this.dev->ready() ) {
+      if( ! this.vhost_ready ) {
+         print("vhost_user: Connected and initialized: "..this.socket_path);
+      }
+      this.vhost_ready = true;
+   }
+}
+
+function VhostUser::set_vring_base (msg) {
+   debug("vhost_user: set_vring_base", msg.state.index, msg.state.num);
+   this.dev->set_vring_base(msg.state.index, msg.state.num);
+}
+
+function VhostUser::get_vring_base (msg) {
+   msg.state.num = this.dev->get_vring_base(msg.state.index);
+   msg.size = ffi.sizeof("struct vhost_vring_state");
+
+   // get_vring_base disables vring processing in vhost-user protocol
+   this.vhost_ready = false;
+
+   this->reply(msg);
+}
+
+function VhostUser::set_mem_table (msg, fds, nfds) {
+   assert(nfds == msg.memory.nregions);
+
+   // ensure the mem table is empty before we start
+   this->free_mem_table();
+
+   for( i = 0, msg.memory.nregions - 1 ) {
+      assert(fds[i] > 0);
+
+      var guest = msg.memory.regions[i].guest_phys_addr;
+      var size = msg.memory.regions[i].memory_size;
+      var qemu = msg.memory.regions[i].userspace_addr;
+      var offset = msg.memory.regions[i].mmap_offset;
+
+      var mmap_fd = fds[i];
+      var mmap_size = offset + size;
+      var mmap_pointer = C.vhost_user_map_guest_memory(mmap_fd, mmap_size);
+      var pointer = ffi.cast("char *", mmap_pointer);
+      pointer = pointer + offset; // advance to the offset
+
+      this.mem_table[i] = {
+         mmap_pointer = mmap_pointer,
+         mmap_size = mmap_size,
+         guest = guest,
+         qemu  = qemu,
+         snabb = ffi.cast("int64_t", pointer),
+         size  = tonumber(size) };
+
+      C.close(mmap_fd);
+   }
+   this.dev->set_mem_table(this.mem_table);
+}
+
+function VhostUser::free_mem_table () {
+   if( table.getn(this.mem_table) == 0 ) {
+      return;
+   }
+
+   for( i = 0, table.getn(this.mem_table) ) {
+      var mmap_pointer = this.mem_table[i].mmap_pointer;
+      var mmap_size = lib.align(this.mem_table[i].mmap_size, memory.huge_page_size);
+      C.vhost_user_unmap_guest_memory(mmap_pointer, mmap_size);
+   }
+
+   this.mem_table = {};
+}
+
+function VhostUser::reply (req) {
+   assert(this.socket);
+   req.flags = 5;
+   C.vhost_user_send(this.socket, req);
+}
+
+function VhostUser::report() {
+   if( this.connected ) { this.dev->report();
+   } else { print("Not connected."); }
+}
+
+function VhostUser::rx_buffers() {
+   return this.dev->rx_buffers();
+}
+
+function selftest () {
+   print("selftest: vhost_user");
+   // Create an app network that proxies packets between a vhost_user
+   // port (qemu) and a sink. Create
+   // separate pcap traces for packets received from vhost.
+   //
+   // schema for traffic from the VM:
+   //
+   // vhost -> tee -> sink
+   //           |
+   //           v
+   //       vhost pcap
+   //
+
+   var vhost_user_sock = os.getenv("SNABB_TEST_VHOST_USER_SOCKET");
+   if( ! vhost_user_sock ) {
+      print("SNABB_TEST_VHOST_USER_SOCKET was not set\nTest skipped");
+      os.exit(app.test_skipped_code);
+   }
+   var server = os.getenv("SNABB_TEST_VHOST_USER_SERVER");
+   var c = config.new();
+   config.app(c, "vhost_user", VhostUser, {socket_path=vhost_user_sock, is_server=server});
+   //config.app(c, "vhost_dump", pcap.PcapWriter, "vhost_vm_dump.cap")
+   config.app(c, "vhost_tee", basic_apps.Tee);
+   config.app(c, "sink", basic_apps.Sink);
+   config.app(c, "source", basic_apps.Source, "250");
+   config.app(c, "source_tee", basic_apps.Tee);
+
+   config.link(c, "vhost_user.tx -> vhost_tee.input");
+   //config.link(c, "vhost_tee.dump -> vhost_dump.input")
+   config.link(c, "vhost_tee.traffic -> sink.in");
+
+   config.link(c, "source.tx -> source_tee.input");
+   config.link(c, "source_tee.traffic -> vhost_user.rx");
+
+   app.configure(c);
+   var vhost_user = app.app_table.vhost_user;
+   vhost_user.link_down_proc = function() {
+      main.exit(0);
+   };
+   var source = app.app_table.source;
+
+   var fn = function () {
+      var vu = app.apps.vhost_user;
+      app.report();
+      if( vhost_user.vhost_ready ) {
+         vhost_user->report();
+      }
+   };
+   timer.activate(timer.new("report", fn, 10e9, 'repeating'));
+
+   // Check that vhost_user:report() works in unconnected state.
+   vhost_user->report();
+
+   app.main();
+}
+
+function ptr (x) { return ffi.cast("void*",x); }
+
+function debug (...) {
+   if( _G.developer_debug ) { print(...); }
+}

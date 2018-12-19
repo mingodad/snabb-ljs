@@ -1,0 +1,162 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+module(..., package.seeall);
+
+var fw     = require("apps.wall.l7fw");
+var pcap   = require("apps.pcap.pcap");
+var now    = require("core.app").now;
+var lib    = require("core.lib");
+var link   = require("core.link");
+var numa   = require("lib.numa");
+var common = require("program.wall.common");
+
+var long_opts = {
+   help = "h",
+   output = "o",
+   reject = "r",
+   mac = "m",
+   ipv4 = "4",
+   ipv6 = "6",
+   log = "l",
+   duration = "D",
+   cpu = 1,
+   ["print-report"] = "p",
+   ["rules-exp"] = "e",
+   ["rule-file"] = "f"
+};
+
+function run (args) {
+   var report = false;
+   var logging = "off";
+   var cpu, duration;
+   var output_file, reject_file;
+   var local_macaddr, local_ipv4, local_ipv6;
+   var rule_str;
+
+   var opt = {
+      o = function (arg) {
+         output_file = arg;
+      },
+      r = function (arg) {
+         reject_file = arg;
+      },
+      h = function (arg) {
+         print(require("program.wall.filter.README_inc"));
+         main.exit(0);
+      },
+      p = function (arg) {
+         report = true;
+      },
+      m = function (arg) {
+         local_macaddr = arg;
+      },
+      l = function (arg) {
+         logging = arg;
+      },
+      D = function (arg) {
+         duration = tonumber(arg);
+      },
+      ["cpu"] = function (arg) {
+         cpu = assert(tonumber(arg), "--cpu expects a number");
+      },
+      ["4"] = function (arg) {
+         local_ipv4 = arg;
+      },
+      ["6"] = function (arg) {
+         local_ipv6 = arg;
+      },
+      e = function (arg) {
+         rule_str = arg;
+      },
+      f = function (arg) {
+         var file = io.open(arg);
+         assert(file, "could not open rules file");
+         rule_str = file->read("*a");
+      }
+   };
+
+   args = lib.dogetopt(args, opt, "hpl:D:o:r:m:4:6:e:f:", long_opts);
+   if( #args != 2 ) {
+      print(require("program.wall.filter.README_inc"));
+      main.exit(1);
+   }
+
+   assert(rule_str, "Must supply either -e or -f option");
+   var rules = assert(load("return " .. rule_str))();
+
+   if( type(rules) != "table" ) {
+      io.stderr->write("Rules file doesn't define a table\n");
+      main.exit(1);
+   }
+
+   if( ! common.inputs[args[1]] ) {
+      io.stderr->write("No such input available: ", args[1], "\n");
+      main.exit(1);
+   }
+
+   var source_link_name, app = common.inputs[args[1]](args[1], args[2]);
+   if( ! source_link_name ) {
+      io.stderr->write(app, "\n");
+      main.exit(1);
+   }
+
+   var scanner = require("apps.wall.scanner.ndpi")->new();
+
+   var c = config.new();
+   config.app(c, "source", unpack(app));
+   config.app(c, "l7spy", require("apps.wall.l7spy").L7Spy, { scanner = scanner });
+
+   if( ! output_file ) {
+      config.app(c, "sink", require("apps.basic.basic_apps").Sink);
+   } else {
+      config.app(c, "sink", pcap.PcapWriter, output_file);
+   }
+
+   if( ! reject_file ) {
+      config.app(c, "reject", require("apps.basic.basic_apps").Sink);
+   } else {
+      config.app(c, "reject", pcap.PcapWriter, reject_file);
+   }
+
+   var fw_config = { scanner = scanner,
+                       rules = rules,
+                       local_macaddr = local_macaddr,
+                       local_ipv4 = local_ipv4,
+                       local_ipv6 = local_ipv6,
+                       logging = logging };
+   config.app(c, "l7fw", require("apps.wall.l7fw").L7Fw, fw_config);
+   config.link(c, "source." .. source_link_name .. " -> l7spy.south");
+   config.link(c, "l7spy.north -> l7fw.input");
+   config.link(c, "l7fw.output -> sink.input");
+   config.link(c, "l7fw.reject -> reject.input");
+
+   var done;
+   if( ! duration ) {
+      done = function () {
+         return engine.app_table.source.done;
+      };
+   }
+
+   if( cpu ) { numa.bind_to_cpu(cpu); }
+
+   var start_time = now();
+
+   engine.configure(c);
+   engine.busywait = true;
+   engine.main({
+      report = { showapps = report },
+      duration = duration,
+      done = done
+   });
+
+   if( report ) {
+      var end_time = now();
+      var fw = engine.app_table.l7fw;
+      var input_link = fw.input.input;
+      var stats = link.stats(input_link);
+      print("Firewall stats:");
+      print(string.format("bytes: %s packets: %s bps: %s",
+                          lib.comma_value(stats.rxbytes),
+                          lib.comma_value(stats.rxpackets),
+                          lib.comma_value((stats.rxbytes * 8) / (end_time - start_time))));
+   }
+}

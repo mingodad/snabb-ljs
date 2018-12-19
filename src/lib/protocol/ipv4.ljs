@@ -1,0 +1,245 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+module(..., package.seeall);
+var ffi = require("ffi");
+var C = ffi.C;
+var lib = require("core.lib");
+var header = require("lib.protocol.header");
+var ipsum = require("lib.checksum").ipsum;
+var htons, ntohs, htonl, ntohl =
+   lib.htons, lib.ntohs, lib.htonl, lib.ntohl;
+
+// TODO: generalize
+var AF_INET = 2;
+var INET_ADDRSTRLEN = 16;
+
+var ipv4hdr_pseudo_t = ffi.typeof([=[
+      struct {
+      uint8_t  src_ip[4];
+      uint8_t  dst_ip[4];
+      uint8_t  ulp_zero;
+      uint8_t  ulp_protocol;
+      uint16_t ulp_length;
+      } __attribute__((packed))
+]=]);
+
+var ipv4_addr_t = ffi.typeof("uint8_t[4]");
+var ipv4_addr_t_size = ffi.sizeof(ipv4_addr_t);
+var ipv4 = subClass(header);
+
+// Class variables
+ipv4._name = "ipv4";
+ipv4._ulp = {
+   class_map = {
+       [6] = "lib.protocol.tcp",
+      [17] = "lib.protocol.udp",
+      [47] = "lib.protocol.gre",
+      [58] = "lib.protocol.icmp.header",
+      [1] = "lib.protocol.icmp.header",
+   },
+   method    = 'protocol' };
+ipv4->init(
+   {
+      [1] = ffi.typeof([=[
+	    struct {
+	       uint16_t ihl_v_tos; // ihl:4, version:4, tos(dscp:6 + ecn:2)
+	       uint16_t total_length;
+	       uint16_t id;
+	       uint16_t frag_off; // flags:3, fragmen_offset:13
+	       uint8_t  ttl;
+	       uint8_t  protocol;
+	       uint16_t checksum;
+	       uint8_t  src_ip[4];
+	       uint8_t  dst_ip[4];
+	    } __attribute__((packed))
+      ]=]),
+   });
+
+// Class methods
+
+function ipv4::new (config) {
+   var o = ipv4->superClass().new(this);
+   o->header().ihl_v_tos = htons(0x4000); // v4
+   o->ihl(o->sizeof() / 4);
+   o->dscp(config.dscp || 0);
+   o->ecn(config.ecn || 0);
+   o->total_length(o->sizeof()); // default to header only
+   o->id(config.id || 0);
+   o->flags(config.flags || 0);
+   o->frag_off(config.frag_off || 0);
+   o->ttl(config.ttl || 0);
+   o->protocol(config.protocol || 0xff);
+   o->src(config.src);
+   o->dst(config.dst);
+   o->checksum();
+   return o;
+}
+
+function ipv4::pton (p) {
+   var in_addr  = ffi.new("uint8_t[4]");
+   var result = C.inet_pton(AF_INET, p, in_addr);
+   if( result != 1 ) {
+      return false, "malformed IPv4 address: " .. p;
+   }
+   return in_addr;
+}
+
+function ipv4::ntop (n) {
+   var p = ffi.new("char[?]", INET_ADDRSTRLEN);
+   var c_str = C.inet_ntop(AF_INET, n, p, INET_ADDRSTRLEN);
+   return ffi.string(c_str);
+}
+
+function ipv4::set(addr) {
+   return ipv4->pton(addr);
+}
+
+// Instance methods
+
+function ipv4::get() {
+   return ipv4->ntop(this);
+}
+
+function ipv4::version (v) {
+   return lib.bitfield(16, this->header(), 'ihl_v_tos', 0, 4, v);
+}
+
+function ipv4::ihl (ihl) {
+   return lib.bitfield(16, this->header(), 'ihl_v_tos', 4, 4, ihl);
+}
+
+function ipv4::dscp (dscp) {
+   return lib.bitfield(16, this->header(), 'ihl_v_tos', 8, 6, dscp);
+}
+
+function ipv4::ecn (ecn) {
+   return lib.bitfield(16, this->header(), 'ihl_v_tos', 14, 2, ecn);
+}
+
+function ipv4::total_length (length) {
+   if( length != null ) {
+      this->header().total_length = htons(length);
+   } else {
+      return(ntohs(this->header().total_length));
+   }
+}
+
+function ipv4::id (id) {
+   if( id != null ) {
+      this->header().id = htons(id);
+   } else {
+      return(ntohs(this->header().id));
+   }
+}
+
+function ipv4::flags (flags) {
+   return lib.bitfield(16, this->header(), 'frag_off', 0, 3, flags);
+}
+
+function ipv4::frag_off (frag_off) {
+   return lib.bitfield(16, this->header(), 'frag_off', 3, 13, frag_off);
+}
+
+function ipv4::ttl (ttl) {
+   if( ttl != null ) {
+      this->header().ttl = ttl;
+   } else {
+      return this->header().ttl;
+   }
+}
+
+function ipv4::protocol (protocol) {
+   if( protocol != null ) {
+      this->header().protocol = protocol;
+   } else {
+      return this->header().protocol;
+   }
+}
+
+function ipv4::checksum () {
+   this->header().checksum = 0;
+   this->header().checksum = htons(ipsum(ffi.cast("uint8_t *", this->header()),
+                                        this->sizeof(), 0));
+   return ntohs(this->header().checksum);
+}
+
+function ipv4::src (ip) {
+   if( ip != null ) {
+      ffi.copy(this->header().src_ip, ip, ipv4_addr_t_size);
+   } else {
+      return this->header().src_ip;
+   }
+}
+
+function ipv4::src_eq (ip) {
+   return C.memcmp(ip, this->header().src_ip, ipv4_addr_t_size) == 0;
+}
+
+function ipv4::dst (ip) {
+   if( ip != null ) {
+      ffi.copy(this->header().dst_ip, ip, ipv4_addr_t_size);
+   } else {
+      return this->header().dst_ip;
+   }
+}
+
+function ipv4::dst_eq (ip) {
+   return C.memcmp(ip, this->header().dst_ip, ipv4_addr_t_size) == 0;
+}
+
+// override the default equality method
+function ipv4::eq (other) {
+   //compare significant fields
+   return (this->ihl() == other->ihl()) &&
+         (this->id() == other->id()) &&
+         (this->protocol() == other->protocol()) &&
+         this->src_eq(other->src()) && this->dst_eq(other->dst());
+}
+
+// Return a pseudo header for checksum calculation in a upper-layer
+// protocol (e.g. icmp).  Note that the payload length and next-header
+// values in the pseudo-header refer to the effective upper-layer
+// protocol.  They differ from the respective values of the ipv6
+// header if extension headers are present.
+function ipv4::pseudo_header (ulplen, proto) {
+   var ph = ipv4hdr_pseudo_t();
+   var h = this->header();
+   ffi.copy(ph, h.src_ip, 2*ipv4_addr_t_size);  // Copy source and destination
+   ph.ulp_length = htons(ulplen);
+   ph.ulp_protocol = proto;
+   return(ph);
+}
+
+var function test_ipv4_checksum () {
+   var IP_BASE      = 14;
+   var IP_HDR_SIZE  = 20;
+
+   var p = packet.from_string(lib.hexundump([=[
+      52:54:00:02:02:02 52:54:00:01:01:01 08 00 45 00
+      00 34 59 1a 40 00 40 06 b0 8e c0 a8 14 a9 6b 15
+      f0 b4 de 0b 01 bb e7 db 57 bc 91 cd 18 32 80 10
+      05 9f 00 00 00 00 01 01 08 0a 06 0c 5c bd fa 4a
+      e1 65
+   ]=], 66));
+
+   var ip_hdr = ipv4->new_from_mem(p.data + IP_BASE, IP_HDR_SIZE);
+   assert(ip_hdr);
+   var csum = ip_hdr->checksum();
+   assert(csum == 0xb08e, "Wrong IPv4 checksum");
+}
+
+function selftest() {
+   var ipv4_address = "192.168.1.1";
+   assert(ipv4_address == ipv4->ntop(ipv4->pton(ipv4_address)),
+      'ipv4 text to binary conversion failed.');
+
+   test_ipv4_checksum();
+
+   var ipv4hdr = ipv4->new({});
+   assert(C.ntohs(ipv4hdr->header().ihl_v_tos) == 0x4500,
+      'ipv4 header field ihl_v_tos not initialized correctly.');
+}
+
+ipv4.selftest = selftest;
+
+return ipv4;

@@ -1,0 +1,106 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+module(..., package.seeall);
+
+var S = require("syscall");
+var app = require("core.app");
+var common = require("program.config.common");
+var lib = require("core.lib");
+var shm = require("core.shm");
+
+var basename, dirname = lib.basename, lib.dirname;
+
+var function usage (code) {
+   var f = code == 0 && io.stdout || io.stderr;
+   f->write(require("program.ps.README_inc"));
+   main.exit(code);
+}
+
+var function parse_args (args) {
+   var opt = {};
+   function opt.h (arg) { usage(0); }
+   args = lib.dogetopt(args, opt, "h", {help='h'});
+   if( #args != 0 ) { usage(1); }
+}
+
+function appname_resolver() {
+    var instances = {};
+    for( name, pid in pairs(app.enumerate_named_programs()) ) {
+        instances[pid] = name;
+    }
+    return function (pid) { return instances[pid]; };
+}
+
+function is_worker (pid) {
+   return shm.exists("/"..pid.."/group");
+}
+
+var function is_addressable (pid) {
+   var socket = assert(S.socket("unix", "stream"));
+   var tail = pid.."/config-leader-socket";
+   var by_name = S.t.sockaddr_un(shm.root..'/by-name/'..tail);
+   var by_pid = S.t.sockaddr_un(shm.root..'/'..tail);
+   if( socket->connect(by_name) || socket->connect(by_pid) ) {
+      socket->close();
+      return true;
+   }
+   return false;
+}
+
+function get_manager_pid (pid) {
+   var fq = shm.root.."/"..pid.."/group";
+   var path = S.readlink(fq);
+   return basename(dirname(path));
+}
+
+var function compute_snabb_instances() {
+   // Produces set of snabb instances, excluding this one.
+   var whichname = appname_resolver();
+   var pids = {};
+   var my_pid = S.getpid();
+   for( _, name in ipairs(shm.children("/")) ) {
+      // This could fail as the name could be for example "by-name"
+      var p = tonumber(name);
+      name = whichname(p);
+      if( p && p != my_pid ) {
+         var instance = {pid=p, name=name};
+         if( is_worker(p) ) {
+            instance.leader = get_manager_pid(p);
+         }
+         if( is_addressable(p) ) {
+            instance.addressable = true;
+            var descr = common.call_leader(p, 'describe', {});
+            instance.schema = descr.native_schema;
+         }
+         table.insert(pids, instance);
+      }
+   }
+   table.sort(pids, function(a, b) {
+      return tonumber(a.pid) < tonumber(b.pid);
+   });
+   return pids;
+}
+
+function run (args) {
+   parse_args(args);
+   var instances = compute_snabb_instances();
+   for( _, instance in ipairs(instances) ) {
+      // Check instance is a worker.
+      if( instance.leader ) {
+         io.write("  \\- "..instance.pid.."   worker for "..instance.leader);
+      } else {
+         io.write(instance.pid);
+         if( instance.name ) {
+            io.write("\t["..instance.name.."]");
+         }
+      }
+      if( instance.addressable ) {
+         io.write(" *");
+      }
+      if( instance.schema ) {
+         io.write(" [schema: "..instance.schema.."]");
+      }
+      io.write("\n");
+   }
+   main.exit(0);
+}

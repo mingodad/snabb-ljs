@@ -1,0 +1,76 @@
+module(...,package.seeall);
+
+var app = require("core.app");
+var packet = require("core.packet");
+var link = require("core.link");
+var transmit, receive = link.transmit, link.receive;
+var clone = packet.clone;
+
+//- ### `RateLimitedRepeater` app: A repeater that can limit flow rate
+
+
+RateLimitedRepeater = {
+   config = {
+      // rate: by default, limit to 10 Mbps, just to have a default.
+      rate = {default=10e6},
+      // bucket_capacity: by default, allow for 255 standard packets in the
+      // queue.
+      bucket_capacity = {default=255*1500*8},
+      initial_capacity = {}
+   }
+};
+
+function RateLimitedRepeater::new (conf) {
+   conf.initial_capacity = conf.initial_capacity || conf.bucket_capacity;
+   var o = {
+      index = 1,
+      packets = {},
+      rate = conf.rate,
+      bucket_capacity = conf.bucket_capacity,
+      bucket_content = conf.initial_capacity
+    };
+   return setmetatable(o, {__index=RateLimitedRepeater});
+}
+
+function RateLimitedRepeater::set_rate (bit_rate) {
+   this.rate = math.max(bit_rate, 0);
+}
+
+function RateLimitedRepeater::push () {
+   var i, o = this.input.input, this.output.output;
+   for( _ = 1, link.nreadable(i) ) {
+      var p = receive(i);
+      table.insert(this.packets, p);
+   }
+
+   {
+      var cur_now = tonumber(app.now());
+      var last_time = this.last_time || cur_now;
+      this.bucket_content = math.min(
+            this.bucket_content + this.rate * (cur_now - last_time),
+            this.bucket_capacity
+         );
+      this.last_time = cur_now;
+   }
+
+   // 7 bytes preamble, 1 start-of-frame, 4 CRC, 12 interpacket gap.
+   var overhead = 7 + 1 + 4 + 12;
+
+   var npackets = #this.packets;
+   if( npackets > 0 && this.rate > 0 ) {
+      for( _ = 1, engine.pull_npackets ) {
+         var p = this.packets[this.index];
+         var bits = (p.length + overhead) * 8;
+         if( bits > this.bucket_content ) { break; }
+         this.bucket_content = this.bucket_content - bits;
+         transmit(o, clone(p));
+         this.index = (this.index % npackets) + 1;
+      }
+   }
+}
+
+function RateLimitedRepeater::stop () {
+   for( i = 1, #this.packets ) {
+      packet.free(this.packets[i]);
+   }
+}

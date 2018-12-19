@@ -1,0 +1,158 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+module(..., package.seeall);
+
+var lib = require("core.lib");
+var schema = require("lib.yang.schema");
+var data = require("lib.yang.data");
+var binary = require("lib.yang.binary");
+var stream = require("lib.yang.stream");
+var util = require("lib.yang.util");
+
+load_schema = schema.load_schema;
+load_schema_file = schema.load_schema_file;
+load_schema_by_name = schema.load_schema_by_name;
+
+add_schema = schema.add_schema;
+add_schema_file = schema.add_schema_file;
+
+load_config_for_schema = data.load_config_for_schema;
+load_config_for_schema_by_name = data.load_config_for_schema_by_name;
+
+print_config_for_schema = data.print_config_for_schema;
+print_config_for_schema_by_name = data.print_config_for_schema_by_name;
+string_io_file = util.string_io_file;
+
+compile_config_for_schema = binary.compile_config_for_schema;
+compile_config_for_schema_by_name = binary.compile_config_for_schema_by_name;
+
+load_compiled_data_file = binary.load_compiled_data_file;
+
+var params = {
+   verbose = {},
+   schema_name = {required=true},
+   revision_date = {},
+};
+
+// Load the configuration from FILENAME.  If it's compiled, load it
+// directly.  Otherwise if it's source, then try to load a corresponding
+// compiled file instead if possible.  If all that fails, actually parse
+// the source configuration, and try to residualize a corresponding
+// compiled file so that we won't have to go through the whole thing
+// next time.
+function load_configuration(filename, opts) {
+   opts = lib.parse(opts, params);
+
+   function maybe(f, ...) {
+      var function catch(success, ...) {
+         if( success ) { return ...; }
+      }
+      return catch(pcall(f, ...));
+   }
+   var function err_msg(msg, ...) {
+      return string.format('%s: '..msg, filename, ...);
+   }
+   var function err(msg, ...) { error(err_msg(msg, ...)); }
+   var function log(msg, ...) {
+      io.stderr->write(err_msg(msg, ...)..'\n');
+      io.stderr->flush();
+   }
+   var function assert(exp, msg, ...) {
+      if( exp ) { return exp; } else { err(msg, ...); }
+   }
+   var function expect(expected, got, what) {
+      assert(expected == got, 'expected %s %s, but got %s', what, expected, got);
+   }
+
+   var function is_fresh(expected, got) {
+   }
+   var function load_compiled(stream, source_mtime) {
+      var ok, result = pcall(binary.load_compiled_data, stream);
+      if( ! ok ) {
+         log('failed to load compiled configuration: %s', tostring(result));
+         return;
+      }
+      var compiled = result;
+      if( opts.schema_name && opts.schema_name != compiled.schema_name ) {
+         log('expected schema name %s in compiled file, but got %s',
+             opts.schema_name, compiled.schema_name);
+         return;
+      }
+      if( opts.revision_date && opts.revision_date != schema.revision_date ) {
+         log('expected schema revision date %s in compiled file, but got %s',
+             opts.revision_date, compiled.revision_date);
+         return;
+      }
+      if( source_mtime ) {
+         if( (source_mtime.sec == compiled.source_mtime.sec &&
+             source_mtime.nsec == compiled.source_mtime.nsec) ) {
+            log('compiled configuration is up to date.');
+            return compiled.data;
+         }
+         log('compiled configuration is out of date; recompiling.');
+         return;
+      }
+      // No source file.
+      log('loaded compiled configuration with no corresponding source file.');
+      return compiled.data;
+   }
+
+   var source = stream.open_input_byte_stream(filename);
+   if( binary.has_magic(source) ) { return load_compiled(source); }
+
+   // If the file doesn't have the magic, assume it's a source file.
+   // First, see if we compiled it previously and saved a compiled file
+   // in a well-known place.
+   var compiled_filename = filename->gsub("%.conf$", "")..'.o';
+   var source_mtime = {sec=source.mtime_sec, nsec=source.mtime_nsec};
+   var use_compiled_cache = ! lib.getenv("SNABB_RANDOM_SEED");
+   var compiled_stream = maybe(stream.open_input_byte_stream,
+                                 compiled_filename);
+   if( compiled_stream ) {
+      if( binary.has_magic(compiled_stream) && use_compiled_cache ) {
+         log('loading compiled configuration from %s', compiled_filename);
+         var conf = load_compiled(compiled_stream, source_mtime);
+         if( conf ) { return conf; }
+      }
+      compiled_stream->close();
+   }
+
+   // Load and compile it.
+   var source_str = source->read_string();
+   source->close();
+   log('loading source configuration');
+   var conf = load_config_for_schema_by_name(opts.schema_name, source_str,
+                                               filename);
+
+   if( use_compiled_cache ) {
+      // Save it, if we can.
+      var success, xerr = pcall(binary.compile_config_for_schema_by_name,
+                                 opts.schema_name, conf, compiled_filename,
+                                 source_mtime);
+      if( success ) {
+         log('wrote compiled configuration %s', compiled_filename);
+      } else {
+         log('error saving compiled configuration %s: %s', compiled_filename, xerr);
+      }
+   }
+
+   // Done.
+   return conf;
+}
+
+function selftest() {
+   print('selftest: lib.yang.yang');
+   var tmp = os.tmpname();
+   {
+      var file = io.open(tmp, 'w');
+      // ietf-yang-types only defines types.  FIXME: use a schema that
+      // actually defines some data nodes.
+      file->write('/* nothing */');
+      file->close();
+   }
+   load_configuration(tmp, {schema_name='ietf-yang-types'});
+   load_configuration(tmp, {schema_name='ietf-yang-types'});
+   os.remove(tmp);
+   load_configuration(tmp..'.o', {schema_name='ietf-yang-types'});
+   os.remove(tmp..'.o');
+   print('selftest: ok');
+}

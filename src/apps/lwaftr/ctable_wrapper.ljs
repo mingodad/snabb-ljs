@@ -1,0 +1,84 @@
+module(..., package.seeall);
+
+var ctable = require('lib.ctable');
+var math = require("math");
+var os = require("os");
+var S = require("syscall");
+var bit = require("bit");
+
+var bnot, bxor = bit.bnot, bit.bxor;
+var floor, ceil = math.floor, math.ceil;
+var HASH_MAX = 0xFFFFFFFF;
+
+// This is only called when the table is 'full'.
+// Notably, it cannot be called on an empty table,
+// so there is no risk of an infinite loop.
+var function evict_random_entry(ctab) {
+   var random_hash = math.random(0, HASH_MAX - 1);
+   var index = floor(random_hash*ctab.scale + 0.5);
+   var entries = ctab.entries;
+   while( entries[index].hash == HASH_MAX ) {
+      if( index >= ctab.size + ctab.max_displacement ) {
+         index = 0; // Seems unreachable?
+      } else {
+         ++index    ;
+      }
+   }
+   var ptr = ctab.entries + index;
+   ctab->remove_ptr(ptr);
+}
+
+// Behave exactly like insertion, except if the table is full: if it
+// is, then evict a random entry instead of resizing.
+var function add_with_random_eviction(this, key, value, updates_allowed) {
+   var did_evict = false;
+   if( this.occupancy + 1 > this.occupancy_hi ) {
+      evict_random_entry(this);
+      did_evict = true;
+   }
+   return ctable.CTable.add(this, key, value, updates_allowed), did_evict;
+}
+
+function new(params) {
+   var ctab = ctable.new(params);
+   ctab.add = add_with_random_eviction;
+   return ctab;
+}
+
+function selftest() {
+   print('selftest: apps.lwaftr.ctable_wrapper');
+   var ffi = require("ffi");
+   var occupancy = 4;
+   // 32-byte entries 
+   var params = {
+      key_type = ffi.typeof('uint32_t'),
+      value_type = ffi.typeof('int32_t[6]'),
+      max_occupancy_rate = 0.4,
+      initial_size = ceil(occupancy / 0.4)
+   };
+   var ctab = new(params);
+ 
+   // Fill table fully, to the verge of being resized.
+   var v = ffi.new('int32_t[6]');
+   var i = 1;
+   while( ctab.occupancy + 1 <= ctab.occupancy_hi ) {
+      for( j=0,5 ) { v[j] = bnot(i); }
+      ctab->add(i, v);
+      ++i    ;
+   }
+
+   var old_occupancy = ctab.occupancy;
+   for( j=0,5 ) { v[j] = bnot(i); }
+   var entry = ctab->add(i, v);
+   var iterated = 0;
+   for( xentry in ctab->iterate() ) {}  //DADNOTUSED
+   assert(old_occupancy == ctab.occupancy, "bad random eviction!");
+ 
+   ctab->remove_ptr(entry, false);
+   iterated = 0;
+   for( xentry in ctab->iterate() ) { ++iterated    ; }
+   assert(iterated == ctab.occupancy);
+   assert(iterated == old_occupancy - 1);
+   // OK, all looking good with our ctab.
+   print('selftest: ok');
+}

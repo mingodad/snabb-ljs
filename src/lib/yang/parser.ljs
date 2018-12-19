@@ -1,0 +1,435 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+// This module implements a YANG parser which will parse a YANG module to a
+// Lua table. This is used by instantiating the Parser with the module and
+// optionally the filename. You then should call Parser:parse_module
+//
+// The parser uses the same termanology as the specification (rfc6020). The
+// following is an example YANG module and lua representation:
+// YANG:
+//
+// leaf port {
+//     type inet:port-number;
+//     default;
+//     description "The port to which the SSH server listens"
+//  }
+//
+// Lua table:
+// {
+//     {argument="port", keyword="leaf", statements={
+//         {keyword="type", argument="inet:port-number"},
+//         {keyword="default"},
+//         {
+//             keyword="description",
+//             argument="The port to which the SSH server listens"
+//         }}
+//     }
+// }
+
+module(..., package.seeall);
+
+var lib = require('core.lib');
+
+Parser = {};
+function Parser.new(str, filename) {
+   var ret = {pos=1, str=str, filename=filename, line=1, column=0, line_pos=1};
+   ret = setmetatable(ret, {__index = Parser});
+   ret.peek_char = ret->read_char();
+   return ret;
+}
+
+function Parser::loc() {
+   return string.format('%s:%d:%d', this.name || '<unknown>', this.line,
+                        this.column);
+}
+
+function Parser::error(msg, ...) {
+   print(this.str->match("[^\n]*", this.line_pos));
+   print(string.rep(" ", this.column).."^");
+   error(('%s: error: '..msg)->format(this->loc(), ...));
+}
+
+function Parser::read_char() {
+   if( this.pos <= #this.str ) {
+      var ret = this.str->sub(this.pos,this.pos);
+      this.pos = this.pos + 1;
+      return ret;
+   }
+}
+
+function Parser::peek() { return this.peek_char; }
+function Parser::is_eof() { return ! this->peek(); }
+
+function Parser::next() {
+   var chr = this.peek_char;
+   if( chr == '\n' ) {
+      this.line_pos = this.pos + 1;
+      this.column = 0;
+      this.line = this.line + 1;
+   } else if( chr == "\t" ) {
+      this.column = this.column + 8;
+      this.column = 8 * math.floor(this.column / 8);
+   } else if( chr ) {
+      this.column = this.column + 1;
+   }
+   this.peek_char = this->read_char();
+   return chr;
+}
+
+function Parser::peek_n(n) {
+   var end_index = this.pos + n - 1;
+   if( end_index < #this.str ) {
+      return this->peek() .. this.str->sub(this.pos, (end_index - 1));
+   }
+   return this->peek() .. this.str->sub(this.pos);
+}
+
+function Parser::check(expected) {
+   if( this->peek() == expected ) {
+      if( expected ) { this->next(); }
+      return true;
+   }
+   return false;
+}
+
+function Parser::check_pattern(pattern) {
+   if( ! this->is_eof() ) {
+      return this->peek()->match(pattern);
+   }
+   return false;
+}
+
+function Parser::consume(expected) {
+   if( ! this->check(expected) ) {
+      var ch = this->peek();
+      if( ch == null ) {
+         this->error("while looking for '%s', got EOF", expected);
+      } else if( expected ) {
+         this->error("expected '%s', got '%s'", expected, ch);
+      } else {
+         this->error("expected EOF, got '%s'", ch);
+      }
+   }
+}
+
+function Parser::take_while(pattern) {
+   var res = {};
+   while( ! this->is_eof() && this->peek()->match(pattern) ) {
+      table.insert(res, this->next());
+   }
+   return table.concat(res);
+}
+
+function Parser::skip_c_comment() {
+   do {
+      this->take_while("[^*]");
+      this->consume("*");
+   } while(!( this->check("/")) );
+}
+
+// Returns true if has consumed any whitespace
+function Parser::skip_whitespace() {
+   var result = false;
+   if( this->take_while('%s') != "" ) { result = true; }
+   // Skip comments, which start with # and continue to the end of line.
+   while( this->check('/') ) {
+      result = true;
+      if( this->check("*") ) {
+         this->skip_c_comment();
+      } else {
+         this->consume("/");
+         this->take_while('[^\n]');
+      }
+      this->take_while('%s');
+   }
+   return result;
+}
+
+function Parser::consume_whitespace() {
+   if( ! this->skip_whitespace() ) {
+      this->error("Missing whitespace");
+   }
+}
+
+function Parser::consume_token(pattern, expected) {
+   var tok = this->take_while(pattern);
+   if( tok->lower() != expected ) {
+      this->error("expected '%s', got '%s'", expected, tok);
+   }
+}
+
+function Parser::parse_qstring(quote) {
+   var start_column = this.column;
+   var terminators = "\n"..quote;
+   if( quote == '"' ) { terminators = terminators.."\\"; }
+
+   var result = {};
+   while( true ) {
+      table.insert(result, this->take_while("[^"..terminators.."]"));
+      if( this->check(quote) ) { break; }
+      if( this->check("\n") ) {
+         while( this.column < start_column ) {
+            if( ! this->check(" ") && ! this->check("\t") ) { break; }
+         }
+         table.insert(result, "\n");
+         if( this.column > start_column ) {
+            table.insert(result, string.rep(" ", this.column-start_column));
+         }
+      } else if( this->check("\\") ) {
+         if( this->check("n")      ) { table.insert(result, "\n");
+         } else if( this->check("t")  ) { table.insert(result, "\t");
+         } else if( this->check('"')  ) { table.insert(result, '"');
+         } else if( this->check("\\") ) { table.insert(result, "\\");
+         } else {                         table.insert(result, "\\"); }
+      }
+   }
+   result = table.concat(result);
+   this->check(quote);
+   this->skip_whitespace();
+
+   if( ! this->check("+") ) { return result; }
+   this->skip_whitespace();
+
+   // Strings can be concatenated together with a +
+   if( this->check("'") ) {
+      return result..this->parse_qstring("'");
+   } else if( this->check('"') ) {
+      return result..this->parse_qstring('"');
+   } else {
+      this->error("Expected quote character");
+   }
+}
+
+function Parser::parse_string() {
+   if( this->check("'") ) { return this->parse_qstring("'");
+   } else if( this->check('"') ) { return this->parse_qstring('"');
+   } else {
+      var ret = {};
+      do {
+         table.insert(ret, this->take_while("[^%s;{}\"'/]"));
+         if( this->is_eof() ) { break; }
+         if( this->peek_n(2) == "/*" ) { break; }
+         if( this->peek_n(2) == "//" ) { break; }
+         if( this->check("/") ) {
+            table.insert(ret, "/");
+         }
+      } while(!( ! this->check_pattern("[^%s;{}\"'/]")) );
+      return table.concat(ret);
+   }
+}
+
+function Parser::parse_identifier() {
+   var id = this->parse_string();
+   if( ! id == "" ) { this->error("Expected identifier"); }
+   if( ! id->match("^[%a_][%w_.-]*$") ) { this->error("Invalid identifier"); }
+   return id;
+}
+
+function Parser::parse_keyword() {
+   this->skip_whitespace();
+
+   if( this->is_eof() ) {
+      this->error("Expected keyword");
+   }
+
+   var char = this->peek();
+   var is_prefix = char == "'" || char == '"';
+   var id = this->parse_identifier();
+
+   if( this->check(":") ) {
+      var extension_id = this->parse_identifier();
+      return {id, extension_id};
+   }
+
+   if( is_prefix ) { error("Expected colon"); }
+   return id;
+}
+
+function Parser::parse_module() {
+   var statements = this->parse_statement_list();
+   if( ! this->is_eof() ) { error("Not end of file"); }
+   return statements;
+}
+
+function Parser::parse_statement_list() {
+   var statements = {};
+   while( true ) {
+      this->skip_whitespace();
+      if( this->is_eof() || this->peek() == "}" ) {
+         break;
+      }
+      table.insert(statements, this->parse_statement());
+   }
+   return statements;
+}
+
+function Parser::parse_statement() {
+   this->skip_whitespace();
+
+   var returnval = { loc = this->loc() };
+
+   // Then must be a string that is the statement's identifier
+   var keyword = this->parse_keyword();
+   if( keyword == "" ) {
+      this->error("keyword expected");
+   }
+   returnval.keyword = keyword;
+
+   // Take the identifier
+   if( this->skip_whitespace() && this->peek() != ';' && this->peek() != '{' ) {
+      returnval.argument = this->parse_string();
+      this->skip_whitespace();
+   }
+
+   if( this->check(";") ) {
+      return returnval;
+   }
+
+   if( this->check("{") ) {
+      returnval.statements = this->parse_statement_list();
+      this->consume("}");
+      return returnval;
+   }
+
+   this->error("Unexpected character found");
+}
+
+function parse_string(str, filename) {
+   var parser = Parser.new(str, filename);
+   parser->skip_whitespace();
+   str = parser->parse_string();
+   parser->skip_whitespace();
+   if( ! parser->is_eof() ) { parser->error("Not end of file"); }
+   return str;
+}
+
+function parse_strings(str, filename) {
+   var parser = Parser.new(str, filename);
+   var ret = {};
+   parser->skip_whitespace();
+   while( ! parser->is_eof() ) {
+      table.insert(ret, parser->parse_string());
+      parser->skip_whitespace();
+   }
+   return ret;
+}
+
+function parse_statement_lists(str, filename) {
+   var parser = Parser.new(str, filename);
+   var ret = {};
+   parser->skip_whitespace();
+   while( ! parser->is_eof() ) {
+      parser->consume("{");
+      table.insert(ret, parser->parse_statement_list());
+      parser->consume("}");
+      parser->skip_whitespace();
+   }
+   return ret;
+}
+
+function parse(str, filename) {
+   var parser = Parser.new(str, filename);
+   return parser->parse_module();
+}
+
+function parse_file(filename) {
+   var file_in = assert(io.open(filename));
+   var contents = file_in->read("*a");
+   file_in->close();
+   return parse(contents, filename);
+}
+
+function selftest() {
+   var function assert_equal(a, b) {
+      if( ! lib.equal(a, b) ) {
+         print(a, b);
+         error("not equal");
+      }
+   }
+
+   var function strip_locs(exp) {
+      if( type(exp) != 'table' ) { return exp; }
+      var ret = {};
+      for( k, v in pairs(exp) ) {
+         if( k != 'loc' ) { ret[k] = strip_locs(v); }
+      }
+      return ret;
+   }
+
+   var function test_string(src, exp) {
+      var parser = Parser.new(src);
+      parser->skip_whitespace();
+      assert_equal(strip_locs(parser->parse_string()), exp);
+   }
+
+   var function pp(x) {
+      if( type(x) == "table" ) {
+         io.write("{");
+         var first = true;
+         for( k,v in pairs(x) ) {
+            if( ! first ) {
+               io.write(", ");
+            }
+            io.write(k.."=");
+            pp(v);
+            first = false;
+         }
+         io.write("}");
+      } else if( type(x) == "string" ) {
+         io.write(x);
+      } else {
+         error("Unsupported type");
+      }
+   }
+
+
+   var function test_module(src, exp) {
+      var result = strip_locs(parse(src));
+      if( ! lib.equal(result, exp) ) {
+         pp(result);
+         pp(exp);
+         error("no equal");
+      }
+   }
+
+   var function lines(...) {
+      return table.concat({...}, "\n");
+   }
+
+   // Test the string parser
+   test_string("foo", "foo");
+   test_string([=["foo"]=], "foo");
+   test_string([=["foo"+"bar"]=], "foobar");
+   test_string([=['foo'+"bar"]=], "foobar");
+   test_string("'foo\\nbar'", "foo\\nbar");
+   test_string('"foo\\nbar"', "foo\nbar");
+   test_string('"// foo bar;"', '// foo bar;');
+   test_string('"/* foo bar */"', '/* foo bar */');
+   test_string([=["foo \"bar\""]=], 'foo "bar"');
+   test_string("hello//world", "hello");
+   test_string(lines("  'foo", "    bar'"), lines("foo", " bar"));
+   test_string(lines("  'foo", "  bar'"), lines("foo", "bar"));
+   test_string(lines("   'foo", "\tbar'"), lines("foo", "    bar"));
+   test_string(lines("   'foo", " bar'"), lines("foo", "bar"));
+   test_module("type;", {{keyword="type"}});
+   test_module("type string;", {{keyword="type", argument="string"}});
+   test_module("/** **/", {});
+   test_module("  /** **/  ", {});
+   test_module("// foo bar;", {});
+   test_module("// foo bar;\nleaf port;", {{keyword="leaf", argument="port"}});
+   test_module("type/** hellooo */string;", {{keyword="type", argument="string"}});
+   test_module('type "hello\\pq";', {{keyword="type", argument="hello\\pq"}});
+   test_module('description "";', {{keyword="description", argument=""}});
+   test_module('description;', {{keyword="description"}});
+   test_module('description ;', {{keyword="description"}});
+   test_module(lines("leaf port {", "type number;", "}"), {{keyword="leaf",
+   argument="port", statements={{keyword="type", argument="number"}}}});
+   test_module(lines("leaf port {", "type;", "}"), {{keyword="leaf",
+   argument="port", statements={{keyword="type"}}}});
+   test_module('description hello/world;', {{keyword="description",
+   argument="hello/world"}});
+   parse(require('lib.yang.ietf_inet_types_yang'));
+   parse(require('lib.yang.ietf_yang_types_yang'));
+   parse(require('lib.yang.ietf_softwire_common_yang'));
+   parse(require('lib.yang.ietf_softwire_br_yang'));
+}

@@ -1,0 +1,188 @@
+module(..., package.seeall);
+
+var config = require("core.config");
+var constants = require("apps.lwaftr.constants");
+var ingress_drop_monitor = require("lib.timers.ingress_drop_monitor");
+var lib = require("core.lib");
+var counters = require("program.lwaftr.counters");
+var lwutil = require("apps.lwaftr.lwutil");
+var setup = require("program.snabbvmx.lwaftr.setup");
+var shm = require("core.shm");
+
+var fatal, file_exists = lwutil.fatal, lwutil.file_exists;
+
+var DEFAULT_MTU = 9500;
+
+var function show_usage (exit_code) {
+   print(require("program.snabbvmx.lwaftr.README_inc"));
+   main.exit(exit_code);
+}
+
+function parse_args (args) {
+   if( #args == 0 ) { show_usage(1); }
+   var conf_file, id, pci, mac, sock_path, mirror_id;
+   var opts = { verbosity = 0 };
+   var handlers = {};
+   function handlers.v () { opts.verbosity = opts.verbosity + 1; }
+   function handlers.D (arg) {
+      opts.duration = assert(tonumber(arg), "Duration must be a number");
+   }
+   function handlers.c(arg) {
+      conf_file = arg;
+      if( ! arg ) {
+         fatal("Argument '--conf' was not set");
+      }
+      if( ! file_exists(conf_file) ) {
+         print(("Warning: config file %s not found")->format(conf_file));
+      }
+   }
+   function handlers.i(arg) {
+      id = arg;
+      if( ! arg ) {
+         fatal("Argument '--id' was not set");
+      }
+   }
+   function handlers.p(arg) {
+      pci = arg;
+      if( ! arg ) {
+         fatal("Argument '--pci' was not set");
+      }
+   }
+   function handlers.m(arg) {
+      mac = arg;
+      if( ! arg ) {
+         fatal("Argument '--mac' was not set");
+      }
+   }
+   function handlers.s(arg) {
+      sock_path = arg;
+      if( ! arg ) {
+         fatal("Argument '--sock' was not set");
+      }
+   }
+   function handlers.mirror (arg) {
+      mirror_id = arg;
+   }
+   function handlers.h() { show_usage(0); }
+   lib.dogetopt(args, handlers, "c:s:i:p:m:vD:h", {
+      ["conf"] = "c", ["sock"] = "s", ["id"] = "i", ["pci"] = "p", ["mac"] = "m",
+      ["mirror"] = 1, verbose = "v", duration = "D", help = "h" });
+   return opts, conf_file, id, pci, mac, sock_path, mirror_id;
+}
+
+var function effective_vlan (conf, external_interface, internal_interface) {
+   if( conf.settings && conf.settings.vlan ) {
+      return conf.settings.vlan;
+   }
+   if( external_interface.vlan_tag ) {
+      if( external_interface.vlan_tag == internal_interface.vlan_tag ) {
+         return external_interface.vlan_tag;
+      }
+      return {v4_vlan_tag = external_interface.vlan_tag,
+              v6_vlan_tag = internal_interface.vlan_tag};
+   }
+   return false;
+}
+
+function run(args) {
+   var opts, conf_file, id, pci, mac, sock_path, mirror_id = parse_args(args);
+
+   var conf, lwconf;
+   var external_interface, internal_interface;
+   var ring_buffer_size = 2048;
+
+   var ingress_drop_action = "flush";
+   var ingress_drop_threshold = 100000;
+   var ingress_drop_interval = 1e6;
+   var ingress_drop_wait = 20;
+
+   if( file_exists(conf_file) ) {
+      conf, lwconf = setup.load_conf(conf_file);
+      external_interface = lwconf.softwire_config.external_interface;
+      internal_interface = lwconf.softwire_config.internal_interface;
+      // If one interface has vlan tags, then the other one should as well.
+      assert((! external_interface.vlan_tag) == (! internal_interface.vlan_tag));
+   } else {
+      print(("Interface '%s' set to passthrough mode.")->format(id));
+      ring_buffer_size = 1024;
+      conf = {settings = {}};
+   }
+
+   if( conf.settings ) {
+      if( conf.settings.ingress_drop_monitor ) {
+         ingress_drop_action = conf.settings.ingress_drop_monitor;
+         if( ingress_drop_action == 'off' ) {
+            ingress_drop_action = null;
+         }
+      }
+      if( conf.settings.ingress_drop_threshold ) {
+         ingress_drop_threshold = conf.settings.ingress_drop_threshold;
+      }
+      if( conf.settings.ingress_drop_interval ) {
+         ingress_drop_interval = conf.settings.ingress_drop_interval;
+      }
+      if( conf.settings.ingress_drop_wait ) {
+         ingress_drop_wait = conf.settings.ingress_drop_wait;
+      }
+   }
+
+   if( id ) { engine.claim_name(id); }
+
+   var vlan = false;
+   var mtu = DEFAULT_MTU;
+   if( lwconf ) {
+      vlan = effective_vlan(conf, external_interface, internal_interface);
+      mtu = internal_interface.mtu;
+      if( external_interface.mtu > mtu ) { mtu = external_interface.mtu; }
+      mtu = mtu + constants.ethernet_header_size;
+      if( external_interface.vlan_tag ) { mtu +=   4; }
+   }
+
+   conf.interface = {
+      mac_address = mac,
+      pci = pci,
+      id = id,
+      mtu = mtu,
+      vlan = vlan,
+      mirror_id = mirror_id,
+      ring_buffer_size = ring_buffer_size,
+   };
+
+   var c = config.new();
+   if( lwconf ) {
+      setup.lwaftr_app(c, conf, lwconf, sock_path);
+   } else {
+      setup.passthrough(c, conf, sock_path);
+   }
+   engine.configure(c);
+
+   if( opts.verbosity >= 2 ) {
+      var function lnicui_info() {
+         engine.report_apps();
+      }
+      var t = timer.new("report", lnicui_info, 1e9, 'repeating');
+      timer.activate(t);
+   }
+
+   if( ingress_drop_action ) {
+      assert(ingress_drop_action == "flush" || ingress_drop_action == "warn",
+             "Not valid ingress-drop-monitor action");
+      print(("Ingress drop monitor: %s (threshold: %d packets; wait: %d seconds; interval: %.2f seconds)")->format(
+             ingress_drop_action, ingress_drop_threshold, ingress_drop_wait, 1e6/ingress_drop_interval));
+      var counter_path = "apps/lwaftr/ingress-packet-drops";
+      var mon = ingress_drop_monitor.new({
+         action = ingress_drop_action,
+         threshold = ingress_drop_threshold,
+         wait = ingress_drop_wait,
+         counter = counter_path,
+      });
+      timer.activate(mon->timer(ingress_drop_interval));
+   }
+
+   engine.busywait = true;
+   if( opts.duration ) {
+      engine.main({duration=opts.duration, report={showlinks=true}});
+   } else {
+      engine.main({report={showlinks=true}});
+   }
+}

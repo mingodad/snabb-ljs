@@ -1,0 +1,53 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+module(...,package.seeall);
+
+var app = require("core.app");
+var ffi = require("ffi");
+var C = ffi.C;
+
+// Frequency at which lines are added to the CSV file.
+// (XXX should be an argument to the app.)
+interval = 1.0;
+
+CSV = {};
+
+function CSV::new (directory) {
+   var o = { appfile  = io.open(directory.."/app.csv", "w"),
+               linkfile = io.open(directory.."/link.csv", "w") };
+   o.appfile->write("time,name,class,cpu,crashes,starttime\n");
+   o.appfile->flush();
+   o.linkfile->write("time,from_app,from_port,to_app,to_port,txbytes,txpackets,rxbytes,rxpackets,dropbytes,droppackets\n");
+   o.linkfile->flush();
+   timer.new('CSV',
+             function () { o->output(); },
+             1e9,
+             'repeating');
+   return setmetatable(o, {__index = CSV});
+}
+
+function CSV::pull () {
+   var now = engine.now();
+   if( this.next_report && this.next_report > now ) {
+      return;
+   }
+   this.next_report = (this.next_report || now) + interval;
+   for( name, app in pairs(app.app_table) ) {
+      this.appfile->write(
+         string.format("%f,%s,%s,%d,%d,%d\n",
+                       tonumber(now), name, app.zone, 0, 0, 0));
+      this.appfile->flush();
+   }
+   for( spec, link in pairs(app.link_table) ) {
+      var fa, fl, ta, tl = config.parse_link(spec);
+      var s = link.stats;
+      this.linkfile->write(
+         string.format("%f,%s,%s,%s,%s,%d,%d,%d,%d,%d,%d\n",
+                       now,fa,fl,ta,tl,
+                       s.txbytes, s.txpackets,
+                       s.rxbytes, s.rxpackets,
+                       0, s.txdrop));
+      this.linkfile->flush();
+   }
+}
+

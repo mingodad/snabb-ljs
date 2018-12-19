@@ -1,0 +1,183 @@
+module(..., package.seeall);
+var ffi = require("ffi");
+var C = ffi.C;
+var lpm4_trie = require("lib.lpm.lpm4_trie").LPM4_trie;
+var lpm4 = require("lib.lpm.lpm4");
+var ip4 = require("lib.lpm.ip4");
+
+LPM4_dxr = setmetatable({ alloc_storable = { "dxr_smints", "dxr_keys", "dxr_bottoms", "dxr_tops" } }, { __index = lpm4_trie });
+
+ffi.cdef([=[
+uint16_t lpm4_dxr_search(uint32_t ip, uint16_t *ints, uint16_t *keys, uint32_t *bottoms, uint32_t *tops);
+]=]);
+
+function LPM4_dxr::new () {
+   this = lpm4_trie.new(this);
+   this->alloc("dxr_intervals", ffi.typeof("uint32_t"), 2000000);
+   this->alloc("dxr_keys", ffi.typeof("uint16_t"), 2000000);
+   this->alloc("dxr_smints", ffi.typeof("uint16_t"), 2000000);
+   this->alloc("dxr_tops", ffi.typeof("uint32_t"), 2**16);
+   this->alloc("dxr_bottoms", ffi.typeof("uint32_t"), 2**16);
+   this.dxr_ioff = 0;
+   return this;
+}
+function LPM4_dxr::print_intervals (first, last) {
+   first = first || 0;
+   last = last || this.dxr_ioff - 1;
+   for( i = first, last ) {
+      print(string.format("INTERVAL%d %s %s %d",
+      i,
+      ip4.tostring(this.dxr_intervals[i]),
+      ip4.tostring(this.dxr_smints[i]),
+      this.dxr_keys[i]
+      ));
+   }
+   return this;
+}
+
+function LPM4_dxr::build () {
+   this.built = false;
+   this.dxr_ioff = 0;
+   this->build_intervals();
+   this->build_compressed();
+   this->build_direct();
+   this.built = true;
+   return this;
+}
+function LPM4_dxr::build_intervals () {
+   var stk = ffi.new(ffi.typeof("$[33]", lpm4.entry));
+   var soff = -1;
+   var previous = -1;
+
+   function bcast (e) {
+      return e.ip + 2**(32-e.length) - 1;
+   }
+   function pop () {
+      --soff    ;
+   }
+   function head () {
+      return stk[soff];
+   }
+   function push (e) {
+      ++soff    ;
+      stk[soff].ip, stk[soff].length, stk[soff].key = e.ip, e.length, e.key;
+   }
+   function empty () {
+      return soff < 0;
+   }
+   function add_interval (finish) {
+      previous = finish;
+      this.dxr_intervals[this.dxr_ioff] = finish;
+      this.dxr_keys[this.dxr_ioff] = head().key;
+      this.dxr_ioff = this.dxr_ioff + 1;
+   }
+
+   for( e in this->entries() ) {
+      if( e.ip == 0 && e.length == 0 ) {
+         push(e);
+      } else if( bcast(head()) < e.ip ) {
+         // while there is something the stack that finishes before e.ip
+         while((bcast(head()) < e.ip) ) {
+            if( bcast(head()) > previous ) {
+               add_interval(bcast(head()));
+            }
+            pop();
+         }
+      }
+      // if there is a gap between the end of what we popped and this fill
+      // it with what's on the stack
+      if( previous + 1 < e.ip - 1 ) {
+         add_interval(e.ip - 1);
+      }
+      push(e);
+   }
+   while( ! empty() ) {
+      add_interval(bcast(head()));
+      pop();
+   }
+   return this;
+}
+function LPM4_dxr::build_compressed () {
+
+   var ints = this.dxr_intervals;
+   var keys = this.dxr_keys;
+   var smints = this.dxr_smints;
+
+   var i,j = this.dxr_ioff, 0;
+
+   var function tbits(ip) { return ffi.cast("uint32_t", bit.rshift(ip, 16)); }
+   var function bbits(ip) { return ffi.cast("uint16_t", bit.band(ip, 0xffff)); }
+   for( k = 0,i ) {
+      if( keys[k] == keys[k+1] && tbits(ints[k]) == tbits(ints[k+1]) ) {
+      } else {
+         keys[j] = keys[k];
+         ints[j] = ints[k];
+         smints[j] = bbits(ints[k]);
+         ++j    ;
+      }
+   }
+   this.dxr_ioff = j;
+}
+function LPM4_dxr::build_direct () {
+   for( i=0, 2**16 -1 ) {
+      var base = i * 2**16;
+      this.dxr_bottoms[i] = this->search_interval(base);
+      this.dxr_tops[i] = this->search_interval(base + 2**16-1);
+   }
+}
+
+function LPM4_dxr::search_interval (ip) {
+   var ints = this.dxr_intervals;
+   var top = this.dxr_ioff - 1;
+   var bottom = 0;
+   var mid;
+   if( this.built ) {
+      var base = bit.rshift(ip, 16);
+      top = this.dxr_tops[base];
+      bottom = this.dxr_bottoms[base];
+      ip = tonumber(ffi.cast("uint16_t", bit.band(ip, 0xffff)));
+      ints = this.dxr_smints;
+   }
+
+   while( bottom < top ) {
+      mid = math.floor( bottom + (top - bottom) / 2 );
+      if( ints[mid] < ip ) {
+         bottom = mid + 1;
+      } else {
+         top = mid;
+      }
+   }
+   return top;
+}
+
+function LPM4_dxr::search (ip) {
+   return C.lpm4_dxr_search(ip, this.dxr_smints, this.dxr_keys, this.dxr_bottoms, this.dxr_tops);
+   //return self.dxr_keys[self:search_interval(ip)]
+}
+
+function selftest () {
+   var f = LPM4_dxr->new();
+   f->add_string("0.0.0.0/0",700);
+   f->add_string("128.0.0.0/8",701);
+   f->add_string("192.0.0.0/8",702);
+   f->add_string("192.0.0.0/16",703);
+   f->add_string("224.0.0.0/8",704);
+   f->build();
+   function lsearch(f, ip) {
+      return f.dxr_keys[f->search_interval(ip4.parse(ip))];
+   }
+   assert(700 == lsearch(f, "1.1.1.1"));
+   assert(701 == lsearch(f, "128.1.1.1"));
+   assert(702 == lsearch(f, "192.1.1.1"));
+   assert(703 == lsearch(f, "192.0.1.1"));
+   assert(704 == lsearch(f, "224.1.1.1"));
+   assert(700 == lsearch(f, "225.1.1.1"));
+
+   assert(700 == f->search_string("1.1.1.1"));
+   assert(701 == f->search_string("128.1.1.1"));
+   assert(702 == f->search_string("192.1.1.1"));
+   assert(703 == f->search_string("192.0.1.1"));
+   assert(704 == f->search_string("224.1.1.1"));
+   assert(700 == f->search_string("225.1.1.1"));
+   LPM4_dxr->selftest();
+}

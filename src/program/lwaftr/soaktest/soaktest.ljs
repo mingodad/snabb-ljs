@@ -1,0 +1,50 @@
+module(..., package.seeall);
+
+var config = require("core.config");
+var lib = require("core.lib");
+var setup = require("program.lwaftr.setup");
+var engine = require("core.app");
+
+var long_opts = {
+   duration="D",
+   help="h",
+   ["on-a-stick"] = 0,
+};
+
+function show_usage(code) {
+   print(require("program.lwaftr.soaktest.README_inc"));
+   main.exit(code);
+}
+
+function parse_args (args) {
+   var handlers = {};
+   var opts = {};
+   function handlers.h() { show_usage(0); }
+   function handlers.D (arg) {
+      opts.duration = assert(tonumber(arg), "Duration must be a number");
+   }
+   handlers["on-a-stick"] = function () {
+      opts["on-a-stick"] = true;
+   };
+   args = lib.dogetopt(args, handlers, "D:h", long_opts);
+   if( #args != 3 ) { print("Wrong number of arguments: "..#args); show_usage(1); }
+   if( ! opts.duration ) { opts.duration = 0.10; }
+   return opts, args;
+}
+
+function run (args) {
+   var opts;
+   opts, args = parse_args(args);
+   var conf_file, inv4_pcap, inv6_pcap = unpack(args);
+
+   var load_soak_test = opts["on-a-stick"] && setup.load_soak_test_on_a_stick
+                                             ||  setup.load_soak_test;
+   var c = config.new();
+   var conf = setup.read_config(conf_file);
+   load_soak_test(c, conf, inv4_pcap, inv6_pcap);
+
+   engine.configure(c);
+   engine.main({duration=opts.duration});
+
+   print("done");
+}

@@ -1,0 +1,32 @@
+var base_folder = "./";
+
+var re_list = [
+	"%-%-", "//",
+	"end\n", "}\n",
+	" then ", " ) { ",
+	" then\n", " ) {\n",
+	"if ", "if( ",
+	"elseif", "} else if",
+	"local ", "var ",
+	"nil", "null",
+	"while ", "while( ",
+	"for ", "for( ",
+	" do ", " ) { ",
+	" do\n", " ) {\n",
+	"~=", "!=",
+	"(function[^(]*%b())\n", "%1 {\n",
+];
+
+var cmd = "find " .. base_folder .. " -name '*.dasl'";
+var fd = io.popen(cmd);
+for(fname in fd->lines())
+{
+	print("\n====", fname);
+
+	var txt = io.open(fname)->read("*a");
+	for( idx=1, #re_list, 2 )
+	{
+		txt = txt->gsub(re_list[idx], re_list[idx+1]);
+	}
+	print(txt);
+}

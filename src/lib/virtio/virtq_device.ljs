@@ -1,0 +1,113 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+// Implements virtio virtq
+
+
+var lib       = require("core.lib");
+var memory    = require("core.memory");
+var ffi       = require("ffi");
+var C         = ffi.C;
+var band      = bit.band;
+var rshift    = bit.rshift;
+require("lib.virtio.virtio.h");
+require("lib.virtio.virtio_vring_h");
+
+/*
+--*/
+
+var vring_desc_ptr_t = ffi.typeof("struct vring_desc *");
+
+VirtioVirtq = {};
+
+function VirtioVirtq::new() {
+   var o = {};
+   return setmetatable(o, {__index = VirtioVirtq});
+}
+
+function VirtioVirtq::enable_indirect_descriptors () {
+   this.get_desc = this.get_desc_indirect;
+}
+
+function VirtioVirtq::get_desc_indirect (id) {
+   var device = this.device;
+   var ring_desc = this.virtq.desc;
+   if( band(ring_desc[id].flags, C.VIRTIO_DESC_F_INDIRECT) == 0 ) {
+      return ring_desc, id;
+   } else {
+      var addr = device.map_from_guest(device, ring_desc[id].addr);
+      return ffi.cast(vring_desc_ptr_t, addr), 0;
+   }
+}
+
+function VirtioVirtq::get_desc_direct (id) {
+   return this.virtq.desc, id;
+}
+
+// Default: don't support indirect descriptors unless
+// enable_indirect_descriptors is called to replace this binding.
+VirtioVirtq.get_desc = VirtioVirtq.get_desc_direct;
+
+// Receive all available packets from the virtual machine.
+function VirtioVirtq::get_buffers (kind, ops, hdr_len) {
+
+   var device = this.device;
+   var idx = this.virtq.avail.idx;
+   var avail, vring_mask = this.avail, this.vring_num-1;
+
+   while( idx != avail ) {
+
+      // Header
+      var v_header_id = this.virtq.avail.ring[band(avail,vring_mask)];
+      var desc, id = this->get_desc(v_header_id);
+
+      var data_desc = desc[id];
+
+      var packet =
+         ops.packet_start(device, data_desc.addr, data_desc.len);
+      var total_size = hdr_len;
+
+      if( ! packet ) { break; }
+
+      // support ANY_LAYOUT
+      if( hdr_len < data_desc.len ) {
+         var addr = data_desc.addr + hdr_len;
+         var len = data_desc.len - hdr_len;
+         var added_len = ops.buffer_add(device, packet, addr, len);
+         total_size +=   added_len;
+      }
+
+      // Data buffer
+      while( band(data_desc.flags, C.VIRTIO_DESC_F_NEXT) != 0 ) {
+         data_desc  = desc[data_desc.next];
+         var added_len = ops.buffer_add(device, packet, data_desc.addr, data_desc.len);
+         total_size +=   added_len;
+      }
+
+      ops.packet_end(device, v_header_id, total_size, packet);
+
+      avail = band(avail + 1, 65535);
+   }
+   this.avail = avail;
+}
+
+function VirtioVirtq::put_buffer (id, len) {
+   var used = this.virtq.used.ring[band(this.used, this.vring_num-1)];
+   used.id, used.len = id, len;
+
+   this.used = band(this.used + 1, 65535);
+}
+
+// Prepared argument for writing a 1 to an eventfd.
+var eventfd_one = ffi.new("uint64_t[1]", {1});
+
+function VirtioVirtq::signal_used () {
+   if( this.virtq.used.idx != this.used ) {
+      this.virtq.used.idx = this.used;
+      C.full_memory_barrier();
+      if( band(this.virtq.avail.flags, C.VRING_F_NO_INTERRUPT) == 0 ) {
+         C.write(this.callfd, eventfd_one, 8);
+      }
+   }
+}
+
+return VirtioVirtq;

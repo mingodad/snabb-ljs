@@ -1,0 +1,138 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+module(..., package.seeall);
+
+var lib = require("core.lib");
+var usage = require("program.snsh.README_inc");
+
+var long_opts = {
+   ["package-path"] = "P",
+   eval = "e",
+   load = "l",
+   program = "p",
+   test = "t",
+   interactive = "i",
+   debug = "d",
+   jit = "j",
+   sigquit = "q",
+   help = "h",
+};
+
+function run (parameters) {
+   var profiling = false;
+   var traceprofiling = false;
+   var start_repl = false;
+   var noop = true; // are we doing nothing?
+   var program; // should we run a different program?
+   // Table of functions implementing command-line arguments
+   var opt = {};
+   function opt.h (arg) { print(usage); main.exit(0);            }
+   function opt.l (arg) { require(arg);            noop = false; }
+   function opt.t (arg) { require(arg).selftest(); noop = false; }
+   function opt.q (arg) { hook_sigquit(arg);                    }
+   function opt.d (arg) { _G.developer_debug = true;            }
+   function opt.p (arg) { program = arg;                        }
+   function opt.i (arg) { start_repl = true;       noop = false; }
+   function opt.j (arg) {
+      if( arg->match("^v") ) {
+         var file = arg->match("^v=(.*)");
+         if( file == '' ) { file = null; }
+         require("jit.v").start(file);
+      } else if( arg->match("^p") ) {
+         var opts, file = arg->match("^p=([^,]*),?(.*)");
+         if( file == '' ) { file = null; }
+         require("jit.p").start(opts, file);
+         profiling = true;
+      } else if( arg->match("^dump") ) {
+         var opts, file = arg->match("^dump=([^,]*),?(.*)");
+         if( file == '' ) { file = null; }
+         require("jit.dump").on(opts, file);
+      } else if( arg->match("^tprof") ) {
+         require("lib.traceprof.traceprof").start();
+         traceprofiling = true;
+      }
+   }
+   function opt.e (arg) {
+      var thunk, error = loadstring(arg);
+      if( thunk ) { thunk(); } else { print(error); }
+      noop = false;
+   }
+   function opt.P (arg) {
+      package.path = arg;
+   }
+
+   // Execute command line arguments
+   parameters = lib.dogetopt(parameters, opt, "hl:p:t:die:j:P:q:", long_opts);
+
+   if( program ) {
+      var mod = (("program.%s.%s")->format(program, program));
+      require(mod).run(parameters);
+   } else if( #parameters > 0 ) {
+      run_script(parameters);
+   } else if( noop ) {
+      print(usage);
+      main.exit(1);
+   }
+
+   if( start_repl ) { repl(); }
+   if( profiling ) { require("jit.p").stop(); }
+   if( traceprofiling ) {
+      require("lib.traceprof.traceprof").stop();
+   }
+}
+
+function run_script (parameters) {
+   var command = table.remove(parameters, 1);
+   main.parameters = parameters; // make remaining args available to script
+   dofile(command);
+}
+
+// This is a simple REPL similar to LuaJIT's built-in REPL. It can only
+// read single-line statements but does support the `=<expr>' syntax.
+function repl () {
+   var line = null;
+   var function eval_line () {
+      if( line->sub(0,1) == "=" ) {
+         // Evaluate line as expression.
+         print(loadstring("return "..line->sub(2))());
+      } else {
+         // Evaluate line as statement
+         var load = loadstring(line);
+         if( load ) { load(); }
+      }
+   }
+   do {
+      io.stdout->write("Snabb> ");
+      io.stdout->flush();
+      line = io.stdin->read("*l");
+      if( line ) {
+         var status, err = pcall(eval_line);
+         if( ! status ) {
+            io.stdout->write(("Error in %s\n")->format(err));
+         }
+         io.stdout->flush();
+      }
+   } while(!( ! line) );
+}
+
+// Cause SIGQUIT to enter the REPL.
+// SIGQUIT can be triggered interactively with `Control \' in a terminal.
+function hook_sigquit (action) {
+   if( action != 'repl' ) {
+      print("ignoring unrecognized SIGQUIT action: " .. action);
+      os.exit(1);
+   }
+   var S = require("syscall");
+   var fd = S.signalfd("quit", "nonblock"); // handle SIGQUIT via fd
+   S.sigprocmask("block", "quit");            // block traditional handler
+   var timer = require("core.timer");
+   timer.activate(timer.new("sigquit-repl",
+                            function () {
+                               if( (#S.util.signalfd_read(fd) > 0) ) {
+                                  print("[snsh: SIGQUIT caught - entering REPL]");
+                                  repl();
+                               }
+                            },
+                            1e4,
+                            'repeating'));
+}

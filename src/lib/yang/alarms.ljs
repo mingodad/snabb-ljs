@@ -1,0 +1,869 @@
+module(..., package.seeall);
+
+var data = require('lib.yang.data');
+var lib = require('core.lib');
+var util = require('lib.yang.util');
+var alarm_codec = require('lib.ptree.alarm_codec');
+var counter = require("core.counter");
+
+var format_date_as_iso_8601 = util.format_date_as_iso_8601;
+var parse_date_as_iso_8601 = util.parse_date_as_iso_8601;
+
+var control = {
+   alarm_shelving = {
+      shelf = {}
+   }
+};
+
+var state = {
+   alarm_inventory = {
+      alarm_type = {},
+   },
+   alarm_list = {
+      alarm = {},
+      number_of_alarms = 0,
+   },
+   shelved_alarms = {
+      shelved_alarms = {}
+   }
+};
+
+var function table_size (t) {
+   var size = 0;
+   for( _ in pairs(t) ) { ++size    ; }
+   return size;
+}
+
+var function table_is_empty(t) {
+   for( k,v in pairs(t) ) { return false; }
+   return true;
+}
+
+function get_state () {
+   // status-change is stored as an array while according to ietf-alarms schema
+   // it should be a hashmap indexed by time.
+   var function index_by_time (status_change) {
+      var ret = {};
+      for( _, v in pairs(status_change) ) { ret[v.time] = v; }
+      return ret;
+   }
+   var function transform_alarm_list (alarm_list) {
+      var alarm = alarm_list.alarm;
+      var ret = {};
+      for( k,v in pairs(alarm) ) {
+         ret[k] = lib.deepcopy(v);
+         ret[k].status_change = index_by_time(ret[k].status_change);
+         ret[k].operator_state_change = index_by_time(ret[k].operator_state_change);
+      }
+      alarm_list.alarm = ret;
+      return alarm_list;
+   }
+   return {
+      alarm_inventory = state.alarm_inventory,
+      alarm_list = transform_alarm_list(state.alarm_list),
+      summary = {
+         alarm_summary = build_summary(state.alarm_list.alarm),
+      }
+   };
+}
+
+function build_summary (alarms) {
+   var function last_operator_state_change (alarm) {
+      return alarm.operator_state_change[#alarm.operator_state_change];
+   }
+   var function state_change (alarm) {
+      var state_change = last_operator_state_change(alarm);
+      return state_change && state_change.state || '';
+   }
+   var function is_cleared (alarm) {
+      return alarm.is_cleared;
+   }
+   var function is_cleared_not_closed (alarm) {
+      return alarm.is_cleared && state_change(alarm) != 'closed';
+   }
+   var function is_cleared_closed (alarm) {
+      return alarm.is_cleared && state_change(alarm) == 'closed';
+   }
+   var function is_not_cleared_closed (alarm) {
+      return ! alarm.is_cleared && state_change(alarm) == 'closed';
+   }
+   var function is_not_cleared_not_closed (alarm) {
+      return ! alarm.is_cleared && state_change(alarm) != 'closed';
+   }
+   var ret = {};
+   for( key, alarm in pairs(alarms) ) {
+      var severity = alarm.perceived_severity;
+      var entry = ret[severity];
+      if( ! entry ) {
+         entry = {
+             total = 0,
+             cleared = 0,
+             cleared_not_closed = 0,
+             cleared_closed = 0,
+             not_cleared_closed = 0,
+             not_cleared_not_closed = 0,
+         };
+      }
+      entry.total = entry.total + 1;
+      if( is_cleared(alarm) ) {
+         entry.cleared = entry.cleared + 1;
+      }
+      if( is_cleared_not_closed(alarm) ) {
+         entry.cleared_not_closed = entry.cleared_not_closed + 1;
+      }
+      if( is_cleared_closed(alarm) ) {
+         entry.cleared_closed = entry.cleared_closed + 1;
+      }
+      if( is_not_cleared_closed(alarm) ) {
+         entry.not_cleared_closed = entry.not_cleared_closed + 1;
+      }
+      if( is_not_cleared_not_closed(alarm) ) {
+         entry.not_cleared_not_closed = entry.not_cleared_not_closed + 1;
+      }
+      ret[severity] = entry;
+   }
+   if( ! table_is_empty(state.shelved_alarms.shelved_alarms) ) {
+      ret['shelved_alarms'] = table_size(state.shelved_alarms.shelved_alarms);
+   }
+   return ret;
+}
+
+// Single point to access alarm type keys.
+alarm_type_keys = {};
+
+function alarm_type_keys::fetch (alarm_type_id, alarm_type_qualifier) {
+   this.cache = this.cache || {};
+   var function lookup (alarm_type_id, alarm_type_qualifier) {
+      if( ! this.cache[alarm_type_id] ) {
+         this.cache[alarm_type_id] = {};
+      }
+      return this.cache[alarm_type_id][alarm_type_qualifier];
+   }
+   assert(alarm_type_id);
+   alarm_type_qualifier = alarm_type_qualifier || '';
+   var key = lookup(alarm_type_id, alarm_type_qualifier);
+   if( ! key ) {
+      key = {alarm_type_id=alarm_type_id, alarm_type_qualifier=alarm_type_qualifier};
+      this.cache[alarm_type_id][alarm_type_qualifier] = key;
+   }
+   return key;
+}
+function alarm_type_keys::normalize (key) {
+   var alarm_type_id = assert(key.alarm_type_id);
+   var alarm_type_qualifier = key.alarm_type_qualifier || '';
+   return this->fetch(alarm_type_id, alarm_type_qualifier);
+}
+
+function add_to_inventory (alarm_types) {
+   assert(type(alarm_types) == 'table');
+   for( key,args in pairs(alarm_types) ) {
+      alarm_codec.add_to_inventory(key, args);
+   }
+}
+
+function do_add_to_inventory (k, v) {
+   var key = alarm_type_keys->normalize(k);
+   var resource = {v.resource};
+   // Preserve previously defined resources.
+   if( state.alarm_inventory.alarm_type[key] ) {
+      resource = state.alarm_inventory.alarm_type[key].resource;
+      table.insert(resource, v.resource);
+   }
+   state.alarm_inventory.alarm_type[key] = v;
+   state.alarm_inventory.alarm_type[key].resource = resource;
+}
+
+// Single point to access alarm keys.
+alarm_keys = {};
+
+function alarm_keys::fetch (...) {
+   this.cache = this.cache || {};
+   var function lookup (resource, alarm_type_id, alarm_type_qualifier) {
+      if( ! this.cache[resource] ) {
+         this.cache[resource] = {};
+      }
+      if( ! this.cache[resource][alarm_type_id] ) {
+         this.cache[resource][alarm_type_id] = {};
+      }
+      return this.cache[resource][alarm_type_id][alarm_type_qualifier];
+   }
+   var resource, alarm_type_id, alarm_type_qualifier = unpack({...});
+   assert(resource && alarm_type_id);
+   alarm_type_qualifier = alarm_type_qualifier || '';
+   var key = lookup(resource, alarm_type_id, alarm_type_qualifier);
+   if( ! key ) {
+      key = {resource=resource, alarm_type_id=alarm_type_id,
+             alarm_type_qualifier=alarm_type_qualifier};
+      this.cache[resource][alarm_type_id][alarm_type_qualifier] = key;
+   }
+   return key;
+}
+function alarm_keys::normalize (key) {
+   var resource = assert(key.resource);
+   var alarm_type_id = assert(key.alarm_type_id);
+   var alarm_type_qualifier = key.alarm_type_qualifier || '';
+   return this->fetch(resource, alarm_type_id, alarm_type_qualifier);
+}
+
+// Contains a table with all the declared alarms.
+var alarm_list = {
+   list = {},
+   defaults = {},
+};
+function alarm_list::new (key, alarm) {
+   this.list[key] = alarm;
+   this->set_defaults_if_any(key);
+}
+function alarm_list::set_defaults_if_any (key) {
+   k = alarm_type_keys->normalize(key);
+   var default = this.defaults[k];
+   if( default ) {
+      for( k,v in pairs(default) ) {
+         this.list[key][k] = v;
+      }
+   }
+}
+function add_default (key, args) {
+   this.defaults[key] = args;
+}
+function alarm_list::lookup (key) {
+   return this.list[key];
+}
+function alarm_list::retrieve (key, args) {
+   var function copy (src, args) {
+      var ret = {};
+      for( k,v in pairs(src) ) { ret[k] = args[k] || v; }
+      return ret;
+   }
+   var alarm = this->lookup(key);
+   if( alarm ) {
+      return copy(alarm, args);
+   }
+}
+
+function default_alarms (alarms) {
+   for( k,v in pairs(alarms) ) {
+      k = alarm_type_keys->normalize(k);
+      alarm_list.defaults[k] = v;
+   }
+}
+
+function declare_alarm (alarms) {
+   var k, v = next(alarms);
+   alarm_codec.declare_alarm(k, v);
+   var key = alarm_keys->normalize(k);
+   var alarm = {};
+   function alarm::raise (args) {
+      alarm_codec.raise_alarm(key, args);
+   }
+   function alarm::clear () {
+      alarm_codec.clear_alarm(key);
+   }
+   return alarm;
+}
+
+function do_declare_alarm (key, args) {
+   var function create_or_update (key, src) {
+      var dst = alarm_list->lookup(key);
+      if( dst ) {
+         // Extend or overwrite existing alarm values.
+         for( k, v in pairs(src) ) {
+            dst[k] = v;
+         }
+         alarm_list->new(key, dst);
+      } else {
+         alarm_list->new(key, src);
+      }
+   }
+   key = alarm_keys->normalize(key);
+   create_or_update(key, args);
+}
+
+// Raise alarm.
+
+// The entry with latest time-stamp in this list MUST correspond to the leafs
+// 'is-cleared', 'perceived-severity' and 'alarm-text' for the alarm.
+// The time-stamp for that entry MUST be equal to the 'last-changed' leaf.
+var function add_status_change (alarm, status) {
+   alarm.status_change = alarm.status_change || {};
+   alarm.perceived_severity = status.perceived_severity;
+   alarm.alarm_text = status.alarm_text;
+   alarm.last_changed = status.time;
+   state.alarm_list.last_changed = status.time;
+   table.insert(alarm.status_change, status);
+}
+
+// Creates a new alarm.
+//
+// The alarm is retrieved from the db of predefined alarms. Default values get
+// overridden by args. Additional fields are initialized too and an initial
+// status change is added to the alarm.
+var function new_alarm (key, args) {
+   var ret = assert(alarm_list->retrieve(key, args), 'Not supported alarm');
+   var status = {
+      time = format_date_as_iso_8601(),
+      perceived_severity = args.perceived_severity || ret.perceived_severity,
+      alarm_text = args.alarm_text || ret.alarm_text,
+   };
+   add_status_change(ret, status);
+   ret.last_changed = assert(status.time);
+   ret.time_created = assert(ret.last_changed);
+   ret.is_cleared = args.is_cleared;
+   ret.operator_state_change = {};
+   state.alarm_list.number_of_alarms = state.alarm_list.number_of_alarms + 1;
+   return ret;
+}
+
+// Adds alarm to state.alarm_list.
+var function create_alarm (key, args) {
+   var alarm = assert(new_alarm(key, args));
+   state.alarm_list.alarm[key] = alarm;
+}
+
+// The following state changes creates a new status change:
+//   - changed severity (warning, minor, major, critical).
+//   - clearance status, this also updates the 'is-cleared' leaf.
+//   - alarm text update.
+var function needs_status_change (alarm, args) {
+   if( alarm.is_cleared != args.is_cleared ) {
+      return true;
+   } else if( args.perceived_severity &&
+          alarm.perceived_severity != args.perceived_severity ) {
+      return true;
+   } else if( args.alarm_text && alarm.alarm_text != args.alarm_text ) {
+      return true;
+   }
+   return false;
+}
+
+// An alarm gets updated if it needs a status change.  A status change implies
+// to add a new status change to the alarm and update the alarm 'is_cleared'
+// flag.
+var function update_alarm (alarm, args) {
+   if( needs_status_change(alarm, args) ) {
+      var status = {
+         time = assert(format_date_as_iso_8601()),
+         perceived_severity = assert(args.perceived_severity || alarm.perceived_severity),
+         alarm_text = assert(args.alarm_text || alarm.alarm_text),
+      };
+      add_status_change(alarm, status);
+      alarm.is_cleared = args.is_cleared;
+   }
+}
+
+var function is_shelved(key) {
+   return control.alarm_shelving.shelf[key];
+}
+
+// Check up if the alarm already exists in state.alarm_list.
+var function lookup_alarm (key) {
+   if( is_shelved(key) ) {
+      return state.shelved_alarms.shelved_alarms[key];
+   } else {
+      return state.alarm_list.alarm[key];
+   }
+}
+
+function raise_alarm (key, args) {
+   assert(key);
+   args = args || {};
+   args.is_cleared = false;
+   key = alarm_keys->normalize(key);
+   var alarm = lookup_alarm(key);
+   if( ! alarm ) {
+      create_alarm(key, args);
+   } else {
+      update_alarm(alarm, args);
+   }
+}
+
+// Clear alarm.
+
+function clear_alarm (key) {
+   assert(key);
+   var args = {is_cleared = true};
+   key = alarm_keys->normalize(key);
+   var alarm = lookup_alarm(key);
+   if( alarm ) {
+      update_alarm(alarm, args);
+   }
+}
+
+// Alarm shelving.
+
+function shelve_alarm (key, alarm) {
+   alarm = alarm || state.alarm_list.alarm[key];
+   state.shelved_alarms.shelved_alarms[key] = alarm;
+   state.alarm_list.alarm[key] = null;
+   control.alarm_shelving.shelf[key] = true;
+}
+
+function unshelve_alarm (key, alarm) {
+   alarm = alarm || state.shelved_alarms.shelved_alarms[key];
+   state.alarm_list.alarm[key] = alarm;
+   state.shelved_alarms.shelved_alarms[key] = null;
+   control.alarm_shelving.shelf[key] = null;
+}
+
+// Set operator state.
+
+var operator_states = lib.set('none', 'ack', 'closed', 'shelved', 'un-shelved');
+
+function set_operator_state (key, args) {
+   assert(args.state && operator_states[args.state],
+          'Not a valid operator state: '..args.state);
+   key = alarm_keys->normalize(key);
+   var alarm;
+   if( args.state == 'un-shelved' ) {
+      alarm = assert(state.shelved_alarms.shelved_alarms[key], 'Could not locate alarm in shelved-alarms');
+      control.alarm_shelving.shelf[key] = null;
+   } else {
+      alarm = assert(state.alarm_list.alarm[key], 'Could not locate alarm in alarm-list');
+   }
+   if( ! alarm.operator_state_change ) {
+      alarm.operator_state_change = {};
+   }
+   var time = format_date_as_iso_8601();
+   table.insert(alarm.operator_state_change, {
+      time = time,
+      operator = 'admin',
+      state = args.state,
+      text = args.text,
+   });
+   if( args.state == 'shelved' ) {
+      shelve_alarm(key, alarm);
+   } else if( args.state == 'un-shelved' ) {
+      unshelve_alarm(key, alarm);
+   }
+   return true;
+}
+
+// Purge alarms.
+
+var ages = {seconds=1, minutes=60, hours=3600, days=3600*24, weeks=3600*24*7};
+
+var function toseconds (date) {
+   var function tz_seconds (t) {
+      if( ! t.tz_hour ) { return 0; }
+      var sign = t.tz_sign || "+";
+      var seconds = tonumber(t.tz_hour) * 3600 + tonumber(t.tz_min) * 60;
+      return sign == '+' && seconds || seconds*-1;
+   }
+   if( type(date) == 'table' ) {
+      assert(date.age_spec && date.value, "Not a valid 'older_than' data type");
+
+      var multiplier = assert(ages[date.age_spec],
+                                "Not a valid 'age_spec' value: "..date.age_spec);
+      return date.value * multiplier;
+   } else if( type(date) == 'string' ) {
+      var t = parse_date_as_iso_8601(date);
+      return os.time(t) + tz_seconds(t);
+   } else {
+      error('Wrong data type: '..type(date));
+   }
+}
+
+// `purge_alarms` requests the server to delete entries from the alarm list
+// according to the supplied criteria.  Typically it can be used to delete
+// alarms that are in closed operator state and older than a specified time.
+// The number of purged alarms is returned as an output parameter.
+//
+// args: {status, older_than, severity, operator_state}
+function purge_alarms (args) {
+   var alarm_list = state.alarm_list;
+   var alarms = state.alarm_list.alarm;
+   args.alarm_status = args.alarm_status || 'any';
+   var function purge_alarm (key) {
+      alarms[key] = null;
+      alarm_list.number_of_alarms = alarm_list.number_of_alarms - 1;
+   }
+   var function by_status (alarm, args) {
+      var status = assert(args.alarm_status);
+      var alarm_statuses = lib.set('any', 'cleared', 'not-cleared');
+      assert(alarm_statuses[status], 'Not a valid status value: '..status);
+      if( status == 'any' ) { return true; }
+      if( status == 'cleared' ) { return alarm.is_cleared; }
+      if( status == 'not-cleared' ) { return ! alarm.is_cleared; }
+      return false;
+   }
+   var function by_older_than (alarm, args) {
+      var older_than = assert(args.older_than);
+      if( type(older_than) == 'string' ) {
+         var age_spec, value = older_than->match("([%w]+):([%d]+)");
+         older_than = {value = value, age_spec = age_spec};
+      }
+      assert(type(older_than) == 'table');
+      var alarm_time = toseconds(alarm.time_created);
+      var threshold = toseconds(older_than);
+      return os.time() - alarm_time >= threshold;
+   }
+   var function by_severity (alarm, args) {
+      var severity = assert(args.severity);
+      if( type(severity) == 'string' ) {
+         var sev_spec, value = severity->match("([%w]+):([%w]+)");
+         severity = {sev_spec = sev_spec, value = value};
+      }
+      assert(type(severity) == 'table' && severity.sev_spec && severity.value,
+             'Not valid severity data type');
+      var severities = {indeterminate=2, minor=3 , warning=4, major=5, critical=6};
+      var function tonumber (severity) {
+         return severities[severity];
+      }
+      var sev_spec;
+      sev_spec, severity = severity.sev_spec, tonumber(severity.value);
+      var alarm_severity = tonumber(alarm.perceived_severity);
+      if( sev_spec == 'below' ) {
+         return alarm_severity < severity;
+      } else if( sev_spec == 'is' ) {
+         return alarm_severity == severity;
+      } else if( sev_spec == 'above' ) {
+         return alarm_severity > severity;
+      } else {
+         error('Not valid sev-spec value: '..sev_spec);
+      }
+      return false;
+   }
+   var function by_operator_state (alarm, args) {
+      var operator_state = assert(args.operator_state_filter);
+      var state, user;
+      if( type(operator_state) == 'string' ) {
+         state, user = operator_state->match("([%w]+):([%w]+)");
+         if( ! state ) {
+            state, user = operator_state, operator_state;
+         }
+         operator_state = {state=state, user=user};
+      }
+      assert(type(operator_state) == 'table');
+      var function tonumber (state) {
+         return operator_states[state];
+      }
+      state, user = operator_state.state, operator_state.user;
+      if( state || user ) {
+         for( _, state_change in pairs(alarm.operator_state_change || {}) ) {
+            if( state && tonumber(state_change.state) == tonumber(state) ) {
+               return true;
+            } else if( user && state_change.user == user ) {
+               return true;
+            }
+         }
+      }
+      return false;
+   }
+   var args_to_filters = { older_than=by_older_than,
+                             severity = by_severity,
+                             operator_state_filter = by_operator_state, };
+   var filter = {};
+   function filter::initialize (args) {
+      this.args = args;
+      this.filters = { by_status };
+      for( name, filter in pairs(args_to_filters) ) {
+         if( args[name] ) {
+            table.insert(this.filters, filter);
+         }
+      }
+   }
+   function filter::apply (alarm) {
+      for( _, filter in ipairs(this.filters) ) {
+         if( ! filter(alarm, this.args) ) { return false; }
+      }
+      return true;
+   }
+   var count = 0;
+   filter->initialize(args);
+   for( key, alarm in pairs(alarms) ) {
+      if( filter->apply(alarm) ) {
+         purge_alarm(key);
+         ++count    ;
+      }
+   }
+   return count;
+}
+
+var function alarm_key_matches (k1, k2) {
+   if( k1.resource && k1.resource != k2.resource ) {
+     return false;
+   } else if( k1.alarm_type_id && k1.alarm_type_id != k2.alarm_type_id ) {
+     return false;
+   } else if( k1.alarm_type_qualifier &&
+          k1.alarm_type_qualifier != k2.alarm_type_qualifier ) {
+     return false;
+   }
+   return true;
+}
+
+var function compress_alarm (alarm) {
+   assert(alarm.status_change);
+   var latest_status_change = alarm.status_change[#alarm.status_change];
+   alarm.status_change = {latest_status_change};
+}
+
+// This operation requests the server to compress entries in the
+// alarm list by removing all but the latest state change for all
+// alarms.  Conditions in the input are logically ANDed.  If no
+// input condition is given, all alarms are compressed.
+function compress_alarms (key) {
+   assert(type(key) == 'table');
+   var count = 0;
+   for( k, alarm in pairs(state.alarm_list.alarm) ) {
+      if( alarm_key_matches(key, k) ) {
+         compress_alarm(alarm);
+         ++count    ;
+      }
+   }
+   return count;
+}
+
+var Alarm = {};
+Alarm.__index={Alarm};
+
+function Alarm::check () {
+   if( this.next_check == null ) {
+      this.next_check = engine.now() + this.period;
+      this.last_value = this->get_value();
+   } else if( this.next_check < engine.now() ) {
+      var value = this->get_value();
+      if( (value - this.last_value > this.limit) ) {
+         this.alarm->raise();
+      } else {
+         this.alarm->clear();
+      }
+      this.next_check = engine.now() + this.period;
+      this.last_value = value;
+   }
+}
+
+CallbackAlarm = {};
+
+function CallbackAlarm.new (alarm, period, limit, expr) {
+   assert(type(expr) == 'function');
+   return setmetatable({alarm=alarm, period=period, limit=limit, expr=expr},
+      {__index = setmetatable(CallbackAlarm, {__index=Alarm})});
+}
+function CallbackAlarm::get_value() {
+   return this.expr();
+}
+
+CounterAlarm = {};
+
+function CounterAlarm.new (alarm, period, limit, object, counter_name) {
+   return setmetatable({alarm=alarm, period=period, limit=limit,  object=object,
+      counter_name=counter_name}, {__index = setmetatable(CounterAlarm, {__index=Alarm})});
+}
+function CounterAlarm::get_value() {
+   return counter.read(this.object.shm[this.counter_name]);
+}
+
+//
+
+function selftest () {
+   print("selftest: alarms");
+   var function sleep (seconds) {
+      os.execute("sleep "..tonumber(seconds));
+   }
+   var function check_status_change (alarm) {
+      var status_change = alarm.status_change;
+      for( k, v in pairs(status_change) ) {
+         assert(v.perceived_severity);
+         assert(v.time);
+         assert(v.alarm_text);
+      }
+   }
+
+   // ARP alarm.
+   do_add_to_inventory({alarm_type_id='arp-resolution'}, {
+      resource='nic-v4',
+      has_clear=true,
+      description='Raise up if ARP app cannot resolve IP address',
+   });
+   do_declare_alarm({resource='nic-v4', alarm_type_id='arp-resolution'}, {
+      perceived_severity = 'critical',
+      alarm_text = 'Make sure you can ARP resolve IP addresses on NIC',
+   });
+   // NDP alarm.
+   do_add_to_inventory({alarm_type_id='ndp-resolution'}, {
+      resource='nic-v6',
+      has_clear=true,
+      description='Raise up if NDP app cannot resolve IP address',
+   });
+   do_declare_alarm({resource='nic-v6', alarm_type_id='ndp-resolution'}, {
+      perceived_severity = 'critical',
+      alarm_text = 'Make sure you can NDP resolve IP addresses on NIC',
+   });
+
+   // Check alarm inventory has been loaded.
+   assert(table_size(state.alarm_inventory.alarm_type) > 0);
+
+   // Check number of alarms is zero.
+   assert(state.alarm_list.number_of_alarms == 0);
+
+   // Raising an alarm when alarms is empty, creates an alarm.
+   var key = alarm_keys->fetch('nic-v4', 'arp-resolution');
+   raise_alarm(key);
+   var alarm = assert(state.alarm_list.alarm[key]);
+   assert(table_size(alarm.status_change) == 1);
+   assert(state.alarm_list.number_of_alarms == 1);
+
+   // Raise same alarm again. Since there are not changes, everything remains the same.
+   alarm = state.alarm_list.alarm[key];
+   var last_changed = alarm.last_changed;
+   var number_of_status_change = table_size(alarm.status_change);
+   var number_of_alarms = state.alarm_list.number_of_alarms;
+   sleep(1);
+   raise_alarm(key);
+   assert(state.alarm_list.alarm[key].last_changed == last_changed);
+   assert(table_size(alarm.status_change) == number_of_status_change);
+   assert(state.alarm_list.number_of_alarms == number_of_alarms);
+
+   // Raise alarm again but changing severity.
+   alarm = state.alarm_list.alarm[key];
+   last_changed = alarm.last_changed;
+   number_of_status_change = table_size(alarm.status_change);
+   raise_alarm(key, {perceived_severity='minor'});
+   assert(alarm.perceived_severity == 'minor');
+   assert(last_changed != alarm.last_changed);
+   assert(table_size(alarm.status_change) == number_of_status_change + 1);
+   check_status_change(alarm);
+
+   // Raise alarm again with same severity. Should not produce changes.
+   alarm = state.alarm_list.alarm[key];
+   last_changed = alarm.last_changed;
+   number_of_status_change = table_size(alarm.status_change);
+   raise_alarm(key, {perceived_severity='minor'});
+   assert(alarm.perceived_severity == 'minor');
+   assert(last_changed == alarm.last_changed);
+   assert(table_size(alarm.status_change) == number_of_status_change);
+
+   // Raise alarm again but changing alarm_text. A new status change is added.
+   alarm = state.alarm_list.alarm[key];
+   number_of_status_change = table_size(alarm.status_change);
+   raise_alarm(key, {alarm_text='new text'});
+   assert(table_size(alarm.status_change) == number_of_status_change + 1);
+   assert(alarm.alarm_text == 'new text');
+
+   // Clear alarm. Should clear alarm and create a new status change in the alarm.
+   alarm = state.alarm_list.alarm[key];
+   number_of_status_change = table_size(alarm.status_change);
+   assert(! alarm.is_cleared);
+   sleep(1);
+   clear_alarm(key);
+   assert(alarm.is_cleared);
+   assert(table_size(alarm.status_change) == number_of_status_change + 1);
+
+   // Clear alarm again. Nothing should change.
+   alarm = state.alarm_list.alarm[key];
+   last_changed = alarm.last_changed;
+   number_of_status_change = table_size(alarm.status_change);
+   assert(alarm.is_cleared);
+   clear_alarm(key);
+   assert(alarm.is_cleared);
+   assert(table_size(alarm.status_change) == number_of_status_change,
+          table_size(alarm.status_change).." == "..number_of_status_change);
+   assert(alarm.last_changed == last_changed);
+
+   // Set operator state change.
+   assert(table_size(alarm.operator_state_change) == 0);
+   set_operator_state(key, {state='ack'});
+   assert(table_size(alarm.operator_state_change) == 1);
+
+   // Set operator state change again. Should create a new operator state change.
+   sleep(1);
+   set_operator_state(key, {state='ack'});
+   assert(table_size(alarm.operator_state_change) == 2);
+
+   // Summary.
+   var t = build_summary(state.alarm_list.alarm);
+   assert(t.minor.cleared == 1);
+   assert(t.minor.cleared_closed == 0);
+   assert(t.minor.cleared_not_closed == 1);
+   assert(t.minor.not_cleared_closed == 0);
+   assert(t.minor.not_cleared_not_closed == 0);
+   assert(t.minor.total == 1);
+
+   // Compress alarms.
+   key = alarm_keys->fetch('nic-v4', 'arp-resolution');
+   alarm = state.alarm_list.alarm[key];
+   assert(table_size(alarm.status_change) == 4);
+   compress_alarms({resource='nic-v4'});
+   assert(table_size(alarm.status_change) == 1);
+
+   // Set operator state change on non existent alarm should fail.
+   key = {resource='none', alarm_type_id='none', alarm_type_qualifier=''};
+   var success = pcall(set_operator_state, key, {state='ack'});
+   assert(! success);
+
+   // Test toseconds.
+   assert(toseconds({age_spec='weeks', value=1}) == 3600*24*7);
+   var now = os.time();
+   assert(now == toseconds(format_date_as_iso_8601(now)));
+
+   // Purge alarms by status.
+   assert(table_size(state.alarm_list.alarm) == 1);
+   assert(purge_alarms({alarm_status = 'any'}) == 1);
+   assert(table_size(state.alarm_list.alarm) == 0);
+   assert(purge_alarms({alarm_status = 'any'}) == 0);
+
+   // Purge alarms filtering by older_than.
+   key = alarm_keys->fetch('nic-v4', 'arp-resolution');
+   raise_alarm(key);
+   sleep(1);
+   assert(purge_alarms({older_than={age_spec='seconds', value='1'}}) == 1);
+
+   // Purge alarms by severity.
+   key = alarm_keys->fetch('nic-v4', 'arp-resolution');
+   raise_alarm(key);
+   assert(table_size(state.alarm_list.alarm) == 1);
+   assert(purge_alarms({severity={sev_spec='is', value='minor'}}) == 0);
+   assert(purge_alarms({severity={sev_spec='below', value='minor'}}) == 0);
+   assert(purge_alarms({severity={sev_spec='above', value='minor'}}) == 1);
+
+   raise_alarm(key, {perceived_severity='minor'});
+   assert(purge_alarms({severity={sev_spec='is', value='minor'}}) == 1);
+
+   raise_alarm(alarm_keys->fetch('nic-v4', 'arp-resolution'));
+   raise_alarm(alarm_keys->fetch('nic-v6', 'ndp-resolution'));
+   assert(table_size(state.alarm_list.alarm) == 2);
+   assert(purge_alarms({severity={sev_spec='above', value='minor'}}) == 2);
+
+   // Purge alarms by operator_state_filter.
+   key = alarm_keys->fetch('nic-v4', 'arp-resolution');
+   raise_alarm(key);
+   assert(table_size(state.alarm_list.alarm) == 1);
+   success = set_operator_state(key, {state='ack'});
+   assert(success);
+   alarm = assert(state.alarm_list.alarm[key]);
+   assert(table_size(alarm.operator_state_change) == 1);
+   assert(purge_alarms({operator_state_filter={state='ack'}}) == 1);
+
+   // Shelving and alarm should:
+   // - Add shelving criteria to alarms/control.
+   // - Move alarm from alarms/alarm-list to alarms/shelved-alarms.
+   // - Do not generate notifications if the alarm changes its status.
+   // - Increase the number of shelved alarms in summary.
+   key = alarm_keys->fetch('nic-v4', 'arp-resolution');
+   raise_alarm(key, {perceived_severity='minor'});
+   success = set_operator_state(key, {state='shelved'});
+   assert(success);
+   assert(table_size(control.alarm_shelving.shelf) == 1);
+   assert(table_size(state.shelved_alarms.shelved_alarms) == 1);
+
+   // Changing alarm status should create a new status in shelved alarm.
+   alarm = state.shelved_alarms.shelved_alarms[key];
+   assert(table_size(alarm.status_change) == 1);
+   raise_alarm(key, {perceived_severity='critical'});
+   assert(table_size(state.alarm_list.alarm) == 0);
+   assert(table_size(alarm.status_change) == 2);
+
+   // Un-shelving and alarm should:
+   // - Remove shelving criteria from alarms/control.
+   // - Move alarm from alarms/shelved-alarms to alarms/alarm-list.
+   // - The alarm now generates notifications if it changes its status.
+   // - Decrease the number of shelved alarms in summary.
+   success = set_operator_state(key, {state='un-shelved'});
+   assert(success);
+   assert(table_size(control.alarm_shelving.shelf) == 0);
+   raise_alarm(key, {perceived_severity='critical'});
+   assert(! state.shelved_alarms.shelved_alarms[key]);
+   assert(state.alarm_list.alarm[key]);
+
+   print("ok");
+}

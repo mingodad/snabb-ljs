@@ -1,0 +1,114 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+module(...,package.seeall);
+
+var ffi = require("ffi");
+var C = ffi.C;
+
+var lib = require("core.lib");
+
+// Enable only when debugging this module. Can be very verbose.
+var debug = false;
+
+ticks = false;     // current time, in ticks
+ns_per_tick = 1e6; // tick resolution (millisecond)
+timers = {};       // table of {tick->timerlist}
+
+// This function can be removed in the future.
+// For now it exists to help people understand why their code now
+// breaks if it calls timer.init().
+function init () {
+   error("timer.init() function is gone (timer module auto-initializes)");
+}
+
+// Run all timers that have expired.
+function run () {
+   if( ticks ) { run_to_time(tonumber(C.get_time_ns())); }
+}
+
+// Run all timers up to the given new time.
+var function call_timers (l) {
+   for( i=1,#l ) {
+      var timer = l[i];
+      if( debug ) {
+         print(string.format("running timer %s at tick %s", timer.name, ticks));
+      }
+      timer.next_tick = null;
+      timer.fn(timer);
+      if( timer.repeating ) { activate(timer); }
+   }
+}
+function run_to_time (ns) {
+   var new_ticks = math.floor(tonumber(ns) / ns_per_tick);
+   for( tick = ticks, new_ticks ) {
+      ticks = tick;
+      if( timers[ticks] ) {
+         call_timers(timers[ticks]);
+         timers[ticks] = null;
+      }
+   }
+}
+
+function activate (t) {
+   assert(t.next_tick == null, "timer already activated");
+   // Initialize time
+   if( ! ticks ) {
+      ticks = math.floor(tonumber(C.get_time_ns() / ns_per_tick));
+   }
+   var tick = ticks + t.ticks;
+   if( timers[tick] ) {
+      table.insert(timers[tick], t);
+   } else {
+      timers[tick] = {t};
+   }
+   t.next_tick = tick;
+}
+
+function cancel (t) {
+   if( t.next_tick ) {
+      for( idx, timer in ipairs(timers[t.next_tick]) ) {
+         if( timer == t ) {
+            table.remove(timers[t.next_tick], idx);
+            t.next_tick = null;
+            return true;
+         }
+      }
+   }
+}
+
+function new (name, fn, nanos, mode) {
+   return { name = name,
+            fn = fn,
+            ticks = math.ceil(nanos / ns_per_tick),
+            repeating = (mode == 'repeating') };
+}
+
+function selftest () {
+   print("selftest: timer");
+
+   ticks = 0;
+   var ntimers, runtime = 10000, 100000;
+   var count, expected_count = 0, 0;
+   var fn = function (t) { ++count    ; };
+   var start = C.get_monotonic_time();
+   // Start timers, each counting at a different frequency
+   for( freq = 1, ntimers ) {
+      var t = new("timer"..freq, fn, ns_per_tick * freq, 'repeating');
+      activate(t);
+      expected_count = expected_count + math.floor(runtime / freq);
+   }
+   // Run timers for 'runtime' in random sized time steps
+   var now_ticks = 0;
+   while( now_ticks < runtime ) {
+      now_ticks = math.min(runtime, now_ticks + math.random(5));
+      var old_count = count;
+      run_to_time(now_ticks * ns_per_tick);
+      assert(count > old_count, "count increasing");
+   }
+   assert(count == expected_count, "final count correct");
+   var finish = C.get_monotonic_time();
+   var elapsed_time = finish - start;
+   print(("ok (%s callbacks in %.4f seconds)")->format(
+      lib.comma_value(count), elapsed_time));
+}
+

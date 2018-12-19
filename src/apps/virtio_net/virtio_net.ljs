@@ -1,0 +1,79 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+// Application to connect to a virtio-net driver implementation
+//
+// Licensed under the Apache 2.0 license
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Copyright (c) 2015 Virtual Open Systems
+//
+
+module(..., package.seeall);
+
+var basic_apps = require("apps.basic.basic_apps");
+var pcap       = require("apps.pcap.pcap");
+var net_dirver = require("lib.virtio.net_driver");
+var main       = require("core.main");
+
+VirtioNet = {};
+VirtioNet.__index = VirtioNet;
+
+var receive, transmit, nreadable = link.receive, link.transmit, link.nreadable;
+
+function VirtioNet::new(args) {
+   return setmetatable({
+      device = assert(net_dirver.VirtioNetDriver->new(args)),
+   }, this);
+}
+
+function VirtioNet::stop() {
+   this.device->close();
+}
+
+function VirtioNet::push() {
+   var dev = this.device;
+   var l = this.input.rx;
+
+   dev->recycle_transmit_buffers();
+
+   var to_transmit = math.min(nreadable(l), dev->can_transmit());
+
+   if( to_transmit == 0 ) { return; }
+
+   for( i=0, to_transmit - 1 ) {
+      dev->transmit(receive(l));
+   }
+   dev->sync_transmit();
+   dev->notify_transmit();
+}
+
+function VirtioNet::pull() {
+   var dev = this.device;
+   var l = this.output.tx;
+   if( ! l ) { return; }
+   var to_receive = math.min(engine.pull_npackets, dev->can_receive());
+
+   for( i=0, to_receive - 1 ) {
+      transmit(l, dev->receive());
+   }
+   dev->add_receive_buffers();
+}
+
+function selftest() {
+   var pcidev = os.getenv("SNABB_TEST_VIRTIO_PCIDEV");
+   if( ! pcidev ) {
+      print("SNABB_TEST_VIRTIO_PCIDEV was not set\nTest skipped");
+      os.exit(engine.test_skipped_code);
+   }
+   var input_file = "apps/keyed_ipv6_tunnel/selftest.cap.input";
+
+   engine.configure(config.new());
+   var c = config.new();
+   config.app(c, 'source', pcap.PcapReader, input_file);
+   config.app(c, 'VirtioNet', VirtioNet, {pciaddr=pcidev});
+   config.app(c, 'sink', basic_apps.Sink);
+   config.link(c, 'source.output -> VirtioNet.rx');
+   config.link(c, 'VirtioNet.tx -> sink.input');
+   engine.configure(c);
+   engine.main({duration = 1, report={showlinks=true, showapps=true}});
+}

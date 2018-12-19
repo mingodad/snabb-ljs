@@ -1,0 +1,234 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+
+module(...,package.seeall);
+
+var S = require("syscall");
+var lib = require("core.lib");
+var ffi = require("ffi");
+var yang = require("lib.yang.yang");
+var binary = require("lib.yang.binary");
+var shm = require("core.shm");
+
+var action_names = { 'unlink_output', 'unlink_input', 'free_link',
+                       'new_link', 'link_output', 'link_input', 'stop_app',
+                       'start_app', 'reconfig_app',
+                       'call_app_method_with_blob', 'commit', 'shutdown' };
+var action_codes = {};
+for( i, name in ipairs(action_names) ) { action_codes[name] = i; }
+
+var actions = {};
+
+function actions.unlink_output (codec, appname, linkname) {
+   appname = codec->string(appname);
+   linkname = codec->string(linkname);
+   return codec->finish(appname, linkname);
+}
+function actions.unlink_input (codec, appname, linkname) {
+   appname = codec->string(appname);
+   linkname = codec->string(linkname);
+   return codec->finish(appname, linkname);
+}
+function actions.free_link (codec, linkspec) {
+   linkspec = codec->string(linkspec);
+   return codec->finish(linkspec);
+}
+function actions.new_link (codec, linkspec) {
+   linkspec = codec->string(linkspec);
+   return codec->finish(linkspec);
+}
+function actions.link_output (codec, appname, linkname, linkspec) {
+   appname = codec->string(appname);
+   linkname = codec->string(linkname);
+   linkspec = codec->string(linkspec);
+   return codec->finish(appname, linkname, linkspec);
+}
+function actions.link_input (codec, appname, linkname, linkspec) {
+   appname = codec->string(appname);
+   linkname = codec->string(linkname);
+   linkspec = codec->string(linkspec);
+   return codec->finish(appname, linkname, linkspec);
+}
+function actions.stop_app (codec, appname) {
+   appname = codec->string(appname);
+   return codec->finish(appname);
+}
+function actions.start_app (codec, appname, class, arg) {
+   appname = codec->string(appname);
+   var _class = codec->class(class);
+   var config = codec->config(class, arg);
+   return codec->finish(appname, _class, config);
+}
+function actions.reconfig_app (codec, appname, class, arg) {
+   appname = codec->string(appname);
+   var _class = codec->class(class);
+   var config = codec->config(class, arg);
+   return codec->finish(appname, _class, config);
+}
+function actions.call_app_method_with_blob (codec, appname, methodname, blob) {
+   appname = codec->string(appname);
+   methodname = codec->string(methodname);
+   blob = codec->blob(blob);
+   return codec->finish(appname, methodname, blob);
+}
+function actions.commit (codec) {
+   return codec->finish();
+}
+function actions.shutdown (codec) {
+   return codec->finish();
+}
+
+var public_names = {};
+var function find_public_name(obj) {
+   if( public_names[obj] ) { return unpack(public_names[obj]); }
+   for( modname, mod in pairs(package.loaded) ) {
+      if( type(mod) == 'table' ) {
+         for( name, val in pairs(mod) ) {
+            if( val == obj ) {
+               if( type(val) == 'table' && type(val.new) == 'function' ) {
+                  public_names[obj] = { modname, name };
+                  return modname, name;
+               }
+            }
+         }
+      }
+   }
+   error('could not determine public name for object: '..tostring(obj));
+}
+
+var function random_file_name() {
+   var basename = 'app-conf-'..lib.random_printable_string(160);
+   return shm.root..'/'..shm.resolve(basename);
+}
+
+var function encoder() {
+   var encoder = { out = {} };
+   function encoder::uint32(len) {
+      table.insert(this.out, ffi.new('uint32_t[1]', len));
+   }
+   function encoder::string(str) {
+      this->uint32(#str);
+      var buf = ffi.new('uint8_t[?]', #str);
+      ffi.copy(buf, str, #str);
+      table.insert(this.out, buf);
+   }
+   function encoder::blob(blob) {
+      this->uint32(ffi.sizeof(blob));
+      table.insert(this.out, blob);
+   }
+   function encoder::class(class) {
+      var require_path, name = find_public_name(class);
+      this->string(require_path);
+      this->string(name);
+   }
+   function encoder::config(class, arg) {
+      var file_name = random_file_name();
+      if( class.yang_schema ) {
+         yang.compile_config_for_schema_by_name(class.yang_schema, arg,
+                                                file_name);
+      } else {
+         if( arg == null ) { arg = {}; }
+         binary.compile_ad_hoc_lua_data_to_file(file_name, arg);
+      }
+      this->string(file_name);
+   }
+   function encoder::finish() {
+      var size = 0;
+      for( _,src in ipairs(this.out) ) { size = size + ffi.sizeof(src); }
+      var dst = ffi.new('uint8_t[?]', size);
+      var pos = 0;
+      for( _,src in ipairs(this.out) ) {
+         ffi.copy(dst + pos, src, ffi.sizeof(src));
+         pos = pos + ffi.sizeof(src);
+      }
+      return dst, size;
+   }
+   return encoder;
+}
+
+function encode(action) {
+   var name, args = unpack(action);
+   var codec = encoder();
+   codec->uint32(assert(action_codes[name], name));
+   return assert(actions[name], name)(codec, unpack(args));
+}
+
+var uint32_ptr_t = ffi.typeof('uint32_t*');
+var function decoder(buf, len) {
+   var decoder = { buf=buf, len=len, pos=0 };
+   function decoder::read(count) {
+      var ret = this.buf + this.pos;
+      this.pos = this.pos + count;
+      assert(this.pos <= this.len);
+      return ret;
+   }
+   function decoder::uint32() {
+      return ffi.cast(uint32_ptr_t, this->read(4))[0];
+   }
+   function decoder::string() {
+      var len = this->uint32();
+      return ffi.string(this->read(len), len);
+   }
+   function decoder::blob() {
+      var len = this->uint32();
+      var blob = ffi.new('uint8_t[?]', len);
+      ffi.copy(blob, this->read(len), len);
+      return blob;
+   }
+   function decoder::class() {
+      var require_path, name = this->string(), this->string();
+      return assert(require(require_path)[name]);
+   }
+   function decoder::config() {
+      return binary.load_compiled_data_file(this->string()).data;
+   }
+   function decoder::finish(...) {
+      return { ... };
+   }
+   return decoder;
+}
+
+function decode(buf, len) {
+   var codec = decoder(buf, len);
+   var name = assert(action_names[codec->uint32()]);
+   return { name, assert(actions[name], name)(codec) };
+}
+
+function selftest () {
+   print('selftest: lib.ptree.action_codec');
+   var function serialize(data) {
+      var tmp = random_file_name();
+      print('serializing to:', tmp);
+      binary.compile_ad_hoc_lua_data_to_file(tmp, data);
+      var loaded = binary.load_compiled_data_file(tmp);
+      assert(loaded.schema_name == '');
+      assert(lib.equal(data, loaded.data));
+      os.remove(tmp);
+   }
+   serialize('foo');
+   serialize({foo='bar'});
+   serialize({foo={qux='baz'}});
+   serialize(1);
+   serialize(1LL);
+   var function test_action(action) {
+      var encoded, len = encode(action);
+      var decoded = decode(encoded, len);
+      assert(lib.equal(action, decoded));
+   }
+   var appname, linkname, linkspec = 'foo', 'bar', 'foo.a -> bar.q';
+   var class, arg = require('apps.basic.basic_apps').Tee, {};
+   // Because lib.equal only returns true when comparing cdata of
+   // exactly the same type, here we have to use uint8_t[?].
+   var methodname, blob = 'zog', ffi.new('uint8_t[?]', 3, 1, 2, 3);
+   test_action({'unlink_output', {appname, linkname}});
+   test_action({'unlink_input', {appname, linkname}});
+   test_action({'free_link', {linkspec}});
+   test_action({'new_link', {linkspec}});
+   test_action({'link_output', {appname, linkname, linkspec}});
+   test_action({'link_input', {appname, linkname, linkspec}});
+   test_action({'stop_app', {appname}});
+   test_action({'start_app', {appname, class, arg}});
+   test_action({'reconfig_app', {appname, class, arg}});
+   test_action({'call_app_method_with_blob', {appname, methodname, blob}});
+   test_action({'commit', {}});
+   print('selftest: ok');
+}

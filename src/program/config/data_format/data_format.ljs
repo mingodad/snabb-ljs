@@ -1,0 +1,143 @@
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
+module(..., package.seeall);
+
+var lib = require("core.lib");
+var schema = require("lib.yang.schema");
+var yang_data = require("lib.yang.data");
+
+// Number of spaces a tab should consist of when indenting config.
+var tab_spaces = 2;
+
+var function print_level(level, ...) {
+   io.write(string.rep(" ", level * tab_spaces));
+   print(...);
+}
+
+var function union_type(union) {
+   var rtn;
+   for( _, t in pairs(union.argument_type.union) ) {
+      if( rtn ) {
+	 rtn = rtn .. " | " .. t.argument_string;
+      } else {
+	 rtn = t.argument_string;
+      }
+   }
+   return rtn;
+}
+
+var function comment(opts) {
+   var comments = {};
+   if( opts.mandatory == true ) {
+      comments[#comments + 1] = "mandatory";
+   }
+   if( opts.key ) {
+      comments[#comments + 1] = "key";
+   }
+   if( opts.range ) {
+      comments[#comments + 1] = "between " .. opts.range;
+   }
+   var rtn = null;
+   for( n, c in pairs(comments) ) {
+      if( n == 1 ) {
+	 rtn = "// " .. c;
+      } else {
+	 rtn = rtn  .. " " .. c;
+      }
+   }
+   return rtn;
+}
+
+var function display_leaf(level, keyword, argument, opts) {
+   if( argument == "union" ) { argument = union_type(node); }
+   var comments;
+   if( opts ) { comments = comment(opts); }
+   var str = keyword .. " ".. argument .. ";";
+   if( comments ) {
+      print_level(level, str .. " " .. comments);
+   } else {
+      print_level(level, str);
+   }
+}
+
+var function show_usage(status) {
+   print(require("program.config.data_format.README_inc"));
+   main.exit(status);
+}
+
+// Contains verious option handling code.
+var options = {};
+
+function options.key(keys) {
+   return function (name) {
+      for( _, k in pairs(keys) ) {
+	 if( name == k ) { return true; }
+      }
+      return false;
+   };
+}
+
+function options.range(name, node) {
+   if( node.argument_type.range ) {
+      return node.argument_type.range.argument_string;
+   }
+   return null;
+}
+
+// Contains the handlers which know how to describe certain data node types.
+var describers = {};
+
+var function describe(level, name, node, ...) {
+   var err = "Unknown node type: "..node.type;
+   assert(describers[node.type], err)(level, name, node, ...);
+}
+
+var function describe_members(node, level, ...) {
+   if( level == null ) { level = 0; }
+   for( name, n in pairs(node.members) ) {
+      describe(level, name, n, ...);
+   }
+}
+
+function describers.scalar(level, name, node, is_key) {
+   var opts = {};
+   if( is_key ) { opts.key = is_key(name, node); }
+   opts.mandatory = node.mandatory;
+   opts.range = options.range(name, node);
+   display_leaf(level, name, node.argument_type.argument_string, opts);
+}
+
+function describers.table(level, name, node) {
+   print_level(level, "// List, key(s) must be unique.");
+   print_level(level, name.." {");
+   describe_members(node, level + 1, options.key(node.keys));
+   print_level(level, "}");
+}
+
+function describers.struct(level, name, node) {
+   print_level(level, name.." {");
+   describe_members(node, level + 1);
+   print_level(level, "}");
+}
+
+function describers.array(level, name, node) {
+   print_level(level, "// Array, multiple elements by repeating the statement.");
+   display_leaf(level, name, node.element_type.argument_string);
+}
+
+var function parse_args(args) {
+   var handlers = {};
+   handlers.h = function() { show_usage(0); };
+   args = lib.dogetopt(args, handlers, "h", {help="h"});
+   if( #args != 0 ) { show_usage(1); }
+   return unpack(args);
+}
+
+function run(args) {
+   var yang_module = parse_args(args);
+
+   // Fetch and parse the schema module.
+   var s = schema.parse_schema_file(yang_module);
+   var grammar = yang_data.config_grammar_from_schema(s);
+
+   describe_members(grammar);
+}

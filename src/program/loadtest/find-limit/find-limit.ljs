@@ -1,0 +1,271 @@
+module(..., package.seeall);
+
+var engine = require("core.app");
+var counter = require("core.counter");
+var config = require("core.config");
+var pci = require("lib.hardware.pci");
+var basic_apps = require("apps.basic.basic_apps");
+var loadgen = require("apps.lwaftr.loadgen");
+var main = require("core.main");
+var PcapReader = require("apps.pcap.pcap").PcapReader;
+var lib = require("core.lib");
+var numa = require("lib.numa");
+var promise = require("program.loadtest.promise");
+
+var WARM_UP_BIT_RATE = 1e9;
+var WARM_UP_TIME = 5;
+
+var function show_usage(code) {
+   print(require("program.loadtest.find_limit.README_inc"));
+   main.exit(code);
+}
+
+var function find_limit(tester, max_bitrate, precision, duration, retry_count) {
+   var function round(x) {
+      return math.floor((x + precision/2) / precision) * precision;
+   }
+
+   // lo and hi are bitrates, in bits per second.
+   var function bisect(lo, hi, iter) {
+      var function fcontinue(cur, result) {
+         if( result ) {
+            print("Success.");
+            return bisect(cur, hi, 1);
+         } else if( iter <= retry_count ) {
+            print("Failed; "..(retry_count - iter).. " retries remaining.");
+            return bisect(lo, hi, iter + 1);
+         } else {
+            print("Failed.");
+            return bisect(lo, cur, 1);
+         }
+      }
+      var cur = round((lo + hi) / 2);
+      if( cur == lo || cur == hi ) {
+         print(round(lo) * 1e-9);
+         return lo;
+      }
+      return tester.start_load(cur, duration)->
+         and_then(fcontinue, cur);
+   }
+   return bisect(0, round(max_bitrate), 1);
+}
+
+var function parse_args(args) {
+   var opts = { max_bitrate = 10e9, duration = 1, precision = 0.001e9,
+                  retry_count = 3 };
+   var function parse_positive_number(prop) {
+      return function(arg) {
+         var val = assert(tonumber(arg), prop.." must be a number");
+         assert(val > 0, prop.." must be positive");
+         opts[prop] = val;
+      };
+   }
+   var function parse_nonnegative_integer(prop) {
+      return function(arg) {
+         var val = assert(tonumber(arg), prop.." must be a number");
+         assert(val >= 0, prop.." must be non-negative");
+         assert(val == math.floor(val), prop.." must be an integer");
+         opts[prop] = val;
+      };
+   }
+   var function parse_string(prop) {
+      return function(arg) { opts[prop] = assert(arg); };
+   }
+   var handlers = { b = parse_positive_number("max_bitrate"),
+                      e = parse_string("exec"),
+                      D = parse_positive_number("duration"),
+                      p = parse_positive_number("precision"),
+                      r = parse_nonnegative_integer("retry_count"),
+                      cpu = parse_nonnegative_integer("cpu") };
+   function handlers.h() { show_usage(0); }
+   args = lib.dogetopt(args, handlers, "hb:D:p:r:e:",
+                       { bitrate="b", duration="D", precision="p",
+                         ["retry-count"]="r", help="h", cpu=1,
+                         exec="e"});
+
+   if( #args == 2 ) {
+      args = {
+         args[1],
+         'NIC', 'NIC',
+         args[2]
+      };
+   }
+   if( #args == 0 || #args % 4 != 0 ) { show_usage(1); }
+   var streams, streams_by_tx_id, pci_devices = {}, {}, {};
+   for( i=1,#args,4 ) {
+      var stream = {};
+      stream.pcap_file = args[i];
+      stream.tx_name = args[i+1];
+      stream.rx_name = args[i+2];
+      stream.tx_id = stream.tx_name->gsub('[^%w]', '_');
+      stream.rx_id = stream.rx_name->gsub('[^%w]', '_');
+      stream.tx_device = pci.device_info(args[i+3]);
+      stream.tx_driver = require(stream.tx_device.driver).driver;
+      table.insert(streams, stream);
+      table.insert(pci_devices, stream.tx_device.pciaddress);
+      assert(streams_by_tx_id[streams.tx_id] == null, 'Duplicate: '..stream.tx_name);
+      streams_by_tx_id[stream.tx_id] = stream;
+   }
+   for( _, stream in ipairs(streams) ) {
+      assert(streams_by_tx_id[stream.rx_id], 'Missing stream: '..stream.rx_id);
+      stream.rx_device = streams_by_tx_id[stream.rx_id].tx_device;
+   }
+   if( opts.cpu ) { numa.bind_to_cpu(opts.cpu); }
+   numa.check_affinity_for_pci_addresses(pci_devices);
+   return opts, streams;
+}
+
+function run(args) {
+   var opts, streams = parse_args(args);
+
+   var c = config.new();
+   for( _, stream in ipairs(streams) ) {
+      stream.pcap_id     = 'pcap_'..stream.tx_id;
+      stream.repeater_id = 'repeater'..stream.tx_id;
+      stream.nic_tx_id   = 'nic_'..stream.tx_id;
+      stream.nic_rx_id   = 'nic_'..stream.rx_id;
+      // Links are named directionally with respect to NIC apps, but we
+      // want to name tx and rx with respect to the whole network
+      // function.
+      stream.nic_tx_link = stream.tx_device.rx;
+      stream.nic_rx_link = stream.rx_device.tx;
+      stream.rx_sink_id  = 'rx_sink_'..stream.rx_id;
+
+      config.app(c, stream.pcap_id, PcapReader, stream.pcap_file);
+      config.app(c, stream.repeater_id, loadgen.RateLimitedRepeater);
+      config.app(c, stream.nic_tx_id, stream.tx_driver, { pciaddr = stream.tx_device.pciaddress});
+      config.app(c, stream.rx_sink_id, basic_apps.Sink);
+
+      config.link(c, stream.pcap_id..".output -> "..stream.repeater_id..".input");
+      config.link(c, stream.repeater_id..".output -> "..stream.nic_tx_id.."."..stream.nic_tx_link);
+      config.link(c, stream.nic_rx_id.."."..stream.nic_rx_link.." -> "..stream.rx_sink_id..".input");
+   }
+
+   engine.configure(c);
+
+   var function read_counters() {
+      var counters = {};
+      for( _, stream in ipairs(streams) ) {
+         var tx_app = assert(engine.app_table[stream.nic_tx_id]);
+         var rx_app = assert(engine.app_table[stream.nic_rx_id]);
+         var tx, rx = tx_app.input[stream.nic_tx_link], rx_app.output[stream.nic_rx_link];
+         counters[stream.nic_tx_id] = {
+            txpackets = counter.read(tx.stats.txpackets),
+            txbytes = counter.read(tx.stats.txbytes),
+            rxpackets = counter.read(rx.stats.txpackets),
+            rxbytes = counter.read(rx.stats.txbytes),
+            rxdrop = rx_app->rxdrop()
+         };
+      }
+      return counters;
+   }
+
+   var function print_stats(s) {
+   }
+
+   var function check_results(stats) {
+      if( opts.exec ) {
+         return os.execute(opts.exec) == 0;
+      }
+
+      var success = true;
+      for( _, stream in ipairs(streams) ) {
+         var diff = stats[stream.nic_tx_id];
+         success = (diff.rxpackets == diff.txpackets && diff.rxdrop == 0) && success;
+      }
+      return success;
+   }
+
+   var tester = {};
+
+   function tester.adjust_rates(bit_rate) {
+      for( _, stream in ipairs(streams) ) {
+         var app = assert(engine.app_table[stream.repeater_id]);
+         app->set_rate(bit_rate);
+      }
+   }
+
+   function tester.generate_load(bitrate, duration) {
+      tester.adjust_rates(bitrate);
+      return promise.Wait(duration)->and_then(tester.adjust_rates, 0);
+   }
+
+   function tester.warm_up() {
+      print(string.format("Warming up at %f Gb/s for %s seconds.",
+                          WARM_UP_BIT_RATE / 1e9, WARM_UP_TIME));
+      return tester.generate_load(WARM_UP_BIT_RATE, WARM_UP_TIME);
+   }
+
+   var function compute_bitrate(packets, bytes, duration) {
+      // 7 bytes preamble, 1 start-of-frame, 4 CRC, 12 interframe gap.
+      var overhead = 7 + 1 + 4 + 12;
+      return (bytes + packets * overhead) * 8 / duration;
+   }
+
+   function tester.start_load(bitrate, duration) {
+      return tester.generate_load(WARM_UP_BIT_RATE, 1)->
+	 and_then(promise.Wait, 0.002)->
+	 and_then(tester.measure, bitrate, duration);
+   }
+
+   function tester.measure(bitrate, duration) {
+      var gbps_bitrate = bitrate/1e9;
+      var start_counters = read_counters();
+      var function compute_stats() {
+         var end_counters = read_counters();
+         var stats = {};
+         for( _, stream in ipairs(streams) ) {
+            var s = {};
+            for( k,_ in pairs(start_counters[stream.nic_tx_id]) ) {
+               var end_value = end_counters[stream.nic_tx_id][k];
+               var start_value = start_counters[stream.nic_tx_id][k];
+               s[k] = tonumber(end_value - start_value);
+            }
+            s.applied_gbps = gbps_bitrate;
+            s.tx_mpps = s.txpackets / duration / 1e6;
+            s.tx_gbps = compute_bitrate(s.txpackets, s.txbytes, duration) / 1e9;
+            s.rx_mpps = s.rxpackets / duration / 1e6;
+            s.rx_gbps = compute_bitrate(s.rxpackets, s.rxbytes, duration) / 1e9;
+            s.lost_packets = s.txpackets - s.rxpackets - s.rxdrop;
+            s.lost_percent = s.lost_packets / s.txpackets * 100;
+            print(string.format('  %s:', stream.tx_name));
+            print(string.format('    TX %d packets (%f MPPS), %d bytes (%f Gbps)',
+                       s.txpackets, s.tx_mpps, s.txbytes, s.tx_gbps));
+            print(string.format('    RX %d packets (%f MPPS), %d bytes (%f Gbps)',
+                       s.rxpackets, s.rx_mpps, s.rxbytes, s.rx_gbps));
+            print(string.format('    Loss: %d ingress drop + %d packets lost (%f%%)',
+                       s.rxdrop, s.lost_packets, s.lost_percent));
+
+            stats[stream.nic_tx_id] = s;
+         }
+         return stats;
+      }
+      var function verify_load(stats) {
+         for( _, stream in ipairs(streams) ) {
+           var s = stats[stream.nic_tx_id];
+            if( s.tx_gbps < 0.5 * s.applied_gbps ) {
+               print("Invalid result.");
+               return tester.start_load(bitrate, duration);
+            }
+         }
+         return check_results(stats);
+      }
+      print(string.format('Applying %f Gbps of load.', gbps_bitrate));
+      return tester.generate_load(bitrate, duration)->
+         // Wait 2ms for packets in flight to arrive
+         and_then(promise.Wait, 0.002)->
+	 and_then(compute_stats)->
+	 and_then(verify_load);
+   }
+
+   io.stdout->setvbuf("line");
+
+   engine.busywait = true;
+   var is_done = false;
+   var function mark_done() { is_done = true; }
+   tester.warm_up()->
+      and_then(find_limit, tester, opts.max_bitrate, opts.precision,
+               opts.duration, opts.retry_count)->
+      and_then(mark_done);
+   engine.main({done=function() { return is_done; }});
+}
