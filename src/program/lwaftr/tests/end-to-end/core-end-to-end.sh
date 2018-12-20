@@ -49,8 +49,8 @@ function snabb_run_and_regen_counters {
 
 function is_packet_in_wrong_interface_test {
     counters_path=$1
-    if [[ "$counters_path" == "${COUNTERS}/non-ipv6-traffic-to-ipv6-interface.lua" ||
-          "$counters_path" == "${COUNTERS}/non-ipv4-traffic-to-ipv4-interface.lua" ]]; then
+    if [[ "$counters_path" == "${COUNTERS}/non-ipv6-traffic-to-ipv6-interface.ljs" ||
+          "$counters_path" == "${COUNTERS}/non-ipv4-traffic-to-ipv4-interface.ljs" ]]; then
         echo 1
     fi
 }
