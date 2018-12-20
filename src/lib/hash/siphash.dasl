@@ -158,8 +158,8 @@ var function X86_64() {
    }
    function asm::assemble(name, gen) {
       Dst = dasm.new(actions)
-      gen(self)
-      return self.finish(name, Dst)
+      gen(this)
+      return this.finish(name, Dst)
    }
    return asm
 }
@@ -236,7 +236,7 @@ var function SSE(stride) {
    }
    function asm::assemble(name, gen) {
       Dst = dasm.new(actions)
-      gen(self)
+      gen(this)
       return finish(name.."_x2",
                     ffi.typeof("void (*)(uint8_t *, uint32_t *)"),
                     Dst)
@@ -355,7 +355,7 @@ var function AVX2(stride) {
    }
    function asm::assemble(name, gen) {
       Dst = dasm.new(actions)
-      gen(self)
+      gen(this)
       return finish(name.."_x4",
                     ffi.typeof("void (*)(uint8_t *, uint32_t *)"),
                     Dst)
@@ -415,7 +415,7 @@ var function Simulator() {
    function asm::assemble(name, gen) {
       return function(ptr) {
          input, output = ffi.cast('uint8_t*', ptr), null
-         gen(self)
+         gen(this)
          input = null
          return output
       }

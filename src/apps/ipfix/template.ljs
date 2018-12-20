@@ -115,7 +115,7 @@ var function make_template_info(spec) {
       }
    }
 
-   table.insert(swap_fn, 'return function(o)');
+   table.insert(swap_fn, 'return function(o){');
    var key_struct_def = { 'struct {' };
    var key_types = {};
    process_fields(buffer, spec.keys, key_struct_def, key_types,
@@ -126,7 +126,7 @@ var function make_template_info(spec) {
    process_fields(buffer + #spec.keys * 2, spec.values, value_struct_def,
                   value_types, 'o.value.%s = %s(o.value.%s)');
    table.insert(value_struct_def, '} __attribute__((packed))');
-   table.insert(swap_fn, 'end');
+   table.insert(swap_fn, '}');
    var key_t = ffi.typeof(table.concat(key_struct_def, ' '),
                             unpack(key_types));
    var value_t = ffi.typeof(table.concat(value_struct_def, ' '),
