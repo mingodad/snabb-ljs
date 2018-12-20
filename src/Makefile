@@ -26,8 +26,8 @@ PROGRAM = $(shell find program -regex '^[^/]+/[^/]+' -type d -printf '%P ')
 INCSRC = $(sort $(shell find . -regex '[^\#]*\.inc' -printf '%P ') programs.inc)
 YANGSRC= $(shell find . -regex '[^\#]*\.yang' -printf '%P ')
 
-LUAOBJ := $(patsubst %.ljs,obj/%_lua.o,$(LUASRC))
-PFLUAOBJ := $(patsubst %.ljs,obj/%_lua.o,$(PFLUASRC))
+LUAOBJ := $(patsubst %.ljs,obj/%_ljs.o,$(LUASRC))
+PFLUAOBJ := $(patsubst %.ljs,obj/%_ljs.o,$(PFLUASRC))
 COBJ   := $(patsubst %.c,obj/%_c.o,    $(CSRC))
 HOBJ   := $(patsubst %.h,obj/%_h.o,    $(CHDR))
 ARCHOBJ:= $(patsubst %.c,obj/%_c.o,    $(ARCHSRC))
@@ -45,9 +45,9 @@ LUAJIT_A := ../lib/luajit/src/libluajit.a
 # TESTMODS expands to:
 #   core.memory core.lib ...
 # for each module that has a top-level selftest () function.
-TESTMODS = $(shell find . -regex '[^\#]*\.\(lua\|dasl\)' -printf '%P ' | \
+TESTMODS = $(shell find . -regex '[^\#]*\.\(ljs\|dasl\)' -printf '%P ' | \
              xargs grep -s -l '^function selftest *[[:punct:]]' | \
-             sed -e 's_\.lua__' -e 's_\.dasl__' -e 's_/_._g')
+             sed -e 's_\.ljs__' -e 's_\.dasl__' -e 's_/_._g')
 
 # TESTSCRIPTS expands to:
 #   lib/watchdog/selftest.sh ...
@@ -59,11 +59,11 @@ PATH := ../lib/luajit/usr/local/bin:$(PATH)
 snabb: $(LUAOBJ) $(PFLUAOBJ) $(HOBJ) $(COBJ) $(ARCHOBJ) $(ASMOBJ) $(PFLUAASMOBJ) $(INCOBJ) $(YANGOBJ) $(LUAJIT_A)
 	$(E) "GEN       obj/version.ljs.gen"
 	$(Q) ../generate-version-lua.sh > obj/version.ljs.gen
-	$(E) "LUA       obj/version.ljs"
-	$(Q) ljsjit -bg -n core.version obj/version.ljs.gen obj/version_lua.o
+	$(E) "LJS       obj/version.ljs"
+	$(Q) ljsjit -bg -n core.version obj/version.ljs.gen obj/version_ljs.o
 	$(E) "LINK      $@"
 	$(Q) $(CC) $(DEBUG) -Wl,--no-as-needed -Wl,-E -Werror -Wall -o $@ $^ \
-	    obj/version_lua.o \
+	    obj/version_ljs.o \
 	    -lrt -lc -ldl -lm -lpthread
 	@echo -n "BINARY    "
 	@ls -sh snabb
@@ -124,12 +124,12 @@ $(OBJDIR) bin testlog $(OBJDIR/doc):
 	$(E) "DIR       $@"
 	$(Q) mkdir -p $@
 
-$(LUAOBJ): obj/%_lua.o: %.ljs Makefile | $(OBJDIR)
-	$(E) "LUA       $@"
+$(LUAOBJ): obj/%_ljs.o: %.ljs Makefile | $(OBJDIR)
+	$(E) "LJS       $@"
 	$(Q) ljsjit -bg -n $(subst /,.,$*) $< $@
 
-$(PFLUAOBJ): obj/%_lua.o: ../lib/pflua/src/%.ljs Makefile
-	$(E) "LUA       $@"
+$(PFLUAOBJ): obj/%_ljs.o: ../lib/pflua/src/%.ljs Makefile
+	$(E) "LJS       $@"
 	$(Q) mkdir -p $(dir $@)
 	$(Q) ljsjit -bg -n $(subst /,.,$*) $< $@
 
@@ -164,7 +164,7 @@ $(PFLUAASMOBJ): obj/%_dasl.o: ../lib/pflua/src/%.dasl $(CHDR) Makefile | $(OBJDI
 	$(Q) ljsjit -bg -n $(subst /,.,$*) $@.gen $@
 
 $(JITOBJS): obj/jit_%.o: ../lib/luajit/src/jit/%.ljs $(OBJDIR)
-	$(E) "LUA       $@"
+	$(E) "LJS       $@"
 	$(Q) ljsjit -bg -n $(patsubst obj/jit_%.o, jit.%, $@) $< $@
 
 $(RMOBJS): obj/%: %
@@ -193,11 +193,11 @@ FORCE:
 
 # extra/ third party bits and pieces
 obj/strict.o: extra/strict.ljs | $(OBJDIR)
-	$(E) "LUA       $@"
+	$(E) "LJS       $@"
 	$(Q) ljsjit -bg $< $@
 
 obj/jit_tprof.o: extra/tprof.ljs | $(OBJDIR)
-	$(E) "LUA       $@"
+	$(E) "LJS       $@"
 	$(Q) ljsjit -bg -n jit.tprof $< $@
 
 obj/jit_vmprof.o: extra/vmprof.c | $(OBJDIR)
