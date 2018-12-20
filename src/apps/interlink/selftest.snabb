@@ -1,33 +1,33 @@
 #!snabb snsh
 
--- Use of this source code is governed by the Apache 2.0 license; see COPYING.
+// Use of this source code is governed by the Apache 2.0 license; see COPYING.
 
-local worker = require("core.worker")
-local interlink = require("lib.interlink")
-local Receiver = require("apps.interlink.receiver")
-local Sink = require("apps.basic.basic_apps").Sink
+var worker = require("core.worker");
+var interlink = require("lib.interlink");
+var Receiver = require("apps.interlink.receiver");
+var Sink = require("apps.basic.basic_apps").Sink;
 
--- Synopsis: selftest.snabb [duration]
-local DURATION = tonumber(main.parameters[1]) or 10
+// Synopsis: selftest.snabb [duration]
+var DURATION = tonumber(main.parameters[1]) || 10;
 
-worker.start("source", [[require("apps.interlink.test_source").start("test")]])
+worker.start("source", [=[require("apps.interlink.test_source").start("test")]=]);
 
-local c = config.new()
+var c = config.new();
 
-config.app(c, "test", Receiver)
-config.app(c, "sink", Sink)
-config.link(c, "test.output->sink.input")
+config.app(c, "test", Receiver);
+config.app(c, "sink", Sink);
+config.link(c, "test.output->sink.input");
 
-engine.configure(c)
-engine.main({duration=DURATION, report={showlinks=true}})
+engine.configure(c);
+engine.main({duration=DURATION, report={showlinks=true}});
 
-for w, s in pairs(worker.status()) do
-   print(("worker %s: pid=%s alive=%s status=%s"):format(
-         w, s.pid, s.alive, s.status))
-end
-local stats = link.stats(engine.app_table["sink"].input.input)
-print(stats.txpackets / 1e6 / DURATION .. " Mpps")
+for( w, s in pairs(worker.status()) ) {
+   print(("worker %s: pid=%s alive=%s status=%s")->format(
+         w, s.pid, s.alive, s.status));
+}
+var stats = link.stats(engine.app_table["sink"].input.input);
+print(stats.txpackets / 1e6 / DURATION .. " Mpps");
 
--- test teardown
-engine.configure(config.new())
-engine.main({duration=0.1})
+// test teardown
+engine.configure(config.new());
+engine.main({duration=0.1});
