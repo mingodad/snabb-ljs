@@ -140,11 +140,11 @@ function combine.any (parser) {
          if( rest ) {
             s = rest;
          } else {
-            var value;  //DADBUG redefinition null
+            var xvalue;  //DADBUG redefinition null
             if( #seq > 0 ) {
-               value = seq;
+               xvalue = seq;
             }
-            return s, value, value != null; //DADBUG
+            return s, xvalue, xvalue != null; //DADBUG
          }
          if( present ) {
             table.insert(seq, value || false);
