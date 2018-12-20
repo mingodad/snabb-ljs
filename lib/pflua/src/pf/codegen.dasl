@@ -25,7 +25,7 @@ var anchor = {}
 
 var debug = false
 
-// handle spilling in a generic way for( these instructions
+// handle spilling in a generic way for these instructions
 var handle_spill = utils.set("cmp", "add", "add-i", "sub", "sub-i",
                                "mul", "mul-i", "div", "and", "and-i", "or", "or-i",
                                "xor", "xor-i", "shl", "shl-i", "shr", "shr-i",
@@ -135,8 +135,8 @@ var function compile(instructions, alloc, dump) {
 
       } else if( itype == "jmp" ) {
          var next_instr = instructions[idx+1]
-         // if( the jump target is immediately after this in the instruction
-         // sequence ) { don't generate the jump
+         // if the jump target is immediately after this in the instruction
+         // sequence then don't generate the jump
          if( (type(instr[2]) == "number" &&
              next_instr[1] == "label" &&
              next_instr[2] == instr[2]) ) {
@@ -283,7 +283,7 @@ var function compile(instructions, alloc, dump) {
          | imul Rq(reg1), Rq(reg2)
 
       // For division we use floating point division to avoid having
-      // to deal with the %eax register for( the div instruction.
+      // to deal with the %eax register for the div instruction.
       } else if( itype == "div" ) {
          var reg0, reg1 = alloc[instr[2]], alloc[instr[3]]
          | cvtsi2sd xmm(0), Rq(reg0)
@@ -407,8 +407,8 @@ var function compile(instructions, alloc, dump) {
          }
 
          if( idx != #instructions ) {
-            // if( there's no cleanup required due to spilling or callee
-            // save registers, ) { just return instead of jmping
+            // if there's no cleanup required due to spilling or callee
+            // save registers, then just return instead of jmping
             if( spilled_space == 0 && #to_pop == 0 ) {
                | ret
             } else {
@@ -815,8 +815,8 @@ function selftest() {
 
       var mcode, size = Dst->build()
       table.insert(anchor, mcode)
-      f = ffi.cast(ffi.typeof("bool(*)()"), mcode)
-      return f()
+      var xf = ffi.cast(ffi.typeof("bool(*)()"), mcode)
+      return xf()
    }
 
    assert(test('ip[0]+ip[1]+ip[2]+ip[3]+ip[4]+ip[5]+ip[6] =\

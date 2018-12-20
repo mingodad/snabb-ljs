@@ -1,13 +1,13 @@
-#!/usr/bin/env luajit
--- -*- lua -*-
-package.path = package.path .. ";../src/?.lua"
+#!/usr/bin/env ljsjit
+// -*- lua -*-
+package.path = package.path .. ";../src/?.ljs";
 
-local quickcheck = require('pf.quickcheck')
+var quickcheck = require('pf.quickcheck');
 
-function main(...)
-   local args = { ... }
-   quickcheck.initialize_from_command_line(args)
-   quickcheck.run()
-end
+function main(...) {
+   var args = { ... };
+   quickcheck.initialize_from_command_line(args);
+   quickcheck.run();
+}
 
-main(...)
+main(...);

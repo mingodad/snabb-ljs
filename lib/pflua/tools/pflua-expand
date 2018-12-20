@@ -1,36 +1,36 @@
-#!/usr/bin/env luajit
--- -*- lua -*-
+#!/usr/bin/env ljsjit
+// -*- lua -*-
 
-package.path = package.path .. ";../src/?.lua"
+package.path = package.path .. ";../src/?.ljs";
 
-local pf = require("pf")
-local utils = require("pf.utils")
+var pf = require("pf");
+var utils = require("pf.utils");
 
-local function usage()
-   local content = [=[
+var function usage() {
+   var content = [=[
 Usage: pflua-expand [-O0] <pflang-expression>
 Options:
-   -O0       Disable optimizations; optimizations are on by default.]=]
+   -O0       Disable optimizations; optimizations are on by default.]=];
    print(content);
-   os.exit()
-end
+   os.exit();
+}
 
--- Print help
-if #arg == 0 then
-   usage()
-end
+// Print help
+if( #arg == 0 ) {
+   usage();
+}
 
-local flags = utils.set(...)
+var flags = utils.set(...);
 
--- Print help
-if flags["--help"] or flags["-h"] then
-   usage()
-end
+// Print help
+if( flags["--help"] || flags["-h"] ) {
+   usage();
+}
 
-local filter = arg[#arg]
-local expanded = pf.expand.expand(pf.parse.parse(filter), "EN10MB")
-if flags["-O0"] then
-   utils.pp(expanded)
-else
-   utils.pp(pf.optimize.optimize(expanded))
-end
+var filter = arg[#arg];
+var expanded = pf.expand.expand(pf.parse.parse(filter), "EN10MB");
+if( flags["-O0"] ) {
+   utils.pp(expanded);
+} else {
+   utils.pp(pf.optimize.optimize(expanded));
+}

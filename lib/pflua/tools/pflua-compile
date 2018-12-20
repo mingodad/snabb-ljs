@@ -1,15 +1,15 @@
-#!/usr/bin/env luajit
--- -*- lua -*-
+#!/usr/bin/env ljsjit
+// -*- lua -*-
 
-package.path = package.path .. ";../src/?.lua"
+package.path = package.path .. ";../src/?.ljs";
 
-local pf = require("pf")
-local bpf = require("pf.bpf")
-local match = require("pf.match")
-local utils = require("pf.utils")
+var pf = require("pf");
+var bpf = require("pf.bpf");
+var match = require("pf.match");
+var utils = require("pf.utils");
 
-function usage()
-   local content = [=[
+function usage() {
+   var content = [=[
 Usage: pflua-compile [-O0] [--bpf-asm | --bpf-lua | --lua | --native | --match] <expression>
 
 Options:
@@ -19,48 +19,48 @@ Options:
    --native    Print dynasm-generated asm code for the pflang <expression>
    --match     Print Lua code compiled from the pfmatch <expression>
 
-   -O0         Disable optimizations. (Optimizations are on by default) ]=]
+   -O0         Disable optimizations. (Optimizations are on by default) ]=];
    print(content);
-   os.exit()
-end
+   os.exit();
+}
 
--- Print help
-if #arg == 0 then
-   usage()
-end
+// Print help
+if( #arg == 0 ) {
+   usage();
+}
 
-local flags = utils.set(...)
+var flags = utils.set(...);
 
--- Print help
-if flags["--help"] or flags["-h"] then
-   usage()
-end
+// Print help
+if( flags["--help"] || flags["-h"] ) {
+   usage();
+}
 
--- No code-generation flag defined
-if (not(flags["--bpf-asm"] or flags["--bpf-lua"] or flags["--lua"] or flags["--native"] or flags['--match'])) then
-   -- Default action
-   flags["--lua"] = true
-end
+// No code-generation flag defined
+if( (!(flags["--bpf-asm"] || flags["--bpf-lua"] || flags["--lua"] || flags["--native"] || flags['--match'])) ) {
+   // Default action
+   flags["--lua"] = true;
+}
 
 
-local optimize = true
-if flags["-O0"] then optimize = false end
+var optimize = true;
+if( flags["-O0"] ) { optimize = false; }
 
-local filter = arg[#arg]
-if flags["--bpf-asm"] then
+var filter = arg[#arg];
+if( flags["--bpf-asm"] ) {
    print(pf.compile_filter(filter, {libpcap=true, source=true,
-                                    optimize=optimize}))
-end
-if flags["--bpf-lua"] then
+                                    optimize=optimize}));
+}
+if( flags["--bpf-lua"] ) {
    print(pf.compile_filter(filter, {bpf=true, source=true,
-                                    optimize=optimize}))
-end
-if flags["--lua"] then
-   print(pf.compile_filter(filter, {source=true, optimize=optimize}))
-end
-if flags["--native"] then
-   print(pf.compile_filter(filter, {native=true, source=true, optimize=optimize}))
-end
-if flags["--match"] then
-   print(match.compile(filter, {source=true, optimize=optimize}))
-end
+                                    optimize=optimize}));
+}
+if( flags["--lua"] ) {
+   print(pf.compile_filter(filter, {source=true, optimize=optimize}));
+}
+if( flags["--native"] ) {
+   print(pf.compile_filter(filter, {native=true, source=true, optimize=optimize}));
+}
+if( flags["--match"] ) {
+   print(match.compile(filter, {source=true, optimize=optimize}));
+}
