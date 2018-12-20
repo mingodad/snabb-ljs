@@ -13,7 +13,7 @@ class TestCheck(BaseTestCase):
         str(DATA_DIR / 'icmp_on_fail.conf'),
         str(DATA_DIR / 'empty.pcap'), str(DATA_DIR / 'empty.pcap'),
         '/dev/null', '/dev/null',
-        str(COUNTERS_DIR / 'empty.lua'),
+        str(COUNTERS_DIR / 'empty.ljs'),
     )
 
     def execute_check_test(self, cmd_args):
