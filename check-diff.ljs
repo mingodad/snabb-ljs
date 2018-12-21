@@ -11,6 +11,53 @@ var function osExec(cmd)
 	os.execute(cmd);
 }
 
+var lua_globals_list = {};
+var ljs_globals_list = {};
+
+var function checkGlobalsByCmd(lcmd)
+{
+	var g_list = [];
+	var fd = io.popen(lcmd);
+	var line_count = 0;
+	for(line in fd->lines())
+	{
+		++line_count;
+		//0051    GGET    23  30      ; "coroutine"
+		var gvar = line->match("%d+ +GGET +%d+ +%d+ +; +\"([^\"]+)\"");
+		if(gvar) {
+			//print(gvar);
+			table.insert(g_list, gvar);
+		}
+	}
+	fd->close();
+	//print(line_count);
+	return g_list;
+}
+
+var function checkGlobals(lua_fn, ljs_fn)
+{
+	print(ljs_fn);
+	var lcmd = "ljsjit -b -l " .. ljs_fn;
+	var g_ljs_list = checkGlobalsByCmd(lcmd);
+
+	print(lua_fn);
+	lcmd = "luajit -b -l " .. lua_fn;
+	var g_lua_list = checkGlobalsByCmd(lcmd);
+	
+	if(#g_ljs_list != #g_lua_list) print("++do not match", #g_ljs_list, #g_lua_list);
+	for(idx, k in ipairs(g_ljs_list))
+	{
+		if(g_lua_list[idx] != k)
+		{
+			print("**do not match", k, g_lua_list[idx]);
+			//break;
+		}
+	}
+}
+
+//find . -type f -name '*' -exec grep -H -n '\.lua' '{}' \;
+//find . -type l
+
 var fname_re = base_folder->gsub("[.-]", "%%%1") .. "(.+)$";
 //print(fname_re);
 var fd = io.popen(cmd);
@@ -18,7 +65,7 @@ for(line in fd->lines())
 {
 	//print(line);
 	var fname = line->match(fname_re);
-	//print(fname);
+	//print(line, fname);continue;
 	var fname_ljs = fname->replace(".lua", ".ljs");
 	
 	//cmd = "rm " .. fname;
@@ -26,6 +73,8 @@ for(line in fd->lines())
 	
 	cmd = "lua2ljs " .. line .. " > " .. fname_ljs;
 	//osExec(cmd); continue;
+	
+	//checkGlobals(line, fname_ljs); continue;
 	
 	
 	//cmd = "bin/linux/x64/ljsjit-2.0.5 -b -l " .. fname_ljs .. " > /dev/null";
@@ -36,7 +85,8 @@ for(line in fd->lines())
 	//cmd = "ljsc -p -l " .. fname_ljs .. " > /dev/null";
 	//osExec(cmd);	continue;
 
-	cmd = "grep -H -n -b 'selftest' " .. fname_ljs;
+	cmd = "grep -H -n -b 'default' " .. fname_ljs;
+	//cmd = "grep -H -n -b '\"null\"' " .. fname_ljs;
 	//cmd = "grep -H -n -b \"'nil'\" " .. fname_ljs;
 	//cmd = "grep -H -n -b '\"nil\"' " .. fname_ljs;
 	//cmd = "grep -H -n -b '/openresty/' " .. fname_ljs;

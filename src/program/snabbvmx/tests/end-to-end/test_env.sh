@@ -55,6 +55,6 @@ function next_test {
 TEST_DATA=(
     "IPv6 fragments and fragmentation is off"
     "snabbvmx-lwaftr-xe1.cfg" "" "regressiontest-signedntohl-frags.pcap" "" ""
-    "drop-all-ipv6-fragments.lua"
+    "drop-all-ipv6-fragments.ljs"
 )
 TEST_SIZE=${#TEST_DATA[@]}

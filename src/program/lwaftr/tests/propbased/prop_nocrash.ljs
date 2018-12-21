@@ -1,4 +1,4 @@
-#!/usr/bin/env luajit
+#!/usr/bin/env ljsjit
 module(..., package.seeall);
 
 var genyang = require("program.lwaftr.tests.propbased.genyang");

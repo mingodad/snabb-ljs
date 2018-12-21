@@ -1,4 +1,4 @@
-#!/usr/bin/env luajit
+#!/usr/bin/env ljsjit
 module(..., package.seeall);
 
 // Make sure running a snabb config get twice results in the

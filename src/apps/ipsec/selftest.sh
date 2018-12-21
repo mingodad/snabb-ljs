@@ -35,7 +35,7 @@ if ! source program/snabbnfv/test_env/test_env.sh; then
     echo "Could not load test_env."; exit 1
 fi
 
-./snabb snsh apps/ipsec/selftest.lua ${MAC}01 ${MAC}00 $SRC $DST $SPORT $DPORT $SPI $TKEY $TSALT $RKEY $RSALT 3 ping &
+./snabb snsh apps/ipsec/selftest.ljs ${MAC}01 ${MAC}00 $SRC $DST $SPORT $DPORT $SPI $TKEY $TSALT $RKEY $RSALT 3 ping &
 snabb_pid=$!
 
 if ! qemu soft esp.sock $SNABB_TELNET0; then
