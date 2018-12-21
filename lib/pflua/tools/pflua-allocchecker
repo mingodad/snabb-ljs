@@ -9,7 +9,7 @@ var pf = require("pf");
 // Note: Extra argument can be passed to luajit thusly:
 // "-O-cse -other-arbitrary-luajit-argument pflua-match wingolog.pcap tcp"
 function get_trace(...) {
-   table.insert(arg, 1, "luajit");
+   table.insert(arg, 1, "ljsjit");
    table.insert(arg, 2, "-jdump=+rs");
    cmdline = table.concat(arg, " ");
    print("Running: " .. cmdline);

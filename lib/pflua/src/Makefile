@@ -11,21 +11,21 @@ clean:
 preprocess: $(CODEGEN).ljs
 
 $(CODEGEN).ljs: $(CODEGEN).dasl
-	luajit $(DYNASM) $(CODEGEN).dasl > $(CODEGEN).ljs
+	ljsjit $(DYNASM) $(CODEGEN).dasl > $(CODEGEN).ljs
 
 check: preprocess
-	luajit -l pf.types -e 'pf.types.selftest()'
-	luajit -l pf.utils -e 'pf.utils.selftest()'
-	luajit -l pf.libpcap -e 'pf.libpcap.selftest()'
-	luajit -l pf.bpf -e 'pf.bpf.selftest()'
-	luajit -l pf.parse -e 'pf.parse.selftest()'
-	luajit -l pf.expand -e 'pf.expand.selftest()'
-	luajit -l pf.optimize -e 'pf.optimize.selftest()'
-	luajit -l pf.anf -e 'pf.anf.selftest()'
-	luajit -l pf.ssa -e 'pf.ssa.selftest()'
-	luajit -l pf.backend -e 'pf.backend.selftest()'
-	luajit -l pf.match -e 'pf.match.selftest()'
-	luajit -l pf.regalloc -e 'pf.regalloc.selftest()'
-	luajit -l pf.selection -e 'pf.selection.selftest()'
-	luajit -l pf.codegen -e 'pf.codegen.selftest()'
-	luajit -l pf -e 'pf.selftest()'
+	ljsjit -l pf.types -e 'pf.types.selftest()'
+	ljsjit -l pf.utils -e 'pf.utils.selftest()'
+	ljsjit -l pf.libpcap -e 'pf.libpcap.selftest()'
+	ljsjit -l pf.bpf -e 'pf.bpf.selftest()'
+	ljsjit -l pf.parse -e 'pf.parse.selftest()'
+	ljsjit -l pf.expand -e 'pf.expand.selftest()'
+	ljsjit -l pf.optimize -e 'pf.optimize.selftest()'
+	ljsjit -l pf.anf -e 'pf.anf.selftest()'
+	ljsjit -l pf.ssa -e 'pf.ssa.selftest()'
+	ljsjit -l pf.backend -e 'pf.backend.selftest()'
+	ljsjit -l pf.match -e 'pf.match.selftest()'
+	ljsjit -l pf.regalloc -e 'pf.regalloc.selftest()'
+	ljsjit -l pf.selection -e 'pf.selection.selftest()'
+	ljsjit -l pf.codegen -e 'pf.codegen.selftest()'
+	ljsjit -l pf -e 'pf.selftest()'

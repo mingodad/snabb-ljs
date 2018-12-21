@@ -27,7 +27,7 @@ check_luajit:
 	fi
 
 check_dynasm:
-	@if [ ! -f deps/dynasm/dynasm.lua ]; then \
+	@if [ ! -f deps/dynasm/dynasm.ljs ]; then \
 	    echo "Can't find deps/dynasm/. You might need to: git submodule update --init"; exit 1; \
 	fi
 

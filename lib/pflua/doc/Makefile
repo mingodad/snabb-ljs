@@ -49,14 +49,14 @@ EXAMPLES = \
 	fail-fail.md
 
 PFLUA = \
-	../src/pf.lua \
-	../src/pf/bpf.lua \
-	../src/pf/parse.lua \
-	../src/pf/expand.lua \
-	../src/pf/optimize.lua \
-	../src/pf/anf.lua \
-	../src/pf/ssa.lua \
-	../src/pf/backend.lua
+	../src/pf.ljs \
+	../src/pf/bpf.ljs \
+	../src/pf/parse.ljs \
+	../src/pf/expand.ljs \
+	../src/pf/optimize.ljs \
+	../src/pf/anf.ljs \
+	../src/pf/ssa.ljs \
+	../src/pf/backend.ljs
 
 all: $(EXAMPLES)
 
