@@ -1,23 +1,23 @@
-#!/usr/bin/env luajit
+#!/usr/bin/env ljsjit
 
-local function assert(cond, err, ...)
-  if cond == nil then error(tostring(err)) end -- annoyingly, assert does not call tostring!
-  if type(cond) == "function" then return cond, err, ... end
-  if cond == true then return ... end
-  return cond, ...
-end
+var function assert(cond, err, ...) {
+  if( cond == null ) { error(tostring(err)); } // annoyingly, assert does not call tostring!
+  if( type(cond) == "function" ) { return cond, err, ...; }
+  if( cond == true ) { return ...; }
+  return cond, ...;
+}
 
-local kfile = arg[1] or "ktrace.out"
+var kfile = arg[1] || "ktrace.out";
 
-local S = require "syscall"
-local N = require "syscall.netbsd.init"
+var S = require ("syscall");
+var N = require ("syscall.netbsd.init");
 
-local fd = assert(S.open(kfile, "rdonly"))
-local buf = S.t.buffer(32768)
-local n = assert(fd:read(buf, 32768))
-for _, ktr in N.util.kdump(buf, n) do
-  if ktr.version ~= 2 then error "currently only v2 supported" end
-  print(ktr)
-end
-assert(fd:close())
+var fd = assert(S.open(kfile, "rdonly"));
+var buf = S.t.buffer(32768);
+var n = assert(fd->read(buf, 32768));
+for( _, ktr in N.util.kdump(buf, n) ) {
+  if( ktr.version != 2 ) { error ("currently only v2 supported"); }
+  print(ktr);
+}
+assert(fd->close());
 

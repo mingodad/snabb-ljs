@@ -268,7 +268,7 @@ void *dlsym(void *handle, const char *symbol) {
 
   /* syscalls from rump */
 /*
-cat syscall/rump/c.lua | grep 'ffi.C.rump___sysimpl_' | grep -v - '--' | sed 's/.*rump___sysimpl_//g' | sed 's/,//g' | sed 's/\(.*\)/  if (strcmp(symbol, "\1") == 0) return \1;/g'
+cat syscall/rump/c.ljs | grep 'ffi.C.rump___sysimpl_' | grep -v - '--' | sed 's/.*rump___sysimpl_//g' | sed 's/,//g' | sed 's/\(.*\)/  if (strcmp(symbol, "\1") == 0) return \1;/g'
 */
   if (strcmp(symbol, "accept") == 0) return accept;
   if (strcmp(symbol, "access") == 0) return access;
