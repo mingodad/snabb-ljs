@@ -148,7 +148,7 @@ function M.checkstep(state, section) {
 var function xgetsym(name) {
 	return ffi.C[name];
 }
-var getsym = function(name) {  //DADBUG
+var function getsym(name) {  //DADBUG
 	var ok, sym = pcall(xgetsym, name);
 	if( ! ok ) { //not found or not defined: define it and try again
 		ffi.cdef(string.format('void %s();', name));

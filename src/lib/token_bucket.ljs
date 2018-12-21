@@ -113,7 +113,7 @@ function selftest() {
    var rate_eff = (i - burst_size)/interval;
    assert(rate_eff/rate == 1);
 
-   r, b = tb->get();
+   var r, b = tb->get();
    assert(r == rate);
    assert(b == burst_size);
 

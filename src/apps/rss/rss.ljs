@@ -84,7 +84,7 @@ function rss::new (config) {
       table.insert(o.classes, {
                       name = name,
                       match_fn = match_fn,
-                      pcontinue = pcontinue,
+                      "continue" = pcontinue,
                       input = link.new(name),
                       output = { n = 0 }
       });
@@ -97,7 +97,7 @@ function rss::new (config) {
              "Duplicate filter class: "..xconfig.name);
       classes[xconfig.name] = true;
       add_class(xconfig.name, pf.compile_filter(xconfig.filter),
-                config["continue"]);
+                xconfig["continue"]);
    }
    if( config.default_class ) {
       // Catch-all default filter

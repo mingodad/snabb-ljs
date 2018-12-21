@@ -60,9 +60,9 @@ function decode(s, startPos) {
 }
 
 //- The null function allows one to specify a null value in an associative array (which is otherwise
-// discarded if you set the value with 'nil' in Lua. Simply set t = { first=json.null }
-function json_null() {
-  return "null"; // so json.null() will also return null ;-)
+// discarded if you set the value with 'nil' in Lua. Simply set t = { first=json.vnull }
+function vnull() {
+  return vnull; // so json.vnull() will also return null ;-)
 }
 //---------------------------------------------------------------------------
 // Internal, PRIVATE functions.

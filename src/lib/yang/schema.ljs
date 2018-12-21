@@ -908,7 +908,7 @@ function resolve(schema, features) {
    return link(schema, {submodules=pop_prop(schema, 'submodules')});
 }
 
-primitive_types = { //DADBUG redefinition
+var xprimitive_types = { //DADBUG redefinition
    ['ietf-inet-types']=lib.set('ipv4-address', 'ipv6-address',
                            'ipv4-prefix', 'ipv6-prefix'),
    ['ietf-yang-types']=lib.set('mac-address')
@@ -916,7 +916,7 @@ primitive_types = { //DADBUG redefinition
 
 // NB: mutates schema in place!
 var function primitivize(schema) {
-   for( k, _ in pairs(primitive_types[schema.id] || {}) ) {
+   for( k, _ in pairs(xprimitive_types[schema.id] || {}) ) {
       assert(schema.typedefs[k]).primitive_type = k;
    }
    return schema;

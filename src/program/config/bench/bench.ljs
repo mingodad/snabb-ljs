@@ -75,6 +75,7 @@ function run(args) {
    listen_params, file = parse_command_line(args);
    var commands = read_commands(file);
    var ok, err, input_read, input_write = assert(S.pipe());
+   var output_read, output_write;
    ok, err, output_read, output_write = assert(S.pipe());
    var pid = S.fork();
    if( pid == 0 ) {

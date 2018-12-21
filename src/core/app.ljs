@@ -722,7 +722,7 @@ function selftest () {
    configure(c_fail);
    orig_app1 = app_table.app1;
    orig_app2 = app_table.app2;
-   orig_app3 = app_table.app3;
+   var orig_app3 = app_table.app3;
    main({duration = 4, report = {showapps = true}});
    assert(app_table.app1 != orig_app1); // should be restarted
    assert(app_table.app2 != orig_app2); // should be restarted
