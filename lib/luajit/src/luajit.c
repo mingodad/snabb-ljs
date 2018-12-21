@@ -124,7 +124,7 @@ static int docall(lua_State *L, int narg, int clear)
 #endif
   lua_remove(L, base);  /* remove traceback function */
   /* force a complete garbage collection in case of errors */
-  if (status != LUA_OK) lua_gc(L, LUA_GCCOLLECT, 0);
+  if (status != 0) lua_gc(L, LUA_GCCOLLECT, 0);
   return status;
 }
 
@@ -150,7 +150,6 @@ static void print_jit_status(lua_State *L)
     fputs(s, stdout);
   }
   putc('\n', stdout);
-  lua_settop(L, 0);  /* clear stack */
 }
 
 static void createargtable(lua_State *L, char **argv, int argc, int argf)
@@ -250,9 +249,9 @@ static void dotty(lua_State *L)
   const char *oldprogname = progname;
   progname = NULL;
   while ((status = loadline(L)) != -1) {
-    if (status == LUA_OK) status = docall(L, 0, 0);
+    if (status == 0) status = docall(L, 0, 0);
     report(L, status);
-    if (status == LUA_OK && lua_gettop(L) > 0) {  /* any result to print? */
+    if (status == 0 && lua_gettop(L) > 0) {  /* any result to print? */
       lua_getglobal(L, "print");
       lua_insert(L, 1);
       if (lua_pcall(L, lua_gettop(L)-1, 0, 0) != 0)
@@ -274,7 +273,7 @@ static int handle_script(lua_State *L, char **argx)
   if (strcmp(fname, "-") == 0 && strcmp(argx[-1], "--") != 0)
     fname = NULL;  /* stdin */
   status = luaL_loadfile(L, fname);
-  if (status == LUA_OK) {
+  if (status == 0) {
     /* Fetch args from arg table. LUA_INIT or -e might have changed them. */
     int narg = 0;
     lua_getglobal(L, "arg");
@@ -422,7 +421,6 @@ static int collectargs(char **argv, int *flags)
       break;
     case 'e':
       *flags |= FLAGS_EXEC;
-      /* fallthrough */
     case 'j':  /* LuaJIT extension */
     case 'l':
       *flags |= FLAGS_OPTION;
@@ -485,7 +483,7 @@ static int runargs(lua_State *L, char **argv, int argn)
     default: break;
     }
   }
-  return LUA_OK;
+  return 0;
 }
 
 static int handle_luainit(lua_State *L)
@@ -496,7 +494,7 @@ static int handle_luainit(lua_State *L)
   const char *init = getenv(LUA_INIT);
 #endif
   if (init == NULL)
-    return LUA_OK;
+    return 0;  /* status OK */
   else if (init[0] == '@')
     return dofile(L, init+1);
   else
@@ -541,17 +539,17 @@ static int pmain(lua_State *L)
 
   if (!(flags & FLAGS_NOENV)) {
     s->status = handle_luainit(L);
-    if (s->status != LUA_OK) return 0;
+    if (s->status != 0) return 0;
   }
 
   if ((flags & FLAGS_VERSION)) print_version();
 
   s->status = runargs(L, argv, argn);
-  if (s->status != LUA_OK) return 0;
+  if (s->status != 0) return 0;
 
   if (s->argc > argn) {
     s->status = handle_script(L, argv + argn);
-    if (s->status != LUA_OK) return 0;
+    if (s->status != 0) return 0;
   }
 
   if ((flags & FLAGS_INTERACTIVE)) {

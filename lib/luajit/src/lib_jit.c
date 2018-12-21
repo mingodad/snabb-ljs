@@ -141,16 +141,12 @@ LJLIB_CF(jit_attach)
   return 0;
 }
 
-LJLIB_CF(jit_prngstate)
+/* Calling this forces a trace stitch. */
+LJLIB_CF(jit_tracebarrier)
 {
-  jit_State *J = L2J(L);
-  int32_t cur = (int32_t)J->prngstate;
-  if (L->base < L->top && !tvisnil(L->base)) {
-    J->prngstate = (uint32_t)lj_lib_checkint(L, 1);
-  }
-  setintV(L->top++, cur);
-  return 1;
+  return 0;
 }
+
 LJLIB_PUSH(top-5) LJLIB_SET(os)
 LJLIB_PUSH(top-4) LJLIB_SET(arch)
 LJLIB_PUSH(top-3) LJLIB_SET(version_num)
@@ -234,7 +230,6 @@ LJLIB_CF(jit_util_funcbc)
 {
   GCproto *pt = check_Lproto(L, 0);
   BCPos pc = (BCPos)lj_lib_checkint(L, 2);
-  int lineinfo = lj_lib_optint(L, 3, 0);
   if (pc < pt->sizebc) {
     BCIns ins = proto_bc(pt)[pc];
     BCOp op = bc_op(ins);
@@ -242,11 +237,6 @@ LJLIB_CF(jit_util_funcbc)
     setintV(L->top, ins);
     setintV(L->top+1, lj_bc_mode[op]);
     L->top += 2;
-    if (lineinfo) {
-      setintV(L->top, lj_debug_line(pt, pc));
-      L->top += 1;
-      return 3;
-    }
     return 2;
   }
   return 0;
@@ -316,6 +306,9 @@ LJLIB_CF(jit_util_traceinfo)
     setintfield(L, t, "nk", REF_BIAS - (int32_t)T->nk);
     setintfield(L, t, "link", T->link);
     setintfield(L, t, "nexit", T->nsnap);
+    setintfield(L, t, "szmcode", T->szmcode);
+    setintfield(L, t, "mcode", (int32_t)(intptr_t)T->mcode);
+    setintfield(L, t, "mcloop", T->mcloop);
     setstrV(L, L->top++, lj_str_newz(L, jit_trlinkname[T->linktype]));
     lua_setfield(L, -2, "linktype");
     /* There are many more fields. Add them only when needed. */
@@ -572,7 +565,10 @@ static void jit_profile_callback(lua_State *L2, lua_State *L, int samples,
     setfuncV(L2, L2->top++, funcV(tv));
     setthreadV(L2, L2->top++, L);
     setintV(L2->top++, samples);
-    setstrV(L2, L2->top++, lj_str_new(L2, &vmst, 1));
+    if (vmstate >= 256)
+      setintV(L2->top++, vmstate-256);
+    else
+      setstrV(L2, L2->top++, lj_str_new(L2, &vmst, 1));
     status = lua_pcall(L2, 3, 0, 0);  /* callback(thread, samples, vmstate) */
     if (status) {
       if (G(L2)->panic) G(L2)->panic(L2);

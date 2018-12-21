@@ -387,7 +387,6 @@ static Reg asm_fuseloadk64(ASMState *as, IRIns *ir)
       ir->i = (int32_t)(as->mctop - as->mcbot);
       as->mcbot += 8;
       as->mclim = as->mcbot + MCLIM_REDZONE;
-      lj_mcode_commitbot(as->J, as->mcbot);
     }
     as->mrm.ofs = (int32_t)mcpofs(as, as->mctop - ir->i);
     as->mrm.base = RID_RIP;
@@ -1273,7 +1272,7 @@ static void asm_hrefk(ASMState *as, IRIns *ir)
   int32_t ofs = (int32_t)(kslot->op2 * sizeof(Node));
   Reg dest = ra_used(ir) ? ra_dest(as, ir, RSET_GPR) : RID_NONE;
   Reg node = ra_alloc1(as, ir->op1, RSET_GPR);
-#if !LJ_64 || defined(LUAJIT_USE_VALGRIND)
+#if !LJ_64
   MCLabel l_exit;
 #endif
   lua_assert(ofs % sizeof(Node) == 0);
@@ -1288,7 +1287,7 @@ static void asm_hrefk(ASMState *as, IRIns *ir)
     }
   }
   asm_guardcc(as, CC_NE);
-#if LJ_64 && !defined(LUAJIT_USE_VALGRIND)
+#if LJ_64
   if (!irt_ispri(irkey->t)) {
     Reg key = ra_scratch(as, rset_exclude(RSET_GPR, node));
     emit_rmro(as, XO_CMP, key|REX_64, node,
@@ -1759,7 +1758,7 @@ static void asm_sload(ASMState *as, IRIns *ir)
       emit_i8(as, irt_toitype(t));
       emit_rr(as, XO_ARITHi8, XOg_CMP, tmp);
       emit_shifti(as, XOg_SAR|REX_64, tmp, 47);
-      emit_rmro(as, XO_MOV, tmp|REX_64, base, ofs);
+      emit_rmro(as, XO_MOV, tmp|REX_64, base, ofs+4);
 #else
     } else {
       emit_i8(as, irt_toitype(t));
@@ -1792,9 +1791,8 @@ static void asm_cnew(ASMState *as, IRIns *ir)
     Reg r64 = sz == 8 ? REX_64 : 0;
     if (irref_isk(ir->op2)) {
       IRIns *irk = IR(ir->op2);
-      uint64_t k = (irk->o == IR_KINT64 ||
-		    (LJ_GC64 && (irk->o == IR_KPTR || irk->o == IR_KKPTR))) ?
-		   ir_k64(irk)->u64 : (uint64_t)(uint32_t)irk->i;
+      uint64_t k = irk->o == IR_KINT64 ? ir_k64(irk)->u64 :
+					 (uint64_t)(uint32_t)irk->i;
       if (sz == 4 || checki32((int64_t)k)) {
 	emit_i32(as, (int32_t)k);
 	emit_rmro(as, XO_MOVmi, r64, RID_RET, sizeof(GCcdata));

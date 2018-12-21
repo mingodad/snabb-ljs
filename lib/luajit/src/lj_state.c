@@ -224,8 +224,7 @@ LUA_API lua_State *lua_newstate(lua_Alloc f, void *ud)
     close_state(L);
     return NULL;
   }
-  L->status = LUA_OK;
-  L->exdata = NULL;
+  L->status = 0;
   return L;
 }
 
@@ -257,10 +256,10 @@ LUA_API void lua_close(lua_State *L)
 #endif
   for (i = 0;;) {
     hook_enter(g);
-    L->status = LUA_OK;
+    L->status = 0;
     L->base = L->top = tvref(L->stack) + 1 + LJ_FR2;
     L->cframe = NULL;
-    if (lj_vm_cpcall(L, NULL, NULL, cpfinalize) == LUA_OK) {
+    if (lj_vm_cpcall(L, NULL, NULL, cpfinalize) == 0) {
       if (++i >= 10) break;
       lj_gc_separateudata(g, 1);  /* Separate udata again. */
       if (gcref(g->gc.mmudata) == NULL)  /* Until nothing is left to do. */
@@ -275,7 +274,7 @@ lua_State *lj_state_new(lua_State *L)
   lua_State *L1 = lj_mem_newobj(L, lua_State);
   L1->gct = ~LJ_TTHREAD;
   L1->dummy_ffid = FF_C;
-  L1->status = LUA_OK;
+  L1->status = 0;
   L1->stacksize = 0;
   setmref(L1->stack, NULL);
   L1->cframe = NULL;
@@ -285,7 +284,6 @@ lua_State *lj_state_new(lua_State *L)
   setgcrefr(L1->env, L->env);
   stack_init(L1, L);  /* init stack */
   lua_assert(iswhite(obj2gco(L1)));
-  L1->exdata = L->exdata;
   return L1;
 }
 

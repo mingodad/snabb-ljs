@@ -150,7 +150,6 @@ static void *err_unwind(lua_State *L, void *stopcf, int errcode)
     case FRAME_CONT:  /* Continuation frame. */
       if (frame_iscont_fficb(frame))
 	goto unwind_c;
-      /* fallthrough */
     case FRAME_VARG:  /* Vararg frame. */
       frame = frame_prevd(frame);
       break;
@@ -509,9 +508,8 @@ LJ_NOINLINE void LJ_FASTCALL lj_err_throw(lua_State *L, int errcode)
 {
   global_State *g = G(L);
   lj_trace_abort(g);
-  g->saved_jit_base = g->jit_base;
   setmref(g->jit_base, NULL);
-  L->status = LUA_OK;
+  L->status = 0;
 #if LJ_UNWIND_EXT
   err_raise_ext(errcode);
   /*

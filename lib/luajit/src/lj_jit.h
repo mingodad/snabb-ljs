@@ -97,12 +97,12 @@
 
 /* Optimization parameters and their defaults. Length is a char in octal! */
 #define JIT_PARAMDEF(_) \
-  _(\010, maxtrace,	8000)	/* Max. # of traces in cache. */ \
-  _(\011, maxrecord,	16000)	/* Max. # of recorded IR instructions. */ \
+  _(\010, maxtrace,	1000)	/* Max. # of traces in cache. */ \
+  _(\011, maxrecord,	4000)	/* Max. # of recorded IR instructions. */ \
   _(\012, maxirconst,	500)	/* Max. # of IR constants of a trace. */ \
   _(\007, maxside,	100)	/* Max. # of side traces of a root trace. */ \
   _(\007, maxsnap,	500)	/* Max. # of snapshots for a trace. */ \
-  _(\011, minstitch,	3)	/* Min. # of IR ins for a stitched trace. */ \
+  _(\011, minstitch,	0)	/* Min. # of IR ins for a stitched trace. */ \
   \
   _(\007, hotloop,	56)	/* # of iter. to detect a hot loop/call. */ \
   _(\007, hotexit,	10)	/* # of taken exits to start a side trace. */ \
@@ -116,7 +116,7 @@
   /* Size of each machine code area (in KBytes). */ \
   _(\011, sizemcode,	JIT_P_sizemcode_DEFAULT) \
   /* Max. total size of all machine code areas (in KBytes). */ \
-  _(\010, maxmcode,	40960) \
+  _(\010, maxmcode,	512) \
   /* End of list. */
 
 enum {
@@ -157,12 +157,6 @@ typedef uint8_t MCode;
 #else
 typedef uint32_t MCode;
 #endif
-
-/* Linked list of MCode areas. */
-typedef struct MCLink {
-  MCode *next;		/* Next area. */
-  size_t size;		/* Size of current area. */
-} MCLink;
 
 /* Stack snapshot header. */
 typedef struct SnapShot {
@@ -374,7 +368,7 @@ enum {
   ((TValue *)(((intptr_t)&J->ksimd[2*(n)] + 15) & ~(intptr_t)15))
 
 /* Set/reset flag to activate the SPLIT pass for the current trace. */
-#if LJ_SOFTFP32 || (LJ_32 && LJ_HASFFI)
+#if LJ_SOFTFP || (LJ_32 && LJ_HASFFI)
 #define lj_needsplit(J)		(J->needsplit = 1)
 #define lj_resetsplit(J)	(J->needsplit = 0)
 #else
@@ -437,7 +431,7 @@ typedef struct jit_State {
   MSize sizesnapmap;	/* Size of temp. snapshot map buffer. */
 
   PostProc postproc;	/* Required post-processing after execution. */
-#if LJ_SOFTFP32 || (LJ_32 && LJ_HASFFI)
+#if LJ_SOFTFP || (LJ_32 && LJ_HASFFI)
   uint8_t needsplit;	/* Need SPLIT pass. */
 #endif
   uint8_t retryrec;	/* Retry recording. */

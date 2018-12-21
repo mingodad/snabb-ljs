@@ -16,7 +16,7 @@
 MAJVER=  2
 MINVER=  1
 RELVER=  0
-PREREL=  -beta3
+PREREL=  -beta2
 VERSION= $(MAJVER).$(MINVER).$(RELVER)$(PREREL)
 ABIVER=  5.1
 
@@ -25,7 +25,6 @@ ABIVER=  5.1
 # Change the installation path as needed. This automatically adjusts
 # the paths in src/luaconf.h, too. Note: PREFIX must be an absolute path!
 #
-#export PREFIX= /usr/local
 export PREFIX= /usr/local
 export MULTILIB= lib
 ##############################################################################
@@ -88,8 +87,8 @@ FILE_PC= ljsjit.pc
 FILES_INC= lua.h lualib.h lauxlib.h luaconf.h lua.hpp luajit.h
 FILES_JITLIB= bc.ljs bcsave.ljs dump.ljs p.ljs v.ljs zone.ljs \
 	      dis_x86.ljs dis_x64.ljs dis_arm.ljs dis_arm64.ljs \
-	      dis_arm64be.ljs dis_ppc.ljs dis_mips.ljs dis_mipsel.ljs \
-	      dis_mips64.ljs dis_mips64el.ljs vmdef.ljs
+	      dis_ppc.ljs dis_mips.ljs dis_mipsel.ljs dis_mips64.ljs \
+	      dis_mips64el.ljs vmdef.ljs
 
 ifeq (,$(findstring Windows,$(OS)))
   HOST_SYS:= $(shell uname -s)

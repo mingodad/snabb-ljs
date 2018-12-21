@@ -3,7 +3,7 @@ Luajit with C/C++/Java/Javascript syntax
 
 See https://github.com/mingodad/ljs for more details and tests.
 
-README for LuaJIT 2.1.0-beta3
+README for LuaJIT 2.1.0-beta2
 -----------------------------
 
 LuaJIT is a Just-In-Time (JIT) compiler for the Lua programming language.

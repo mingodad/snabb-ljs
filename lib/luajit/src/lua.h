@@ -39,8 +39,7 @@
 #define lua_upvalueindex(i)	(LUA_GLOBALSINDEX-(i))
 
 
-/* thread status */
-#define LUA_OK		0
+/* thread status; 0 is OK */
 #define LUA_YIELD	1
 #define LUA_ERRRUN	2
 #define LUA_ERRSYNTAX	3
@@ -245,8 +244,6 @@ LUA_API void  (lua_concat) (lua_State *L, int n);
 LUA_API lua_Alloc (lua_getallocf) (lua_State *L, void **ud);
 LUA_API void lua_setallocf (lua_State *L, lua_Alloc f, void *ud);
 
-LUA_API void lua_setexdata(lua_State *L, void *exdata);
-LUA_API void *lua_getexdata(lua_State *L);
 
 
 /*
@@ -350,13 +347,6 @@ LUA_API void *lua_upvalueid (lua_State *L, int idx, int n);
 LUA_API void lua_upvaluejoin (lua_State *L, int idx1, int n1, int idx2, int n2);
 LUA_API int lua_loadx (lua_State *L, lua_Reader reader, void *dt,
 		       const char *chunkname, const char *mode);
-LUA_API const lua_Number *lua_version (lua_State *L);
-LUA_API void lua_copy (lua_State *L, int fromidx, int toidx);
-LUA_API lua_Number lua_tonumberx (lua_State *L, int idx, int *isnum);
-LUA_API lua_Integer lua_tointegerx (lua_State *L, int idx, int *isnum);
-
-/* From Lua 5.3. */
-LUA_API int lua_isyieldable (lua_State *L);
 
 
 struct lua_Debug {

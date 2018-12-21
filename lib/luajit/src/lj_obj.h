@@ -619,7 +619,6 @@ typedef struct global_State {
   BCIns bc_cfunc_ext;	/* Bytecode for external C function calls. */
   GCRef cur_L;		/* Currently executing lua_State. */
   MRef jit_base;	/* Current JIT code L->base or NULL. */
-  MRef saved_jit_base;  /* saved jit_base for lj_err_throw */
   MRef ctype_state;	/* Pointer to C type state. */
   GCRef gcroot[GCROOT_MAX];  /* GC roots. */
 } global_State;
@@ -661,7 +660,6 @@ struct lua_State {
   GCRef env;		/* Thread environment (table of globals). */
   void *cframe;		/* End of C stack frame chain. */
   MSize stacksize;	/* True stack size (incl. LJ_STACK_EXTRA). */
-  void *exdata;	        /* user extra data pointer. added by OpenResty */
 };
 
 #define G(L)			(mref(L->glref, global_State))
@@ -926,9 +924,6 @@ static LJ_AINLINE void copyTV(lua_State *L, TValue *o1, const TValue *o2)
 
 #if LJ_SOFTFP
 LJ_ASMF int32_t lj_vm_tobit(double x);
-#if LJ_TARGET_MIPS64
-LJ_ASMF int32_t lj_vm_tointg(double x);
-#endif
 #endif
 
 static LJ_AINLINE int32_t lj_num2bit(lua_Number n)
@@ -944,22 +939,14 @@ static LJ_AINLINE int32_t lj_num2bit(lua_Number n)
 
 #define lj_num2int(n)   ((int32_t)(n))
 
-/*
-** This must match the JIT backend behavior. In particular for archs
-** that don't have a common hardware instruction for this conversion.
-** Note that signed FP to unsigned int conversions have an undefined
-** result and should never be relied upon in portable FFI code.
-** See also: C99 or C11 standard, 6.3.1.4, footnote of (1).
-*/
 static LJ_AINLINE uint64_t lj_num2u64(lua_Number n)
 {
-#if LJ_TARGET_X86ORX64 || LJ_TARGET_MIPS
-  int64_t i = (int64_t)n;
-  if (i < 0) i = (int64_t)(n - 18446744073709551616.0);
-  return (uint64_t)i;
-#else
-  return (uint64_t)n;
+#ifdef _MSC_VER
+  if (n >= 9223372036854775808.0)  /* They think it's a feature. */
+    return (uint64_t)(int64_t)(n - 18446744073709551616.0);
+  else
 #endif
+    return (uint64_t)n;
 }
 
 static LJ_AINLINE int32_t numberVint(cTValue *o)

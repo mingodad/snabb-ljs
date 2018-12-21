@@ -196,7 +196,6 @@ IRFPMDEF(FPMENUM)
   _(FUNC_PC,	offsetof(GCfunc, l.pc)) \
   _(FUNC_FFID,	offsetof(GCfunc, l.ffid)) \
   _(THREAD_ENV,	offsetof(lua_State, env)) \
-  _(THREAD_EXDATA,	offsetof(lua_State, exdata)) \
   _(TAB_META,	offsetof(GCtab, metatable)) \
   _(TAB_ARRAY,	offsetof(GCtab, array)) \
   _(TAB_NODE,	offsetof(GCtab, node)) \
@@ -378,12 +377,10 @@ typedef struct IRType1 { uint8_t irt; } IRType1;
 #define irt_isint64(t)		(irt_typerange((t), IRT_I64, IRT_U64))
 
 #if LJ_GC64
-/* Include IRT_NIL, so IR(ASMREF_L) (aka REF_NIL) is considered 64 bit. */
 #define IRT_IS64 \
   ((1u<<IRT_NUM)|(1u<<IRT_I64)|(1u<<IRT_U64)|(1u<<IRT_P64)|\
    (1u<<IRT_LIGHTUD)|(1u<<IRT_STR)|(1u<<IRT_THREAD)|(1u<<IRT_PROTO)|\
-   (1u<<IRT_FUNC)|(1u<<IRT_CDATA)|(1u<<IRT_TAB)|(1u<<IRT_UDATA)|\
-   (1u<<IRT_NIL))
+   (1u<<IRT_FUNC)|(1u<<IRT_CDATA)|(1u<<IRT_TAB)|(1u<<IRT_UDATA))
 #elif LJ_64
 #define IRT_IS64 \
   ((1u<<IRT_NUM)|(1u<<IRT_I64)|(1u<<IRT_U64)|(1u<<IRT_P64)|(1u<<IRT_LIGHTUD))

@@ -2604,7 +2604,6 @@ static void parse_block(LexState *ls)
   FuncState *fs = ls->fs;
   FuncScope bl;
   fscope_begin(fs, &bl, 0);
-
   if(lex_opt(ls, '{'))
   {
 	  parse_chunk(ls);
@@ -2615,7 +2614,6 @@ static void parse_block(LexState *ls)
 	  parse_stmt(ls);
 	  while(lex_opt(ls, ';'));//skip all ; after statement it breaks else/elseif
   }
-
   fscope_end(fs);
 }
 
@@ -2938,8 +2936,7 @@ static int parse_stmt(LexState *ls)
       lj_lex_next(ls);
       parse_goto(ls);
       break;
-    }
-    /* fallthrough */
+    }  /* else: fallthrough */
   default:
 default_action:
     parse_call_assign(ls);

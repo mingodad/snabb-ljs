@@ -56,11 +56,11 @@ static void asm_exitstub_setup(ASMState *as, ExitNo nexits)
     asm_mclimit(as);
   /* 1: str lr,[sp]; bl ->vm_exit_handler; movz w0,traceno; bl <1; bl <1; ... */
   for (i = nexits-1; (int32_t)i >= 0; i--)
-    *--mxp = A64I_LE(A64I_BL | A64F_S26(-3-i));
-  *--mxp = A64I_LE(A64I_MOVZw | A64F_U16(as->T->traceno));
+    *--mxp = A64I_BL|((-3-i)&0x03ffffffu);
+  *--mxp = A64I_MOVZw|A64F_U16(as->T->traceno);
   mxp--;
-  *mxp = A64I_LE(A64I_BL | A64F_S26(((MCode *)(void *)lj_vm_exit_handler-mxp)));
-  *--mxp = A64I_LE(A64I_STRx | A64F_D(RID_LR) | A64F_N(RID_SP));
+  *mxp = A64I_BL|(((MCode *)(void *)lj_vm_exit_handler-mxp)&0x03ffffffu);
+  *--mxp = A64I_STRx|A64F_D(RID_LR)|A64F_N(RID_SP);
   as->mctop = mxp;
 }
 
@@ -77,7 +77,7 @@ static void asm_guardcc(ASMState *as, A64CC cc)
   MCode *p = as->mcp;
   if (LJ_UNLIKELY(p == as->invmcp)) {
     as->loopinv = 1;
-    *p = A64I_B | A64F_S26(target-p);
+    *p = A64I_B | ((target-p) & 0x03ffffffu);
     emit_cond_branch(as, cc^1, p-1);
     return;
   }
@@ -91,7 +91,7 @@ static void asm_guardtnb(ASMState *as, A64Ins ai, Reg r, uint32_t bit)
   MCode *p = as->mcp;
   if (LJ_UNLIKELY(p == as->invmcp)) {
     as->loopinv = 1;
-    *p = A64I_B | A64F_S26(target-p);
+    *p = A64I_B | ((target-p) & 0x03ffffffu);
     emit_tnb(as, ai^0x01000000u, r, bit, p-1);
     return;
   }
@@ -105,7 +105,7 @@ static void asm_guardcnb(ASMState *as, A64Ins ai, Reg r)
   MCode *p = as->mcp;
   if (LJ_UNLIKELY(p == as->invmcp)) {
     as->loopinv = 1;
-    *p = A64I_B | A64F_S26(target-p);
+    *p = A64I_B | ((target-p) & 0x03ffffffu);
     emit_cnb(as, ai^0x01000000u, r, p-1);
     return;
   }
@@ -286,7 +286,7 @@ static void asm_fusexref(ASMState *as, A64Ins ai, Reg rd, IRRef ref,
 	}
 	rm = ra_alloc1(as, lref, allow);
 	rn = ra_alloc1(as, rref, rset_exclude(allow, rm));
-	emit_dnm(as, (ai^A64I_LS_R), (rd & 31), rn, rm);
+	emit_dnm(as, (ai^A64I_LS_R), rd, rn, rm);
 	return;
       }
     } else if (ir->o == IR_STRREF) {
@@ -431,7 +431,7 @@ static void asm_gencall(ASMState *as, const CCallInfo *ci, IRRef *args)
 	  fpr++;
 	} else {
 	  Reg r = ra_alloc1(as, ref, RSET_FPR);
-	  emit_spstore(as, ir, r, ofs + ((LJ_BE && !irt_isnum(ir->t)) ? 4 : 0));
+	  emit_spstore(as, ir, r, ofs);
 	  ofs += 8;
 	}
       } else {
@@ -441,7 +441,7 @@ static void asm_gencall(ASMState *as, const CCallInfo *ci, IRRef *args)
 	  gpr++;
 	} else {
 	  Reg r = ra_alloc1(as, ref, RSET_GPR);
-	  emit_spstore(as, ir, r, ofs + ((LJ_BE && !irt_is64(ir->t)) ? 4 : 0));
+	  emit_spstore(as, ir, r, ofs);
 	  ofs += 8;
 	}
       }
@@ -869,12 +869,14 @@ static void asm_hrefk(ASMState *as, IRIns *ir)
   int32_t ofs = (int32_t)(kslot->op2 * sizeof(Node));
   int32_t kofs = ofs + (int32_t)offsetof(Node, key);
   int bigofs = !emit_checkofs(A64I_LDRx, ofs);
+  RegSet allow = RSET_GPR;
   Reg dest = (ra_used(ir) || bigofs) ? ra_dest(as, ir, RSET_GPR) : RID_NONE;
-  Reg node = ra_alloc1(as, ir->op1, RSET_GPR);
-  Reg key, idx = node;
-  RegSet allow = rset_exclude(RSET_GPR, node);
+  Reg node = ra_alloc1(as, ir->op1, allow);
+  Reg key = ra_scratch(as, rset_clear(allow, node));
+  Reg idx = node;
   uint64_t k;
   lua_assert(ofs % sizeof(Node) == 0);
+  rset_clear(allow, key);
   if (bigofs) {
     idx = dest;
     rset_clear(allow, dest);
@@ -890,8 +892,7 @@ static void asm_hrefk(ASMState *as, IRIns *ir)
   } else {
     k = ((uint64_t)irt_toitype(irkey->t) << 47) | (uint64_t)ir_kgc(irkey);
   }
-  key = ra_scratch(as, allow);
-  emit_nm(as, A64I_CMPx, key, ra_allock(as, k, rset_exclude(allow, key)));
+  emit_nm(as, A64I_CMPx, key, ra_allock(as, k, allow));
   emit_lso(as, A64I_LDRx, key, idx, kofs);
   if (bigofs)
     emit_opk(as, A64I_ADDx, dest, node, ofs, RSET_GPR);
@@ -1081,7 +1082,7 @@ static void asm_ahustore(ASMState *as, IRIns *ir)
 	src = ra_alloc1(as, ir->op2, allow);
 	rset_clear(allow, src);
 	if (irt_isinteger(ir->t))
-	  type = ra_allock(as, (uint64_t)(int32_t)LJ_TISNUM << 47, allow);
+	  type = ra_allock(as, (int64_t)LJ_TISNUM << 47, allow);
 	else
 	  type = ra_allock(as, irt_toitype(ir->t), allow);
       } else {
@@ -1178,8 +1179,7 @@ dotypecheck:
   }
   if (ra_hasreg(dest)) {
     emit_lso(as, irt_isnum(t) ? A64I_LDRd :
-	     (irt_isint(t) ? A64I_LDRw : A64I_LDRx), (dest & 31), base,
-	     ofs ^ ((LJ_BE && irt_isint(t) ? 4 : 0)));
+	     (irt_isint(t) ? A64I_LDRw : A64I_LDRx), (dest & 31), base, ofs);
   }
 }
 
@@ -1850,7 +1850,7 @@ static void asm_loop_fixup(ASMState *as)
     p[-2] |= ((uint32_t)delta & mask) << 5;
   } else {
     ptrdiff_t delta = target - (p - 1);
-    p[-1] = A64I_B | A64F_S26(delta);
+    p[-1] = A64I_B | ((uint32_t)(delta) & 0x03ffffffu);
   }
 }
 
@@ -1909,7 +1909,7 @@ static void asm_tail_fixup(ASMState *as, TraceNo lnk)
   /* Undo the sp adjustment in BC_JLOOP when exiting to the interpreter. */
   int32_t spadj = as->T->spadjust + (lnk ? 0 : sps_scale(SPS_FIXED));
   if (spadj == 0) {
-    *--p = A64I_LE(A64I_NOP);
+    *--p = A64I_NOP;
     as->mctop = p;
   } else {
     /* Patch stack adjustment. */
@@ -1919,7 +1919,7 @@ static void asm_tail_fixup(ASMState *as, TraceNo lnk)
   }
   /* Patch exit branch. */
   target = lnk ? traceref(as->J, lnk)->mcode : (MCode *)lj_vm_exit_interp;
-  p[-1] = A64I_B | A64F_S26((target-p)+1);
+  p[-1] = A64I_B | (((target-p)+1)&0x03ffffffu);
 }
 
 /* Prepare tail of code. */
@@ -1962,19 +1962,6 @@ static void asm_setup_target(ASMState *as)
   asm_exitstub_setup(as, as->T->nsnap + (as->parent ? 1 : 0));
 }
 
-#if LJ_BE
-/* ARM64 instructions are always little-endian. Swap for ARM64BE. */
-static void asm_mcode_fixup(MCode *mcode, MSize size)
-{
-  MCode *pe = (MCode *)((char *)mcode + size);
-  while (mcode < pe) {
-    MCode ins = *mcode;
-    *mcode++ = lj_bswap(ins);
-  }
-}
-#define LJ_TARGET_MCODE_FIXUP	1
-#endif
-
 /* -- Trace patching ------------------------------------------------------ */
 
 /* Patch exit jumps of existing machine code to a new target. */
@@ -1982,50 +1969,40 @@ void lj_asm_patchexit(jit_State *J, GCtrace *T, ExitNo exitno, MCode *target)
 {
   MCode *p = T->mcode;
   MCode *pe = (MCode *)((char *)p + T->szmcode);
-  MCode *cstart = NULL;
+  MCode *cstart = NULL, *cend = p;
   MCode *mcarea = lj_mcode_patch(J, p, 0);
   MCode *px = exitstub_trace_addr(T, exitno);
-  /* Note: this assumes a trace exit is only ever patched once. */
   for (; p < pe; p++) {
     /* Look for exitstub branch, replace with branch to target. */
-    ptrdiff_t delta = target - p;
-    MCode ins = A64I_LE(*p);
+    uint32_t ins = *p;
     if ((ins & 0xff000000u) == 0x54000000u &&
 	((ins ^ ((px-p)<<5)) & 0x00ffffe0u) == 0) {
-      /* Patch bcc, if within range. */
-      if (A64F_S_OK(delta, 19)) {
-	*p = A64I_LE((ins & 0xff00001fu) | A64F_S19(delta));
-	if (!cstart) cstart = p;
-      }
+      /* Patch bcc exitstub. */
+      *p = (ins & 0xff00001fu) | (((target-p)<<5) & 0x00ffffe0u);
+      cend = p+1;
+      if (!cstart) cstart = p;
     } else if ((ins & 0xfc000000u) == 0x14000000u &&
 	       ((ins ^ (px-p)) & 0x03ffffffu) == 0) {
-      /* Patch b. */
-      lua_assert(A64F_S_OK(delta, 26));
-      *p = A64I_LE((ins & 0xfc000000u) | A64F_S26(delta));
+      /* Patch b exitstub. */
+      *p = (ins & 0xfc000000u) | ((target-p) & 0x03ffffffu);
+      cend = p+1;
       if (!cstart) cstart = p;
     } else if ((ins & 0x7e000000u) == 0x34000000u &&
 	       ((ins ^ ((px-p)<<5)) & 0x00ffffe0u) == 0) {
-      /* Patch cbz/cbnz, if within range. */
-      if (A64F_S_OK(delta, 19)) {
-	*p = A64I_LE((ins & 0xff00001fu) | A64F_S19(delta));
-	if (!cstart) cstart = p;
-      }
+      /* Patch cbz/cbnz exitstub. */
+      *p = (ins & 0xff00001f) | (((target-p)<<5) & 0x00ffffe0u);
+      cend = p+1;
+      if (!cstart) cstart = p;
     } else if ((ins & 0x7e000000u) == 0x36000000u &&
 	       ((ins ^ ((px-p)<<5)) & 0x0007ffe0u) == 0) {
-      /* Patch tbz/tbnz, if within range. */
-      if (A64F_S_OK(delta, 14)) {
-	*p = A64I_LE((ins & 0xfff8001fu) | A64F_S14(delta));
-	if (!cstart) cstart = p;
-      }
+      /* Patch tbz/tbnz exitstub. */
+      *p = (ins & 0xfff8001fu) | (((target-p)<<5) & 0x0007ffe0u);
+      cend = p+1;
+      if (!cstart) cstart = p;
     }
   }
-  {  /* Always patch long-range branch in exit stub itself. */
-    ptrdiff_t delta = target - px;
-    lua_assert(A64F_S_OK(delta, 26));
-    *px = A64I_B | A64F_S26(delta);
-    if (!cstart) cstart = px;
-  }
-  lj_mcode_sync(cstart, px+1);
+  lua_assert(cstart != NULL);
+  lj_mcode_sync(cstart, cend);
   lj_mcode_patch(J, mcarea, 1);
 }
 

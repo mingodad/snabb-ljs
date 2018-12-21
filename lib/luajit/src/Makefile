@@ -87,7 +87,7 @@ BUILDMODE= mixed
 ##############################################################################
 # Enable/disable these features as needed, but make sure you force a full
 # recompile with "make clean", followed by "make".
-XCFLAGS=-DLUAJIT_LJS
+XCFLAGS=
 #
 # Permanently disable the FFI extension to reduce the size of the LuaJIT
 # executable. But please consider that the FFI library is compiled-in,
@@ -99,7 +99,7 @@ XCFLAGS=-DLUAJIT_LJS
 # enabled by default. Some other features that *might* break some existing
 # code (e.g. __pairs or os.execute() return values) can be enabled here.
 # Note: this does not provide full compatibility with Lua 5.2 at this time.
-XCFLAGS+= -DLUAJIT_ENABLE_LUA52COMPAT
+#XCFLAGS+= -DLUAJIT_ENABLE_LUA52COMPAT
 #
 # Disable the JIT compiler, i.e. turn LuaJIT into a pure interpreter.
 #XCFLAGS+= -DLUAJIT_DISABLE_JIT
@@ -209,7 +209,7 @@ TARGET_CC= $(STATIC_CC)
 TARGET_STCC= $(STATIC_CC)
 TARGET_DYNCC= $(DYNAMIC_CC)
 TARGET_LD= $(CROSS)$(CC)
-TARGET_AR= $(CROSS)ar rcus
+TARGET_AR= $(CROSS)ar rcus 2>/dev/null
 TARGET_STRIP= $(CROSS)strip
 
 TARGET_LIBPATH= $(or $(PREFIX),/usr/local)/$(or $(MULTILIB),lib)
@@ -242,9 +242,6 @@ ifneq (,$(findstring LJ_TARGET_ARM ,$(TARGET_TESTARCH)))
   TARGET_LJARCH= arm
 else
 ifneq (,$(findstring LJ_TARGET_ARM64 ,$(TARGET_TESTARCH)))
-  ifneq (,$(findstring __AARCH64EB__ ,$(TARGET_TESTARCH)))
-    TARGET_ARCH= -D__AARCH64EB__=1
-  endif
   TARGET_LJARCH= arm64
 else
 ifneq (,$(findstring LJ_TARGET_PPC ,$(TARGET_TESTARCH)))
@@ -308,7 +305,6 @@ ifeq (Windows,$(TARGET_SYS))
   TARGET_XSHLDFLAGS= -shared
   TARGET_DYNXLDOPTS=
 else
-  TARGET_AR+= 2>/dev/null
 ifeq (,$(shell $(TARGET_CC) -o /dev/null -c -x c /dev/null -fno-stack-protector 2>/dev/null || echo 1))
   TARGET_XCFLAGS+= -fno-stack-protector
 endif
@@ -586,10 +582,10 @@ endif
 endif
 endif
 
-#Q= @
-#E= @echo
-Q=
-E= @:
+Q= @
+E= @echo
+#Q=
+#E= @:
 
 ##############################################################################
 # Make targets.

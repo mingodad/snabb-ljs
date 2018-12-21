@@ -87,9 +87,9 @@ static void rec_check_slots(jit_State *J)
   BCReg s, nslots = J->baseslot + J->maxslot;
   int32_t depth = 0;
   cTValue *base = J->L->base - J->baseslot;
-  lua_assert(J->baseslot >= 1+LJ_FR2);
+  lua_assert(J->baseslot >= 1+LJ_FR2 && J->baseslot < LJ_MAX_JSLOTS);
   lua_assert(J->baseslot == 1+LJ_FR2 || (J->slot[J->baseslot-1] & TREF_FRAME));
-  lua_assert(nslots <= LJ_MAX_JSLOTS);
+  lua_assert(nslots < LJ_MAX_JSLOTS);
   for (s = 0; s < nslots; s++) {
     TRef tr = J->slot[s];
     if (tr) {
@@ -581,7 +581,7 @@ static void rec_loop_interp(jit_State *J, const BCIns *pc, LoopEvent ev)
       if (bc_j(*pc) != -1 && !innerloopleft(J, pc))
 	lj_trace_err(J, LJ_TRERR_LINNER);  /* Root trace hit an inner loop. */
       if ((ev != LOOPEV_ENTERLO &&
-	   J->loopref && J->cur.nins - J->loopref > 100) || --J->loopunroll < 0)
+	   J->loopref && J->cur.nins - J->loopref > 24) || --J->loopunroll < 0)
 	lj_trace_err(J, LJ_TRERR_LUNROLL);  /* Limit loop unrolling. */
       J->loopref = J->cur.nins;
     }
@@ -731,8 +731,6 @@ void lj_record_call(jit_State *J, BCReg func, ptrdiff_t nargs)
   J->framedepth++;
   J->base += func+1+LJ_FR2;
   J->baseslot += func+1+LJ_FR2;
-  if (J->baseslot + J->maxslot >= LJ_MAX_JSLOTS)
-    lj_trace_err(J, LJ_TRERR_STACKOV);
 }
 
 /* Record tail call. */
@@ -752,9 +750,14 @@ void lj_record_tailcall(jit_State *J, BCReg func, ptrdiff_t nargs)
     J->base[func+1] = TREF_FRAME;
   memmove(&J->base[-1-LJ_FR2], &J->base[func], sizeof(TRef)*(J->maxslot+1+LJ_FR2));
   /* Note: the new TREF_FRAME is now at J->base[-1] (even for slot #0). */
-  /* Tailcalls can form a loop, so count towards the loop unroll limit. */
-  if (++J->tailcalled > J->loopunroll)
-    lj_trace_err(J, LJ_TRERR_LUNROLL);
+
+  J->tailcalled++;
+
+  /* Although it's true that tail calls can form a loop, the Lua programming
+  ** idiom does not encourage this.  Instead of counting tail calls towards the
+  ** unroll limit and potentially causing important traces without loops to
+  ** abort, eventually blacklist, and fall back to the interpreter, just rely on
+  ** JIT_P_maxrecord to catch runaway tail-call loops. */
 }
 
 /* Check unroll limits for down-recursion. */
@@ -2408,8 +2411,6 @@ void lj_record_ins(jit_State *J)
   case BC_IFORL:
   case BC_IITERL:
   case BC_ILOOP:
-  case BC_IFUNCF:
-  case BC_IFUNCV:
     lj_trace_err(J, LJ_TRERR_BLACKL);
     break;
 
@@ -2421,6 +2422,7 @@ void lj_record_ins(jit_State *J)
   /* -- Function headers -------------------------------------------------- */
 
   case BC_FUNCF:
+  case BC_IFUNCF:
     rec_func_lua(J);
     break;
   case BC_JFUNCF:
@@ -2428,6 +2430,7 @@ void lj_record_ins(jit_State *J)
     break;
 
   case BC_FUNCV:
+  case BC_IFUNCV:
     rec_func_vararg(J);
     rec_func_lua(J);
     break;
@@ -2470,9 +2473,8 @@ void lj_record_ins(jit_State *J)
 #undef rbv
 #undef rcv
 
-  /* Limit the number of recorded IR instructions and constants. */
-  if (J->cur.nins > REF_FIRST+(IRRef)J->param[JIT_P_maxrecord] ||
-      J->cur.nk < REF_BIAS-(IRRef)J->param[JIT_P_maxirconst])
+  /* Limit the number of recorded IR instructions. */
+  if (J->cur.nins > REF_FIRST+(IRRef)J->param[JIT_P_maxrecord])
     lj_trace_err(J, LJ_TRERR_TRACEOV);
 }
 
